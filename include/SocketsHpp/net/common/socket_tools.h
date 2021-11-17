@@ -276,7 +276,7 @@ namespace net
                     // Erase port number
                     ipAddress.erase(lastColon - addr);
                 }
-                // If there are more than two colons, it means the input is IPv4, e.g
+                // If there are more than two colons, it means the input is IPv6, e.g
                 // [fe80::c018:4a9b:3681:4e41]:3000
                 if (numColons > 1)
                 {
