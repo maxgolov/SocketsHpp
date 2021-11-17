@@ -27,14 +27,16 @@ Library may be included using `#include <sockets.hpp>`. It consists of the follo
 
 | File      | Description |
 | --------- | ----------- |
-| `http/common/url_parser.h` | Parser of URLs in format `http://host:port|host:port`. |
-| `http/server/http_server.h` | HTTP server. |
-| `http/server/http_file_server.h` | HTTP file server. |
-| `net/common/socket_server.h` | Socket server that supports TCP, UDP and Unix Domain. |
-| `net/common/socket_tools.h` | C++ socket client abstraction on top of BSD sockets and WinSock. |
-| `config.h` | Configurable namespace definition. |
-| `macros.h` | Common macros for debugging. |
+| `http/common/url_parser.h` | Parser of URLs in format `http://host:port` or `host:port` |
+| `http/server/http_server.h` | HTTP server implementation |
+| `http/server/http_file_server.h` | HTTP file server implementation |
+| `net/common/socket_server.h` | Socket server that supports TCP, UDP and Unix Domain sockets |
+| `net/common/socket_tools.h` | C++ socket client abstraction on top of BSD sockets or WinSock |
+| `config.h` | Configurable namespace definition |
+| `macros.h` | Common macros used for debugging |
 
-The goal is to keep the library as lean as possible, to require only the standard system C++
-runtime and the standard system socket library (POSIX sockets or WinSock). The code is known
-to work well on Windows, Linux (including embedded), Android, iOS and Mac.
+The goal is to keep the library as lean as possible - to require only:
+- standard system C++ runtime
+- standard system socket library (POSIX sockets or WinSock).
+
+The code is known to work well on Windows, Linux (including embedded), Android, iOS and Mac.
