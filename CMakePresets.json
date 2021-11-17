@@ -1,0 +1,36 @@
+{
+    "version": 2,
+    "configurePresets": [
+        {
+            "name": "windows-default",
+            "displayName": "Windows x64 Debug",
+            "description": "Windows x64 Debug",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "architecture": {
+                "value": "x64",
+                "strategy": "external"
+            },
+            "environment": {
+                "VCPKG_ROOT": "C:\\vcpkg"
+            },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}"
+            },
+            "vendor": {
+                "microsoft.com/VisualStudioSettings/CMake/1.0": {
+                    "hostOS": [ "Windows" ]
+                }
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "win-x64-debug-build",
+            "description": "Build with specified toolchain file",
+            "displayName": "Build windows-default",
+            "configurePreset": "windows-default"
+        }
+    ]
+}
