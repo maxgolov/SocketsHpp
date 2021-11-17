@@ -1,7 +1,7 @@
 // Copyright Max Golovanov.
 // SPDX-License-Identifier: Apache-2.0
 // Uncomment this line for additional debugging:
-#define HAVE_CONSOLE_LOG
+// #define HAVE_CONSOLE_LOG
 
 #include <cstdio>
 #include <cstdlib>

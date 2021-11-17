@@ -1,4 +1,4 @@
-﻿cmake_minimum_required (VERSION 3.20.0)
+﻿cmake_minimum_required (VERSION 3.8.0)
 
 project ("SocketsHpp")
 
@@ -12,5 +12,9 @@ include(CTest)
 
 include_directories(include)
 
-add_subdirectory(test)
+find_package(GTest)
+if (GTest_FOUND)
+  add_subdirectory(test)
+endif()
+
 add_subdirectory(samples)
