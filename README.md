@@ -19,7 +19,7 @@ provide your own source of [Google Test](https://github.com/google/googletest).
 2. How to build
 
 - Windows build: use `build.cmd`
-- Pther OS build (Linux, Mac, Android, etc.): use `cmake` for your platform.
+- Other OS build (Linux, Mac, Android, etc.): use `cmake` for your platform.
 
 # Header-only design
 
