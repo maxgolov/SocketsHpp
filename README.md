@@ -1,6 +1,6 @@
 # About Sockets.HPP
 
-Simple no-frills cross-platform C++ header-only client-server sockets library (TCP, UDP, HTTP).
+Simple no-frills cross-platform C++ header-only client-server sockets library (TCP, UDP, Unix Domain, HTTP).
 
 This code contains incremental improvements on top of Apache License 2.0-licensed opensource
 [Microsoft 1DS C/C++ Telemetry](https://github.com/microsoft/cpp_client_telemetry/blob/main/tests/common/HttpServer.hpp)
