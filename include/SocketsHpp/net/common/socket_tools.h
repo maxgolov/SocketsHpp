@@ -242,6 +242,52 @@ namespace net
                 inet4.sin_addr.s_addr = htonl(addr);
             }
 
+            SocketAddr(const char* addr, int port) : SocketAddr()
+            {
+                isUnixDomain = false;
+                std::string ipAddress = addr;
+                auto found = ipAddress.find("://");
+                if (found != std::string::npos)
+                {
+                    // always strip scheme
+                    ipAddress.erase(0, found + 3);
+                }
+
+                // Convert IPv4 or IPv6 address to binary form
+                size_t numColons = std::count(ipAddress.begin(), ipAddress.end(), ':');
+                
+                if (numColons > 1)
+                {
+                    // IPv6 address
+                    sockaddr_in6& inet6 = m_data_in6;
+                    inet6.sin6_family = AF_INET6;
+                    inet6.sin6_port = htons(port);
+                    void* pAddrBuf = &inet6.sin6_addr;
+                    size_t len = ipAddress.length();
+                    if ((ipAddress[0] == '[') && (ipAddress[len - 1] == ']'))
+                    {
+                        // Remove square brackets
+                        ipAddress = ipAddress.substr(1, ipAddress.length() - 2);
+                    }
+                    if (!::inet_pton(inet6.sin6_family, ipAddress.c_str(), pAddrBuf))
+                    {
+                        LOG_ERROR("Invalid IPv6 address: %s", addr);
+                    }
+                }
+                else
+                {
+                    // IPv4 address
+                    sockaddr_in& inet = m_data_in;
+                    inet.sin_family = AF_INET;
+                    inet.sin_port = htons(port);
+                    void* pAddrBuf = &inet.sin_addr;
+                    if (!::inet_pton(inet.sin_family, ipAddress.c_str(), pAddrBuf))
+                    {
+                        LOG_ERROR("Invalid IPv4 address: %s", addr);
+                    }
+                }
+            }
+
             SocketAddr(const char* addr, bool unixDomain = false) : SocketAddr()
             {
                 isUnixDomain = unixDomain;

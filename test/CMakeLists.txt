@@ -32,6 +32,7 @@ set(FUNCTIONAL_TESTS
   sockets_test
   sockets_udp_test
   http_server_test
+  http_streaming_test
 )
 
 foreach(testname ${FUNCTIONAL_TESTS})

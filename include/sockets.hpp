@@ -8,6 +8,7 @@
 #include "SocketsHpp/net/common/socket_tools.h"
 #include "SocketsHpp/net/common/socket_server.h"
 
-// HTTP base and HTTP file server
+// HTTP server and client
 #include "SocketsHpp/http/server/http_server.h"
 #include "SocketsHpp/http/server/http_file_server.h"
+#include "SocketsHpp/http/client/http_client.h"

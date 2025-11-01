@@ -24,6 +24,67 @@ namespace http
         static constexpr const char* CONTENT_TYPE = "Content-Type";
         static constexpr const char* CONTENT_TYPE_TEXT = "text/plain";
         static constexpr const char* CONTENT_TYPE_BIN = "application/octet-stream";
+        static constexpr const char* CONTENT_TYPE_SSE = "text/event-stream";
+        static constexpr const char* CONTENT_TYPE_JSON = "application/json";
+
+        // SSE (Server-Sent Events) helper class
+        class SSEEvent
+        {
+        public:
+            std::string event;
+            std::string data;
+            std::string id;
+            int retry = -1;  // -1 means not set
+
+            std::string format() const
+            {
+                std::ostringstream oss;
+                if (!id.empty())
+                {
+                    oss << "id: " << id << "\n";
+                }
+                if (!event.empty())
+                {
+                    oss << "event: " << event << "\n";
+                }
+                if (retry >= 0)
+                {
+                    oss << "retry: " << retry << "\n";
+                }
+                // Split data by newlines for proper SSE formatting
+                if (!data.empty())
+                {
+                    size_t start = 0;
+                    size_t end = data.find('\n');
+                    while (end != std::string::npos)
+                    {
+                        oss << "data: " << data.substr(start, end - start) << "\n";
+                        start = end + 1;
+                        end = data.find('\n', start);
+                    }
+                    oss << "data: " << data.substr(start) << "\n";
+                }
+                oss << "\n";  // Empty line terminates event
+                return oss.str();
+            }
+
+            static SSEEvent message(const std::string& data, const std::string& id = "")
+            {
+                SSEEvent evt;
+                evt.data = data;
+                evt.id = id;
+                return evt;
+            }
+
+            static SSEEvent custom(const std::string& event, const std::string& data, const std::string& id = "")
+            {
+                SSEEvent evt;
+                evt.event = event;
+                evt.data = data;
+                evt.id = id;
+                return evt;
+            }
+        };
 
         struct HttpRequest
         {
@@ -41,6 +102,12 @@ namespace http
             std::string message;
             std::map<std::string, std::string> headers;
             std::string body;
+            
+            // Streaming support
+            bool streaming = false;
+            bool useChunkedEncoding = false;
+            std::function<std::string()> streamCallback;  // Returns chunk data, empty string = end
+            std::function<void()> onStreamEnd;            // Called when stream completes
         };
 
         using CallbackFunction = std::function<int(HttpRequest const& request, HttpResponse& response)>;
@@ -101,12 +168,17 @@ namespace http
                     Processing,
                     SendingHeaders,
                     SendingBody,
+                    StreamingChunked,  // New: sending chunked data
                     Closing
                 } state;
                 size_t contentLength;
                 bool keepalive;
                 HttpRequest request;
                 HttpResponse response;
+                
+                // Streaming state
+                bool streamingActive = false;
+                size_t chunksSent = 0;
             };
 
             std::string m_serverHost;
@@ -194,7 +266,7 @@ namespace http
                 socket.setNonBlocking();
                 socket.setReuseAddr();
 
-                SocketAddr addr(0, port);
+                SocketAddr addr(static_cast<u_long>(0), port);
                 socket.bind(addr);
                 socket.getsockname(addr);
 
@@ -520,9 +592,18 @@ namespace http
                             return;
                         }
 
-                        conn.sendBuffer = std::move(conn.response.body);
-                        conn.state = Connection::SendingBody;
-                        LOG_TRACE("HttpServer: [%s] sending body", conn.request.client.c_str());
+                        // Check if we're streaming
+                        if (conn.streamingActive)
+                        {
+                            conn.state = Connection::StreamingChunked;
+                            LOG_TRACE("HttpServer: [%s] starting chunked stream", conn.request.client.c_str());
+                        }
+                        else
+                        {
+                            conn.sendBuffer = std::move(conn.response.body);
+                            conn.state = Connection::SendingBody;
+                            LOG_TRACE("HttpServer: [%s] sending body", conn.request.client.c_str());
+                        }
                     }
 
                     if (conn.state == Connection::SendingBody)
@@ -551,6 +632,81 @@ namespace http
                             m_reactor.addSocket(conn.socket, Reactor::Closed);
                             conn.state = Connection::Closing;
                             LOG_TRACE("HttpServer: [%s] closing", conn.request.client.c_str());
+                        }
+                    }
+                    
+                    if (conn.state == Connection::StreamingChunked)
+                    {
+                        // Get next chunk from callback
+                        if (conn.response.streamCallback)
+                        {
+                            std::string chunkData = conn.response.streamCallback();
+                            
+                            if (chunkData.empty())
+                            {
+                                // End of stream - send final chunk
+                                conn.sendBuffer = "0\r\n\r\n";  // Terminal chunk
+                                LOG_TRACE("HttpServer: [%s] sending terminal chunk (sent %zu chunks)",
+                                    conn.request.client.c_str(), conn.chunksSent);
+                                    
+                                if (sendMore(conn))
+                                {
+                                    return;
+                                }
+                                
+                                // Call end callback if provided
+                                if (conn.response.onStreamEnd)
+                                {
+                                    conn.response.onStreamEnd();
+                                }
+                                
+                                conn.streamingActive = false;
+                                conn.keepalive &= allowKeepalive;
+                                
+                                if (conn.keepalive)
+                                {
+                                    m_reactor.addSocket(conn.socket, Reactor::Readable | Reactor::Closed);
+                                    conn.state = Connection::Idle;
+                                    LOG_TRACE("HttpServer: [%s] stream ended, idle (keep-alive)", conn.request.client.c_str());
+                                }
+                                else
+                                {
+                                    conn.socket.shutdown(Socket::ShutdownSend);
+                                    m_reactor.addSocket(conn.socket, Reactor::Closed);
+                                    conn.state = Connection::Closing;
+                                    LOG_TRACE("HttpServer: [%s] stream ended, closing", conn.request.client.c_str());
+                                }
+                            }
+                            else
+                            {
+                                // Format as chunked data: <size in hex>\r\n<data>\r\n
+                                std::ostringstream chunkHeader;
+                                chunkHeader << std::hex << chunkData.size() << "\r\n";
+                                conn.sendBuffer = chunkHeader.str() + chunkData + "\r\n";
+                                conn.chunksSent++;
+                                
+                                LOG_TRACE("HttpServer: [%s] sending chunk #%zu (%zu bytes)",
+                                    conn.request.client.c_str(), conn.chunksSent, chunkData.size());
+                                
+                                if (sendMore(conn))
+                                {
+                                    return;
+                                }
+                                
+                                // Stay in streaming state - reactor will call us again when writable
+                                m_reactor.addSocket(conn.socket, Reactor::Writable | Reactor::Closed);
+                            }
+                        }
+                        else
+                        {
+                            // No callback - end stream
+                            conn.sendBuffer = "0\r\n\r\n";
+                            if (sendMore(conn))
+                            {
+                                return;
+                            }
+                            conn.streamingActive = false;
+                            conn.state = Connection::Closing;
                         }
                     }
 
@@ -708,6 +864,9 @@ namespace http
                 conn.response.message.clear();
                 conn.response.headers.clear();
                 conn.response.body.clear();
+                conn.response.streaming = false;
+                conn.response.useChunkedEncoding = false;
+                conn.response.streamCallback = nullptr;
 
                 if (conn.response.code == 0)
                 {
@@ -745,7 +904,32 @@ namespace http
                 conn.response.headers["Host"] = m_serverHost;
                 conn.response.headers["Connection"] = (conn.keepalive ? "keep-alive" : "close");
                 conn.response.headers["Date"] = formatTimestamp(time(nullptr));
-                conn.response.headers["Content-Length"] = std::to_string(conn.response.body.size());
+                
+                // Handle streaming vs regular response
+                if (conn.response.streaming && conn.response.streamCallback)
+                {
+                    conn.streamingActive = true;
+                    conn.chunksSent = 0;
+                    
+                    // Use chunked encoding for streaming
+                    if (conn.response.useChunkedEncoding || conn.request.protocol == "HTTP/1.1")
+                    {
+                        conn.response.headers["Transfer-Encoding"] = "chunked";
+                        conn.response.headers.erase("Content-Length");
+                    }
+                    
+                    // SSE-specific headers
+                    if (conn.response.headers[CONTENT_TYPE] == CONTENT_TYPE_SSE)
+                    {
+                        conn.response.headers["Cache-Control"] = "no-cache";
+                        conn.response.headers["X-Accel-Buffering"] = "no";  // Disable nginx buffering
+                        conn.keepalive = true;  // Keep connection alive for SSE
+                    }
+                }
+                else
+                {
+                    conn.response.headers["Content-Length"] = std::to_string(conn.response.body.size());
+                }
             }
 
             static std::string formatTimestamp(time_t time)
