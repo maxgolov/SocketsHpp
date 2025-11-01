@@ -33,3 +33,7 @@
 
 out/**
 .vs/**
+
+# Build directories
+build/
+build-*/

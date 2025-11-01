@@ -119,6 +119,7 @@ namespace http
                 path_ = "/";
                 if (url_[cpos] == '?')
                 {
+                    cpos++;
                     query_ = std::string(url_.begin() + cpos, url_.begin() + url_.length());
                 }
             }
