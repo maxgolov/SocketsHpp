@@ -20,13 +20,13 @@ int main()
     try
     {
         // Create HTTP server on port 8080
-        HttpServer server(8080);
+        HttpServer server("0.0.0.0", 8080);
         std::cout << "HTTP Server starting on http://localhost:8080" << std::endl;
 
         // Root endpoint - HTML page
-        server.route("/", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/", [](const HttpRequest& req, HttpResponse& res) -> int {
             res.set_header("Content-Type", "text/html");
-            res.send(R"(
+            res.set_content(R"(
                 <!DOCTYPE html>
                 <html>
                 <head><title>SocketsHpp HTTP Server</title></head>
@@ -41,27 +41,30 @@ int main()
                 </body>
                 </html>
             )");
+            return 0;
         });
 
         // Hello endpoint
-        server.route("/hello", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/hello", [](const HttpRequest& req, HttpResponse& res) -> int {
             res.set_header("Content-Type", "text/plain");
-            res.send("Hello from SocketsHpp HTTP Server!");
+            res.set_content("Hello from SocketsHpp HTTP Server!");
+            return 0;
         });
 
         // JSON API endpoint
-        server.route("/api/info", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/api/info", [](const HttpRequest& req, HttpResponse& res) -> int {
             res.set_header("Content-Type", "application/json");
-            res.send(R"({
+            res.set_content(R"({
                 "server": "SocketsHpp",
                 "version": "1.0",
                 "endpoints": ["/", "/hello", "/api/info", "/echo"]
             })");
+            return 0;
         });
 
         // Echo endpoint with query parameters
-        server.route("/echo", [](const HttpRequest& req, HttpResponse& res) {
-            auto params = req.parse_query();
+        server.route("/echo", [](const HttpRequest& req, HttpResponse& res) -> int {
+            auto params = req.getQueryParams();
             std::string msg = "No message provided";
             
             auto it = params.find("msg");
@@ -70,26 +73,33 @@ int main()
             }
 
             res.set_header("Content-Type", "text/plain");
-            res.send("Echo: " + msg);
+            res.set_content("Echo: " + msg);
+            return 0;
         });
 
         // POST endpoint for JSON data
-        server.route("/api/data", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/api/data", [](const HttpRequest& req, HttpResponse& res) -> int {
             if (req.method == "POST") {
-                std::string body = req.body;
+                std::string body = req.getBody();
                 res.set_header("Content-Type", "application/json");
-                res.send(R"({"received": )" + std::to_string(body.length()) + R"( bytes", "status": "ok"})");
+                res.set_content(R"({"received": )" + std::to_string(body.length()) + R"( bytes", "status": "ok"})");
             } else {
                 res.set_status(405); // Method Not Allowed
-                res.send("Only POST allowed");
+                res.set_content("Only POST allowed");
             }
+            return 0;
         });
 
         std::cout << "Server running! Press Ctrl+C to stop" << std::endl;
         std::cout << "Visit http://localhost:8080 in your browser" << std::endl;
 
         // Start server (blocks until stopped)
-        server.listen();
+        server.start();
+        
+        // Keep server running
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
 
         return 0;
     }

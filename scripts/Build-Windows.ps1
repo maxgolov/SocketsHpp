@@ -7,7 +7,8 @@ param(
     
     [switch]$SkipTests,
     [switch]$Clean,
-    [switch]$Verbose
+    [switch]$Verbose,
+    [switch]$BuildExamples
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,6 +60,10 @@ $ConfigureArgs = @(
     "-DCMAKE_BUILD_TYPE=$Configuration"
 )
 
+if ($BuildExamples) {
+    $ConfigureArgs += "-DBUILD_EXAMPLES=ON"
+}
+
 Write-Host "Running: cmake $($ConfigureArgs -join ' ')" -ForegroundColor Gray
 & cmake @ConfigureArgs
 
@@ -90,6 +95,42 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "`nBuild completed successfully!" -ForegroundColor Green
 
+# Run examples
+if ($BuildExamples) {
+    Write-Host "`nVerifying examples..." -ForegroundColor Cyan
+    
+    # List all example executables (based on CMakeLists.txt target names)
+    $ExampleBinaries = @(
+        "examples\01-tcp-echo\$Configuration\tcp-echo.exe",
+        "examples\02-udp-echo\$Configuration\udp-echo.exe",
+        "examples\10-typescript-interop\$Configuration\cpp_server.exe",
+        "examples\10-typescript-interop\$Configuration\cpp_client.exe"
+    )
+    
+    $BuiltCount = 0
+    $MissingCount = 0
+    
+    foreach ($Binary in $ExampleBinaries) {
+        $FullPath = Join-Path "$ProjectRoot\build\windows-x64" $Binary
+        if (Test-Path $FullPath) {
+            Write-Host "  [OK] $Binary" -ForegroundColor Green
+            $BuiltCount++
+        } else {
+            Write-Host "  [MISSING] $Binary" -ForegroundColor Red
+            $MissingCount++
+        }
+    }
+    
+    Write-Host "`nExamples built: $BuiltCount / $($ExampleBinaries.Length)" -ForegroundColor Cyan
+    
+    if ($MissingCount -gt 0) {
+        Write-Warning "Some examples were not built. Check CMakeLists.txt configuration."
+    }
+    
+    Write-Host "`nNote: Examples 03-09 require API updates and are temporarily disabled." -ForegroundColor Yellow
+    Write-Host "Note: Examples require manual testing. See examples/README.md for usage." -ForegroundColor Yellow
+}
+
 # Run tests
 if (-not $SkipTests) {
     Write-Host "`nRunning tests..." -ForegroundColor Cyan
@@ -118,7 +159,7 @@ if (-not $SkipTests) {
         exit $TestExitCode
     }
 } else {
-    Write-Host "`nSkipping tests (--SkipTests specified)" -ForegroundColor Yellow
+    Write-Host "`nSkipping tests (-SkipTests specified)" -ForegroundColor Yellow
 }
 
 Pop-Location

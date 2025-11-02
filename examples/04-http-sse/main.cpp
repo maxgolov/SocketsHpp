@@ -22,13 +22,13 @@ int main()
 {
     try
     {
-        HttpServer server(8080);
+        HttpServer server("0.0.0.0", 8080);
         std::cout << "SSE Server starting on http://localhost:8080" << std::endl;
 
         // Serve a simple HTML page with SSE client
-        server.route("/", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/", [](const HttpRequest& req, HttpResponse& res) -> int {
             res.set_header("Content-Type", "text/html");
-            res.send(R"(
+            res.set_content(R"(
 <!DOCTYPE html>
 <html>
 <head><title>SSE Demo</title></head>
@@ -62,10 +62,11 @@ int main()
 </body>
 </html>
             )");
+            return 0;
         });
 
         // SSE endpoint - streams events to clients
-        server.route("/events", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/events", [](const HttpRequest& req, HttpResponse& res) -> int {
             // Set SSE headers
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("Cache-Control", "no-cache");
@@ -106,10 +107,11 @@ int main()
             res.send_chunk(done.format());
 
             std::cout << "SSE stream completed" << std::endl;
+            return 0;
         });
 
         // JSON SSE endpoint - demonstrates structured data
-        server.route("/json-events", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/json-events", [](const HttpRequest& req, HttpResponse& res) -> int {
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("Cache-Control", "no-cache");
 
@@ -124,13 +126,20 @@ int main()
                 res.send_chunk(event.format());
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
+            return 0;
         });
 
         std::cout << "Server running!" << std::endl;
         std::cout << "Open http://localhost:8080 to see SSE in action" << std::endl;
         std::cout << "Or use curl: curl -N http://localhost:8080/events" << std::endl;
 
-        server.listen();
+        server.start();
+        
+        // Keep server running
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
         return 0;
     }
     catch (const std::exception& e)

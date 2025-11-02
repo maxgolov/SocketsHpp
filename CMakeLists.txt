@@ -21,6 +21,7 @@ endif()
 # Optional: Enable sanitizers for debug builds
 option(ENABLE_ASAN "Enable Address Sanitizer" OFF)
 option(ENABLE_UBSAN "Enable Undefined Behavior Sanitizer" OFF)
+option(BUILD_EXAMPLES "Build example programs" OFF)
 
 if(ENABLE_ASAN AND NOT MSVC)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
@@ -72,6 +73,26 @@ endif()
 find_package(GTest)
 if (GTest_FOUND)
   add_subdirectory(test)
+endif()
+
+# Build examples if requested
+if(BUILD_EXAMPLES)
+    message(STATUS "Building examples")
+    
+    # Set SOCKETSHPP_INCLUDE_DIR for examples that use find_path
+    set(SOCKETSHPP_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    
+    add_subdirectory(examples/01-tcp-echo)
+    add_subdirectory(examples/02-udp-echo)
+    # Examples 03-09 need API updates - skip for now
+    # add_subdirectory(examples/03-http-server)
+    # add_subdirectory(examples/04-http-sse)
+    # add_subdirectory(examples/05-mcp-server)
+    # add_subdirectory(examples/06-proxy-aware)
+    # add_subdirectory(examples/07-authentication)
+    # add_subdirectory(examples/08-compression)
+    # add_subdirectory(examples/09-full-featured)
+    add_subdirectory(examples/10-typescript-interop)
 endif()
 
 # Examples are standalone - build them separately from their own directories

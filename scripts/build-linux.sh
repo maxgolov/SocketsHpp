@@ -16,6 +16,7 @@ CONFIGURATION="Debug"
 SKIP_TESTS=false
 CLEAN=false
 VERBOSE=false
+BUILD_EXAMPLES=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -36,6 +37,10 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=true
             shift
             ;;
+        --build-examples)
+            BUILD_EXAMPLES=true
+            shift
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -44,6 +49,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-tests   Skip running tests"
             echo "  --clean        Clean build directory before building"
             echo "  --verbose      Verbose build output"
+            echo "  --build-examples Build example programs"
             echo "  --help         Show this help message"
             exit 0
             ;;
@@ -108,6 +114,11 @@ CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE="$CONFIGURATION"
 )
 
+# Enable examples if requested
+if [ "$BUILD_EXAMPLES" = true ]; then
+    CMAKE_ARGS+=(-DBUILD_EXAMPLES=ON)
+fi
+
 # Use Ninja if available
 if [ "$USE_NINJA" = true ]; then
     CMAKE_ARGS+=(-G Ninja)
@@ -145,6 +156,42 @@ if [ $? -ne 0 ]; then
 fi
 
 echo -e "\n${GREEN}Build completed successfully!${NC}"
+
+# Verify examples if built
+if [ "$BUILD_EXAMPLES" = true ]; then
+    echo -e "\n${CYAN}Verifying examples...${NC}"
+    
+    # List all example executables
+    EXAMPLES=(
+        "examples/01-tcp-echo/tcp-echo"
+        "examples/02-udp-echo/udp-echo"
+        "examples/10-typescript-interop/cpp_server"
+        "examples/10-typescript-interop/cpp_client"
+    )
+    
+    BUILT_COUNT=0
+    MISSING_COUNT=0
+    
+    for EXAMPLE in "${EXAMPLES[@]}"; do
+        FULL_PATH="build/linux-x64/$EXAMPLE"
+        if [ -f "$FULL_PATH" ]; then
+            echo -e "  ${GREEN}[✓]${NC} $EXAMPLE"
+            BUILT_COUNT=$((BUILT_COUNT + 1))
+        else
+            echo -e "  ${RED}[✗]${NC} $EXAMPLE (not found)"
+            MISSING_COUNT=$((MISSING_COUNT + 1))
+        fi
+    done
+    
+    echo -e "\n${CYAN}Examples built: $BUILT_COUNT / ${#EXAMPLES[@]}${NC}"
+    
+    if [ $MISSING_COUNT -gt 0 ]; then
+        echo -e "${YELLOW}Warning: Some examples were not built. Check CMakeLists.txt configuration.${NC}"
+    fi
+    
+    echo -e "\n${YELLOW}Note: Examples 03-09 require API updates and are temporarily disabled.${NC}"
+    echo -e "${YELLOW}Note: Examples require manual testing. See examples/README.md for usage.${NC}"
+fi
 
 # Run tests
 if [ "$SKIP_TESTS" = false ]; then

@@ -27,7 +27,7 @@ int main()
 
         // Set destination address
         SocketAddr destination("127.0.0.1:40000");
-        std::cout << "Sending to " << destination.to_string() << std::endl;
+        std::cout << "Sending to " << destination.toString() << std::endl;
 
         // Connect sets the default destination for send()
         client.connect(destination);

@@ -3,6 +3,31 @@
 
 set -e
 
+# Default values
+BUILD_EXAMPLES=false
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --build-examples)
+            BUILD_EXAMPLES=true
+            shift
+            ;;
+        --help)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --build-examples Build example programs"
+            echo "  --help           Show this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
 echo "========================================"
 echo "ARM64 Cross-Compilation Build"
 echo "========================================"
@@ -86,21 +111,71 @@ echo "Configuring CMake for ARM64..."
 # Set QEMU_LD_PREFIX for test discovery during build
 export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
 
-cmake -B build/linux-arm64 -S . \
-    -GNinja \
-    -DCMAKE_SYSTEM_NAME=Linux \
-    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-    -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-    -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
-    -DCMAKE_PREFIX_PATH=$GTEST_ARM64_DIR \
-    -DCMAKE_FIND_ROOT_PATH="/usr/aarch64-linux-gnu;$GTEST_ARM64_DIR;$(pwd)/build/linux-arm64/external" \
-    -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
-    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+CMAKE_ARGS=(
+    -B build/linux-arm64
+    -S .
+    -GNinja
+    -DCMAKE_SYSTEM_NAME=Linux
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64
+    -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc
+    -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+    -DCMAKE_PREFIX_PATH=$GTEST_ARM64_DIR
+    -DCMAKE_FIND_ROOT_PATH="/usr/aarch64-linux-gnu;$GTEST_ARM64_DIR;$(pwd)/build/linux-arm64/external"
+    -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
     -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+)
+
+# Enable examples if requested
+if [ "$BUILD_EXAMPLES" = true ]; then
+    CMAKE_ARGS+=(-DBUILD_EXAMPLES=ON)
+fi
+
+cmake "${CMAKE_ARGS[@]}"
 
 echo ""
 echo "Building for ARM64 architecture..."
 cmake --build build/linux-arm64 -j $(nproc)
+
+# Verify examples if built
+if [ "$BUILD_EXAMPLES" = true ]; then
+    echo ""
+    echo "========================================"
+    echo "Verifying ARM64 Examples"
+    echo "========================================"
+    
+    EXAMPLES=(
+        "examples/01-tcp-echo/tcp-echo"
+        "examples/02-udp-echo/udp-echo"
+        "examples/10-typescript-interop/cpp_server"
+        "examples/10-typescript-interop/cpp_client"
+    )
+    
+    BUILT_COUNT=0
+    MISSING_COUNT=0
+    
+    for EXAMPLE in "${EXAMPLES[@]}"; do
+        FULL_PATH="build/linux-arm64/$EXAMPLE"
+        if [ -f "$FULL_PATH" ]; then
+            echo "  [✓] $EXAMPLE"
+            BUILT_COUNT=$((BUILT_COUNT + 1))
+        else
+            echo "  [✗] $EXAMPLE (not found)"
+            MISSING_COUNT=$((MISSING_COUNT + 1))
+        fi
+    done
+    
+    echo ""
+    echo "Examples built: $BUILT_COUNT / ${#EXAMPLES[@]}"
+    
+    if [ $MISSING_COUNT -gt 0 ]; then
+        echo "Warning: Some examples were not built. Check CMakeLists.txt configuration."
+    fi
+    
+    echo ""
+    echo "Note: Examples 03-09 require API updates and are temporarily disabled."
+    echo "Note: Examples require manual testing. See examples/README.md for usage."
+fi
 
 # Verify build artifacts
 echo ""
