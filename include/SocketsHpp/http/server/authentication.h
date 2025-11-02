@@ -3,6 +3,7 @@
 #pragma once
 
 #include <SocketsHpp/config.h>
+#include <SocketsHpp/utils/base64.h>
 #include <functional>
 #include <string>
 #include <memory>
@@ -236,10 +237,18 @@ namespace http
 
                 // Extract base64 credentials
                 auto base64Creds = authHeader.substr(basicPrefix.length());
-                
-                // Decode base64
-                auto credentials = decodeBase64(base64Creds);
-                
+
+                // Decode base64 using unified utility
+                std::string credentials;
+                try
+                {
+                    credentials = SocketsHpp::utils::Base64::decode(base64Creds);
+                }
+                catch (const std::invalid_argument& e)
+                {
+                    return AuthResult::failure("Invalid base64 encoding in credentials");
+                }
+
                 // Split into username:password
                 auto colonPos = credentials.find(':');
                 if (colonPos == std::string::npos)
@@ -259,35 +268,6 @@ namespace http
             std::string getChallenge() const override
             {
                 return "Basic realm=\"" + m_realm + "\"";
-            }
-
-        private:
-            static std::string decodeBase64(const std::string& input)
-            {
-                static const std::string base64Chars =
-                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-                std::string output;
-                std::vector<int> decodingTable(256, -1);
-                
-                for (int i = 0; i < 64; ++i)
-                {
-                    decodingTable[static_cast<unsigned char>(base64Chars[i])] = i;
-                }
-
-                int val = 0, valb = -8;
-                for (unsigned char c : input)
-                {
-                    if (decodingTable[c] == -1) break;
-                    val = (val << 6) + decodingTable[c];
-                    valb += 6;
-                    if (valb >= 0)
-                    {
-                        output.push_back(char((val >> valb) & 0xFF));
-                        valb -= 8;
-                    }
-                }
-                return output;
             }
         };
 

@@ -26,6 +26,21 @@ namespace http
         using SocketAddr = net::utils::SocketAddr;
         using SocketParams = net::utils::SocketParams;
 
+        // Case-insensitive string comparator for HTTP headers
+        struct CaseInsensitiveCompare
+        {
+            bool operator()(const std::string& lhs, const std::string& rhs) const
+            {
+                return std::lexicographical_compare(
+                    lhs.begin(), lhs.end(),
+                    rhs.begin(), rhs.end(),
+                    [](unsigned char a, unsigned char b) {
+                        return std::tolower(a) < std::tolower(b);
+                    }
+                );
+            }
+        };
+
         // Import commonly used constants into server namespace for convenience
         using constants::CONTENT_TYPE;
         using constants::CONTENT_TYPE_TEXT;
@@ -402,6 +417,51 @@ namespace http
             std::string protocol;
             std::map<std::string, std::string> headers;
             std::string content;
+
+            // Convenience methods for header access
+
+            /// @brief Normalize header name to Title-Case format
+            /// @param name Header name in any case
+            /// @return Normalized header name
+            static std::string normalize_header_name(const std::string& name)
+            {
+                std::string result = name;
+                bool first = true;
+                for (char& ch : result)
+                {
+                    if (first)
+                    {
+                        ch = static_cast<char>(::toupper(static_cast<unsigned char>(ch)));
+                        first = false;
+                    }
+                    else if (ch == '-')
+                    {
+                        first = true;
+                    }
+                    else
+                    {
+                        ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
+                    }
+                }
+                return result;
+            }
+
+            /// @brief Check if header exists (case-insensitive)
+            /// @param name Header name (any case)
+            /// @return true if header exists
+            bool has_header(const std::string& name) const
+            {
+                return headers.find(normalize_header_name(name)) != headers.end();
+            }
+
+            /// @brief Get header value (case-insensitive)
+            /// @param name Header name (any case)
+            /// @return Header value, or empty string if not found
+            std::string get_header_value(const std::string& name) const
+            {
+                auto it = headers.find(normalize_header_name(name));
+                return (it != headers.end()) ? it->second : "";
+            }
             
             /// @brief Parse query parameters from URI with security validation
             /// @return Map of query parameter key-value pairs
@@ -593,12 +653,75 @@ namespace http
             std::string message;
             std::map<std::string, std::string> headers;
             std::string body;
-            
+
             // Streaming support
             bool streaming = false;
             bool useChunkedEncoding = false;
             std::function<std::string()> streamCallback;  // Returns chunk data, empty string = end
             std::function<void()> onStreamEnd;            // Called when stream completes
+
+            // Convenience methods for API consistency
+
+            /// @brief Set HTTP status code
+            /// @param statusCode HTTP status code (e.g., 200, 404, 500)
+            /// @param statusMessage Optional custom message (defaults to standard message)
+            void set_status(int statusCode, const std::string& statusMessage = "")
+            {
+                code = statusCode;
+                message = statusMessage;  // Set message directly; will be filled with default if empty during processing
+            }
+
+            /// @brief Set response header (case-insensitive, normalized to Title-Case)
+            /// @param name Header name (any case)
+            /// @param value Header value
+            void set_header(const std::string& name, const std::string& value)
+            {
+                headers[HttpRequest::normalize_header_name(name)] = value;
+            }
+
+            /// @brief Set response content with optional content type
+            /// @param content Response body content
+            /// @param contentType MIME type (defaults to text/plain)
+            void set_content(const std::string& content, const std::string& contentType = CONTENT_TYPE_TEXT)
+            {
+                body = content;
+                headers[constants::CONTENT_TYPE] = contentType;
+            }
+
+            /// @brief Send response body (convenience alias for set_content)
+            /// @param content Response body content
+            void send(const std::string& content)
+            {
+                body = content;
+            }
+
+            /// @brief Setup streaming response with chunked encoding
+            /// @param callback Function that returns chunk data (empty string = end of stream)
+            /// @param onEnd Optional callback when stream completes
+            void send_chunk_stream(std::function<std::string()> callback, std::function<void()> onEnd = nullptr)
+            {
+                streaming = true;
+                useChunkedEncoding = true;
+                streamCallback = std::move(callback);
+                onStreamEnd = std::move(onEnd);
+            }
+
+            /// @brief Send a single chunk (for manual chunked streaming)
+            /// @param chunk Chunk data to send
+            /// @note This is used internally; for setting up streaming use send_chunk_stream
+            void send_chunk(const std::string& chunk)
+            {
+                // This is a placeholder for API compatibility
+                // Actual chunking is handled by the server's streaming mechanism
+                if (chunk.empty())
+                {
+                    streaming = false;
+                }
+                else
+                {
+                    body += chunk;
+                }
+            }
         };
 
         using CallbackFunction = std::function<int(HttpRequest const& request, HttpResponse& response)>;
@@ -872,6 +995,26 @@ namespace http
                 m_handlers.push_back(HttpRequestHandler(other.first, &other.second));
                 return (*this);
             };
+
+            /// @brief Register a route with a handler function (convenience method)
+            /// @param path URI prefix to match
+            /// @param handler Callback function to handle requests
+            /// @return Reference to the created handler
+            HttpRequestHandler& route(const std::string& path, CallbackFunction handler)
+            {
+                m_handlers.push_back({ path, nullptr });
+                auto& handlerRef = m_handlers.back();
+                handlerRef.second = new HttpRequestCallback(handler);
+                LOG_INFO("HttpServer: Added route for %s", path.c_str());
+                return handlerRef;
+            }
+
+            /// @brief Set maximum request content size (convenience alias)
+            /// @param maxSize Maximum allowed content size in bytes
+            void setMaxRequestContentSize(size_t maxSize)
+            {
+                m_maxRequestContentSize = maxSize;
+            }
 
             void start() { m_reactor.start(); }
 
