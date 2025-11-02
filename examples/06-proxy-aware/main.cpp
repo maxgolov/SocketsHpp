@@ -21,7 +21,7 @@
 #include <string>
 
 using namespace SOCKETSHPP_NS;
-using namespace SOCKETSHPP_NS::http::server;
+using namespace SOCKETSHPP_NS::net::common;
 
 // Simple HTTP request structure
 struct HttpRequest
@@ -108,26 +108,26 @@ int main()
     {
         // Configure proxy trust settings
         // In production, only trust specific proxy IPs for security
-        TrustProxyConfig config;
+        SOCKETSHPP_NS::http::server::TrustProxyConfig config;
         
         // Option 1: Trust all proxies (INSECURE - only for testing)
-        // config.setTrustMode(TrustMode::TrustAll);
+        // config.setMode(SOCKETSHPP_NS::http::server::TrustProxyConfig::TrustMode::TrustAll);
         
         // Option 2: Trust specific proxy IPs (RECOMMENDED)
-        config.setTrustMode(TrustMode::TrustSpecific);
+        config.setMode(SOCKETSHPP_NS::http::server::TrustProxyConfig::TrustMode::TrustSpecific);
         config.addTrustedProxy("127.0.0.1");     // localhost nginx
         config.addTrustedProxy("10.0.0.1");      // internal load balancer
         config.addTrustedProxy("172.16.0.1");    // reverse proxy
         
         std::cout << "Proxy-Aware HTTP Server\n";
         std::cout << "======================\n";
-        std::cout << "Trust mode: " << (config.getTrustMode() == TrustMode::TrustSpecific ? "Specific IPs" : "All") << "\n";
+        std::cout << "Trust mode: Specific IPs\n";
         std::cout << "Listening on http://localhost:8080\n\n";
         
         // Create TCP server
-        tcp::SocketServer<> server(8080);
+        SocketServer<> server(8080);
         
-        server.onConnect([&config](tcp::SocketConnection<>& connection)
+        server.onConnect([&config](SocketConnection<>& connection)
         {
             std::cout << "Client connected from: " << connection.remoteAddress() << "\n";
             
@@ -136,11 +136,17 @@ int main()
                 // Parse HTTP request
                 HttpRequest req = parseRequest(message);
                 
+                std::string remoteAddr = connection.remoteAddress();
+                
                 // Extract real client information using ProxyAwareHelpers
-                std::string protocol = ProxyAwareHelpers::getProtocol(req, config);
-                std::string clientIP = ProxyAwareHelpers::getClientIP(req, config);
-                std::string host = ProxyAwareHelpers::getHost(req, config);
-                bool isSecure = ProxyAwareHelpers::isSecure(req, config);
+                std::string protocol = SOCKETSHPP_NS::http::server::ProxyAwareHelpers::getProtocol(
+                    req.headers, remoteAddr, config);
+                std::string clientIP = SOCKETSHPP_NS::http::server::ProxyAwareHelpers::getClientIP(
+                    req.headers, remoteAddr, config);
+                std::string host = SOCKETSHPP_NS::http::server::ProxyAwareHelpers::getHost(
+                    req.headers, config);
+                bool isSecure = SOCKETSHPP_NS::http::server::ProxyAwareHelpers::isSecure(
+                    req.headers, remoteAddr, config);
                 
                 // Build response showing extracted information
                 std::ostringstream responseBody;
@@ -229,3 +235,4 @@ int main()
     
     return 0;
 }
+

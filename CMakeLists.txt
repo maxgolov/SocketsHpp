@@ -84,10 +84,10 @@ if(BUILD_EXAMPLES)
     
     add_subdirectory(examples/01-tcp-echo)
     add_subdirectory(examples/02-udp-echo)
-    # Examples 03-09 need API updates - skip for now
-    # add_subdirectory(examples/03-http-server)
-    # add_subdirectory(examples/04-http-sse)
-    # add_subdirectory(examples/05-mcp-server)
+    add_subdirectory(examples/03-http-server)
+    add_subdirectory(examples/04-http-sse)
+    add_subdirectory(examples/05-mcp-server)
+    # Examples 06,07,08,09 use SocketServer API that doesn't exist - need full rewrite
     # add_subdirectory(examples/06-proxy-aware)
     # add_subdirectory(examples/07-authentication)
     # add_subdirectory(examples/08-compression)

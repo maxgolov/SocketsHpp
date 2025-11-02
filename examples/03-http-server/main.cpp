@@ -64,7 +64,7 @@ int main()
 
         // Echo endpoint with query parameters
         server.route("/echo", [](const HttpRequest& req, HttpResponse& res) -> int {
-            auto params = req.getQueryParams();
+            auto params = req.parse_query();
             std::string msg = "No message provided";
             
             auto it = params.find("msg");
@@ -80,7 +80,7 @@ int main()
         // POST endpoint for JSON data
         server.route("/api/data", [](const HttpRequest& req, HttpResponse& res) -> int {
             if (req.method == "POST") {
-                std::string body = req.getBody();
+                std::string body = req.content;
                 res.set_header("Content-Type", "application/json");
                 res.set_content(R"({"received": )" + std::to_string(body.length()) + R"( bytes", "status": "ok"})");
             } else {

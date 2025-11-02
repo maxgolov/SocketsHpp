@@ -103,6 +103,9 @@ if ($BuildExamples) {
     $ExampleBinaries = @(
         "examples\01-tcp-echo\$Configuration\tcp-echo.exe",
         "examples\02-udp-echo\$Configuration\udp-echo.exe",
+        "examples\03-http-server\$Configuration\http-server.exe",
+        "examples\04-http-sse\$Configuration\http-sse.exe",
+        "examples\05-mcp-server\$Configuration\mcp-server.exe",
         "examples\10-typescript-interop\$Configuration\cpp_server.exe",
         "examples\10-typescript-interop\$Configuration\cpp_client.exe"
     )
@@ -127,12 +130,9 @@ if ($BuildExamples) {
         Write-Warning "Some examples were not built. Check CMakeLists.txt configuration."
     }
     
-    Write-Host "`nNote: Examples 03-09 require API updates and are temporarily disabled." -ForegroundColor Yellow
+    Write-Host "`nNote: Examples 06-09 use incompatible SocketServer API - disabled pending rewrite." -ForegroundColor Yellow
     Write-Host "Note: Examples require manual testing. See examples/README.md for usage." -ForegroundColor Yellow
-}
-
-# Run tests
-if (-not $SkipTests) {
+}if (-not $SkipTests) {
     Write-Host "`nRunning tests..." -ForegroundColor Cyan
     Push-Location "$ProjectRoot\build\windows-x64"
     

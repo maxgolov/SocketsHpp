@@ -30,33 +30,32 @@ int main()
 {
     try
     {
-        HttpServer server(8080);
+        HttpServer server("0.0.0.0", 8080);
         std::cout << "MCP Server starting on http://localhost:8080" << std::endl;
 
-        // Configure CORS for web-based MCP clients
-        HttpServer::CorsConfig cors;
-        cors.allow_origin = "*";  // In production, specify allowed origins
-        cors.allow_methods = "GET, POST, DELETE, OPTIONS";
-        cors.allow_headers = "Content-Type, Authorization";
-        cors.max_age = 3600;
+        // Configure CORS for web-based MCP clients (note: CorsConfig not in current API, manual headers)
+        const std::string allow_origin = "*";
+        const std::string allow_methods = "GET, POST, DELETE, OPTIONS";
+        const std::string allow_headers = "Content-Type, Authorization";
+        const int max_age = 3600;
 
         // OPTIONS handler for CORS preflight
-        server.route("/sse", [&cors](const HttpRequest& req, HttpResponse& res) {
+        server.route("/sse", [&](const HttpRequest& req, HttpResponse& res) -> int {
             if (req.method == "OPTIONS") {
-                res.set_header("Access-Control-Allow-Origin", cors.allow_origin);
-                res.set_header("Access-Control-Allow-Methods", cors.allow_methods);
-                res.set_header("Access-Control-Allow-Headers", cors.allow_headers);
-                res.set_header("Access-Control-Max-Age", std::to_string(cors.max_age));
+                res.set_header("Access-Control-Allow-Origin", allow_origin);
+                res.set_header("Access-Control-Allow-Methods", allow_methods);
+                res.set_header("Access-Control-Allow-Headers", allow_headers);
+                res.set_header("Access-Control-Max-Age", std::to_string(max_age));
                 res.set_status(204);
-                res.send("");
-                return;
+                res.set_content("");
+                return 0;
             }
 
             // SSE endpoint for MCP messages
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("Cache-Control", "no-cache");
             res.set_header("Connection", "keep-alive");
-            res.set_header("Access-Control-Allow-Origin", cors.allow_origin);
+            res.set_header("Access-Control-Allow-Origin", allow_origin);
 
             // Create session
             std::string session_id;
@@ -126,10 +125,11 @@ int main()
             }
 
             std::cout << "MCP session ended: " << session_id << std::endl;
+            return 0;
         });
 
         // DELETE handler for session cleanup
-        server.route("/session", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/session", [&](const HttpRequest& req, HttpResponse& res) -> int {
             if (req.method == "DELETE") {
                 // Extract session ID from Authorization header or query param
                 std::string session_id = "demo-session";  // Simplified
@@ -141,25 +141,26 @@ int main()
                 
                 std::cout << "Deleted session: " << session_id << std::endl;
                 
-                res.set_header("Access-Control-Allow-Origin", "*");
+                res.set_header("Access-Control-Allow-Origin", allow_origin);
                 res.set_status(204);  // No Content
-                res.send("");
+                res.set_content("");
             } else if (req.method == "OPTIONS") {
-                res.set_header("Access-Control-Allow-Origin", "*");
+                res.set_header("Access-Control-Allow-Origin", allow_origin);
                 res.set_header("Access-Control-Allow-Methods", "DELETE, OPTIONS");
                 res.set_status(204);
-                res.send("");
+                res.set_content("");
             } else {
                 res.set_status(405);  // Method Not Allowed
-                res.send("Only DELETE and OPTIONS allowed");
+                res.set_content("Only DELETE and OPTIONS allowed");
             }
+            return 0;
         });
 
         // Info endpoint (optional MCP metadata)
-        server.route("/info", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/info", [&](const HttpRequest& req, HttpResponse& res) -> int {
             res.set_header("Content-Type", "application/json");
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.send(R"({
+            res.set_header("Access-Control-Allow-Origin", allow_origin);
+            res.set_content(R"({
                 "name": "SocketsHpp MCP Server",
                 "version": "1.0.0",
                 "protocol": "mcp/1.0",
@@ -170,19 +171,21 @@ int main()
                     "resources": false
                 }
             })");
+            return 0;
         });
 
         // Base64 demo endpoint
-        server.route("/base64", [](const HttpRequest& req, HttpResponse& res) {
+        server.route("/base64", [&](const HttpRequest& req, HttpResponse& res) -> int {
             if (req.method == "POST") {
-                std::string input = req.body;
+                std::string input = req.content;
                 std::string encoded = base64::encode(input);
                 
                 res.set_header("Content-Type", "application/json");
-                res.send(R"({"original":")" + input + R"(","encoded":")" + encoded + R"("})");
+                res.set_content(R"({"original":")" + input + R"(","encoded":")" + encoded + R"("})");
             } else {
-                res.send("Send POST request with data to encode");
+                res.set_content("Send POST request with data to encode");
             }
+            return 0;
         });
 
         std::cout << "MCP Server ready!" << std::endl;
@@ -192,7 +195,13 @@ int main()
         std::cout << "  GET  /info     - Server metadata" << std::endl;
         std::cout << "  POST /base64   - Base64 encoding demo" << std::endl;
 
-        server.listen();
+        server.start();
+        
+        // Keep server running
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
         return 0;
     }
     catch (const std::exception& e)

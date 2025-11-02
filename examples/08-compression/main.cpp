@@ -24,8 +24,8 @@
 #include <sstream>
 
 using namespace SOCKETSHPP_NS;
-using namespace SOCKETSHPP_NS::http::server;
-using namespace SOCKETSHPP_NS::http::server::compression;
+using namespace SOCKETSHPP_NS::net::common;
+
 
 // Simple HTTP request/response structures
 struct HttpRequest
@@ -130,21 +130,21 @@ int main()
     try
     {
         // Register compression strategies
-        registerSimpleCompression(); // RLE and Identity for testing
+        SOCKETSHPP_NS::http::server::compression::registerSimpleCompression(); // RLE and Identity for testing
         
 #ifdef _WIN32
         // Register Windows compression (MSZIP, XPRESS, LZMS)
-        registerWindowsCompression();
+        SOCKETSHPP_NS::http::server::compression::registerWindowsCompression();
         std::cout << "Windows Compression API registered (MSZIP, XPRESS, LZMS)\n";
 #endif
         
         // Create compression middleware
-        CompressionMiddleware middleware;
+        SOCKETSHPP_NS::http::server::compression::CompressionMiddleware middleware;
         middleware.setMinSize(500); // Only compress responses > 500 bytes
         middleware.setLevel(6);      // Compression level (1-9)
         
         // Show registered compression algorithms
-        auto encodings = CompressionRegistry::instance().supportedEncodings();
+        auto encodings = SOCKETSHPP_NS::http::server::compression::SOCKETSHPP_NS::http::server::compression::CompressionRegistry::instance().supportedEncodings();
         std::cout << "Compression Server\n";
         std::cout << "==================\n";
         std::cout << "Supported encodings: ";
@@ -294,3 +294,5 @@ int main()
     
     return 0;
 }
+
+

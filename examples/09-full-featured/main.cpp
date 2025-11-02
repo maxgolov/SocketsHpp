@@ -26,8 +26,8 @@
 #include <map>
 
 using namespace SOCKETSHPP_NS;
-using namespace SOCKETSHPP_NS::http::server;
-using namespace SOCKETSHPP_NS::http::server::compression;
+using namespace SOCKETSHPP_NS::net::common;
+
 
 // HTTP request/response structures
 struct HttpRequest
@@ -121,19 +121,19 @@ std::map<std::string, std::string> validUsers = {
 };
 
 // Auth callbacks
-AuthResult validateBearerToken(const std::string& token)
+SOCKETSHPP_NS::http::server::AuthResult validateBearerToken(const std::string& token)
 {
     auto it = validTokens.find(token);
     return it != validTokens.end() ? AuthResult::success(it->second) : AuthResult::failure("Invalid token");
 }
 
-AuthResult validateApiKey(const std::string& apiKey)
+SOCKETSHPP_NS::http::server::AuthResult validateApiKey(const std::string& apiKey)
 {
     auto it = validApiKeys.find(apiKey);
     return it != validApiKeys.end() ? AuthResult::success(it->second) : AuthResult::failure("Invalid API key");
 }
 
-AuthResult validateBasicAuth(const std::string& username, const std::string& password)
+SOCKETSHPP_NS::http::server::AuthResult validateBasicAuth(const std::string& username, const std::string& password)
 {
     auto it = validUsers.find(username);
     return (it != validUsers.end() && it->second == password) ? AuthResult::success(username) : AuthResult::failure("Invalid credentials");
@@ -176,30 +176,30 @@ int main()
     try
     {
         // Configure proxy trust
-        TrustProxyConfig proxyConfig;
-        proxyConfig.setTrustMode(TrustMode::TrustSpecific);
+        SOCKETSHPP_NS::http::server::TrustProxyConfig proxyConfig;
+        proxyConfig.setTrustMode(SOCKETSHPP_NS::http::server::TrustProxyConfig::SOCKETSHPP_NS::http::server::TrustProxyConfig::TrustMode::TrustSpecific);
         proxyConfig.addTrustedProxy("127.0.0.1");
         
         // Configure authentication
-        AuthenticationMiddleware<HttpRequest, HttpResponse> authMiddleware;
-        authMiddleware.addStrategy(std::make_shared<BearerTokenAuth<HttpRequest>>(validateBearerToken));
-        authMiddleware.addStrategy(std::make_shared<ApiKeyAuth<HttpRequest>>(validateApiKey, "X-API-Key"));
-        authMiddleware.addStrategy(std::make_shared<BasicAuth<HttpRequest>>(validateBasicAuth));
+        SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::AuthenticationMiddleware<HttpRequest, HttpResponse> authMiddleware;
+        authMiddleware.addStrategy(std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::BearerTokenAuth<HttpRequest>>(validateBearerToken));
+        authMiddleware.addStrategy(std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::ApiKeyAuth<HttpRequest>>(validateApiKey, "X-API-Key"));
+        authMiddleware.addStrategy(std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::BasicAuth<HttpRequest>>(validateBasicAuth));
         
-        authMiddleware.setAuthenticatedCallback([](HttpRequest& req, const AuthResult& authResult)
+        authMiddleware.setAuthenticatedCallback([](HttpRequest& req, const SOCKETSHPP_NS::http::server::AuthResult& SOCKETSHPP_NS::http::server::AuthResult)
         {
-            std::cout << "  ✓ Authenticated: " << authResult.userId << "\n";
+            std::cout << "  ✓ Authenticated: " << SOCKETSHPP_NS::http::server::AuthResult.userId << "\n";
         });
         
         // Configure compression
-        registerSimpleCompression();
+        SOCKETSHPP_NS::http::server::compression::registerSimpleCompression();
 #ifdef _WIN32
-        registerWindowsCompression();
+        SOCKETSHPP_NS::http::server::compression::registerWindowsCompression();
 #endif
         
-        CompressionMiddleware compressionMiddleware;
-        compressionMiddleware.setMinSize(500);
-        compressionMiddleware.setLevel(6);
+        SOCKETSHPP_NS::http::server::compression::CompressionMiddleware SOCKETSHPP_NS::http::server::compression::CompressionMiddleware;
+        SOCKETSHPP_NS::http::server::compression::CompressionMiddleware.setMinSize(500);
+        SOCKETSHPP_NS::http::server::compression::CompressionMiddleware.setLevel(6);
         
         std::cout << "Full-Featured HTTP Server\n";
         std::cout << "==========================\n";
@@ -258,13 +258,13 @@ int main()
                 else if (req.path.find("/api/") == 0)
                 {
                     // Protected endpoints - require authentication
-                    AuthResult authResult = authMiddleware.authenticate(req, res);
+                    SOCKETSHPP_NS::http::server::AuthResult SOCKETSHPP_NS::http::server::AuthResult = authMiddleware.authenticate(req, res);
                     
-                    if (!authResult)
+                    if (!SOCKETSHPP_NS::http::server::AuthResult)
                     {
                         res.status = 401;
                         res.statusText = "Unauthorized";
-                        res.set_content("{\"error\": \"" + authResult.errorMessage + "\"}");
+                        res.set_content("{\"error\": \"" + SOCKETSHPP_NS::http::server::AuthResult.errorMessage + "\"}");
                         res.set_header("Content-Type", "application/json");
                         std::cout << "  ✗ Authentication failed\n";
                     }
@@ -274,7 +274,7 @@ int main()
                         if (req.path == "/api/user")
                         {
                             std::ostringstream json;
-                            json << "{\n  \"userId\": \"" << authResult.userId << "\",\n";
+                            json << "{\n  \"userId\": \"" << SOCKETSHPP_NS::http::server::AuthResult.userId << "\",\n";
                             json << "  \"clientIP\": \"" << clientIP << "\",\n";
                             json << "  \"protocol\": \"" << protocol << "\",\n";
                             json << "  \"secure\": " << (isSecure ? "true" : "false") << "\n}\n";
@@ -286,7 +286,7 @@ int main()
                         {
                             // Large JSON response (will be compressed)
                             std::ostringstream json;
-                            json << "{\n  \"userId\": \"" << authResult.userId << "\",\n  \"data\": [\n";
+                            json << "{\n  \"userId\": \"" << SOCKETSHPP_NS::http::server::AuthResult.userId << "\",\n  \"data\": [\n";
                             for (int i = 0; i < 100; i++)
                             {
                                 json << "    {\"id\": " << i << ", \"value\": \"Item " << i << "\"}";
@@ -318,7 +318,7 @@ int main()
                 // Apply compression
                 size_t originalSize = res.body.size();
                 std::string encoding;
-                bool compressed = compressionMiddleware.compressResponse(
+                bool compressed = SOCKETSHPP_NS::http::server::compression::CompressionMiddleware.compressResponse(
                     req.get_header_value("Accept-Encoding"),
                     res.headers["Content-Type"],
                     res.body,
@@ -358,3 +358,5 @@ int main()
     
     return 0;
 }
+
+

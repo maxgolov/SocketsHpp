@@ -20,7 +20,7 @@
 #include <map>
 
 using namespace SOCKETSHPP_NS;
-using namespace SOCKETSHPP_NS::http::server;
+using namespace SOCKETSHPP_NS::net::common;
 
 // Simple HTTP request/response structures
 struct HttpRequest
@@ -116,37 +116,37 @@ std::map<std::string, std::string> validUsers = {
 };
 
 // Token validator callback
-AuthResult validateBearerToken(const std::string& token)
+SOCKETSHPP_NS::http::server::AuthResult validateBearerToken(const std::string& token)
 {
     auto it = validTokens.find(token);
     if (it != validTokens.end())
     {
         // Return success with user ID
-        return AuthResult::success(it->second);
+        return SOCKETSHPP_NS::http::server::AuthResult::success(it->second);
     }
-    return AuthResult::failure("Invalid token");
+    return SOCKETSHPP_NS::http::server::AuthResult::failure("Invalid token");
 }
 
 // API key validator callback
-AuthResult validateApiKey(const std::string& apiKey)
+SOCKETSHPP_NS::http::server::AuthResult validateApiKey(const std::string& apiKey)
 {
     auto it = validApiKeys.find(apiKey);
     if (it != validApiKeys.end())
     {
-        return AuthResult::success(it->second);
+        return SOCKETSHPP_NS::http::server::AuthResult::success(it->second);
     }
-    return AuthResult::failure("Invalid API key");
+    return SOCKETSHPP_NS::http::server::AuthResult::failure("Invalid API key");
 }
 
 // Basic auth validator callback
-AuthResult validateBasicAuth(const std::string& username, const std::string& password)
+SOCKETSHPP_NS::http::server::AuthResult validateBasicAuth(const std::string& username, const std::string& password)
 {
     auto it = validUsers.find(username);
     if (it != validUsers.end() && it->second == password)
     {
-        return AuthResult::success(username);
+        return SOCKETSHPP_NS::http::server::AuthResult::success(username);
     }
-    return AuthResult::failure("Invalid credentials");
+    return SOCKETSHPP_NS::http::server::AuthResult::failure("Invalid credentials");
 }
 
 // Simple request parser
@@ -197,24 +197,24 @@ int main()
         std::cout << "Listening on http://localhost:8080\n\n";
         
         // Create authentication middleware with multiple strategies
-        AuthenticationMiddleware<HttpRequest, HttpResponse> authMiddleware;
+        SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::AuthenticationMiddleware<HttpRequest, HttpResponse> authMiddleware;
         
         // Add Bearer token authentication
-        auto bearerAuth = std::make_shared<BearerTokenAuth<HttpRequest>>(validateBearerToken);
+        auto bearerAuth = std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::BearerTokenAuth<HttpRequest>>(validateBearerToken);
         authMiddleware.addStrategy(bearerAuth);
         
         // Add API key authentication
-        auto apiKeyAuth = std::make_shared<ApiKeyAuth<HttpRequest>>(validateApiKey, "X-API-Key");
+        auto apiKeyAuth = std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::ApiKeyAuth<HttpRequest>>(validateApiKey, "X-API-Key");
         authMiddleware.addStrategy(apiKeyAuth);
         
         // Add Basic authentication
-        auto basicAuth = std::make_shared<BasicAuth<HttpRequest>>(validateBasicAuth);
+        auto basicAuth = std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::BasicAuth<HttpRequest>>(validateBasicAuth);
         authMiddleware.addStrategy(basicAuth);
         
         // Set authentication callback
-        authMiddleware.setAuthenticatedCallback([](HttpRequest& req, const AuthResult& authResult)
+        authMiddleware.setAuthenticatedCallback([](HttpRequest& req, const SOCKETSHPP_NS::http::server::AuthResult& SOCKETSHPP_NS::http::server::AuthResult)
         {
-            std::cout << "Authenticated user: " << authResult.userId << "\n";
+            std::cout << "Authenticated user: " << SOCKETSHPP_NS::http::server::AuthResult.userId << "\n";
         });
         
         tcp::SocketServer<> server(8080);
@@ -238,17 +238,17 @@ int main()
                 }
                 
                 // Protected endpoint - requires authentication
-                AuthResult authResult = authMiddleware.authenticate(req, res);
+                SOCKETSHPP_NS::http::server::AuthResult SOCKETSHPP_NS::http::server::AuthResult = authMiddleware.authenticate(req, res);
                 
-                if (!authResult)
+                if (!SOCKETSHPP_NS::http::server::AuthResult)
                 {
                     // Authentication failed
                     res.status = 401;
                     res.statusText = "Unauthorized";
-                    res.set_content("{\"error\": \"" + authResult.errorMessage + "\"}");
+                    res.set_content("{\"error\": \"" + SOCKETSHPP_NS::http::server::AuthResult.errorMessage + "\"}");
                     res.set_header("Content-Type", "application/json");
                     
-                    std::cout << "  Authentication failed: " << authResult.errorMessage << "\n";
+                    std::cout << "  Authentication failed: " << SOCKETSHPP_NS::http::server::AuthResult.errorMessage << "\n";
                     
                     connection.send(res.toString());
                     connection.close();
@@ -260,12 +260,12 @@ int main()
                 {
                     std::ostringstream json;
                     json << "{\n";
-                    json << "  \"userId\": \"" << authResult.userId << "\",\n";
+                    json << "  \"userId\": \"" << SOCKETSHPP_NS::http::server::AuthResult.userId << "\",\n";
                     json << "  \"message\": \"Welcome to the protected API!\",\n";
                     json << "  \"claims\": {\n";
                     
                     bool first = true;
-                    for (const auto& [key, value] : authResult.claims)
+                    for (const auto& [key, value] : SOCKETSHPP_NS::http::server::AuthResult.claims)
                     {
                         if (!first) json << ",\n";
                         json << "    \"" << key << "\": \"" << value << "\"";
@@ -281,7 +281,7 @@ int main()
                 else if (req.path == "/api/admin")
                 {
                     // Admin-only endpoint
-                    if (authResult.userId != "admin")
+                    if (SOCKETSHPP_NS::http::server::AuthResult.userId != "admin")
                     {
                         res.status = 403;
                         res.statusText = "Forbidden";
@@ -336,3 +336,5 @@ int main()
     
     return 0;
 }
+
+
