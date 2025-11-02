@@ -71,7 +71,187 @@ cmake -B build/linux-x64 -S . -DCMAKE_BUILD_TYPE=Release -G Ninja
 cmake --build build/linux-x64
 ```
 
-### Integration
+### Integration into Existing Projects
+
+SocketsHpp is a header-only library that can be integrated into your C++ project using several methods:
+
+#### Option 1: vcpkg Overlay Ports (Recommended for vcpkg Users)
+
+Best for projects already using vcpkg. Provides full dependency management and binary caching.
+
+1. **Create overlay port structure:**
+```bash
+mkdir -p my-vcpkg-overlay/ports/socketshpp
+```
+
+2. **Create `my-vcpkg-overlay/ports/socketshpp/vcpkg.json`:**
+```json
+{
+  "name": "socketshpp",
+  "version": "1.0.0",
+  "description": "Modern C++ socket library",
+  "homepage": "https://github.com/maxgolov/SocketsHpp",
+  "license": "Apache-2.0",
+  "dependencies": [
+    "nlohmann-json",
+    "bshoshany-thread-pool"
+  ]
+}
+```
+
+3. **Create `my-vcpkg-overlay/ports/socketshpp/portfile.cmake`:**
+```cmake
+vcpkg_from_github(
+    OUT_SOURCE_PATH SOURCE_PATH
+    REPO maxgolov/SocketsHpp
+    REF main
+    SHA512 0
+    HEAD_REF main
+)
+
+file(INSTALL "${SOURCE_PATH}/include/" 
+     DESTINATION "${CURRENT_PACKAGES_DIR}/include")
+
+file(INSTALL "${SOURCE_PATH}/LICENSE" 
+     DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}" 
+     RENAME copyright)
+```
+
+4. **Configure vcpkg in your project's `vcpkg-configuration.json`:**
+```json
+{
+  "overlay-ports": ["../my-vcpkg-overlay/ports"],
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg"
+  }
+}
+```
+
+5. **Add to your project's `vcpkg.json`:**
+```json
+{
+  "dependencies": ["socketshpp"]
+}
+```
+
+6. **Use in CMakeLists.txt:**
+```cmake
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(bshoshany-thread-pool CONFIG REQUIRED)
+
+add_executable(myapp main.cpp)
+target_include_directories(myapp PRIVATE 
+    ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include)
+target_link_libraries(myapp PRIVATE 
+    nlohmann_json::nlohmann_json
+    bshoshany-thread-pool::bshoshany-thread-pool)
+```
+
+#### Option 2: Git Submodules (Recommended for Version Control)
+
+Best for reproducible builds with tight version control integration.
+
+```bash
+# Add SocketsHpp as submodule
+git submodule add https://github.com/maxgolov/SocketsHpp.git external/SocketsHpp
+
+# Add dependencies
+git submodule add https://github.com/nlohmann/json.git external/nlohmann-json
+git submodule add https://github.com/bshoshany/thread-pool.git external/thread-pool
+
+# Initialize submodules when cloning
+git clone --recursive https://github.com/youruser/yourproject.git
+```
+
+**CMakeLists.txt integration:**
+```cmake
+# Add dependencies
+add_subdirectory(external/nlohmann-json)
+add_subdirectory(external/thread-pool)
+
+# Create interface library for SocketsHpp
+add_library(socketshpp INTERFACE)
+target_include_directories(socketshpp INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/SocketsHpp/include)
+target_compile_features(socketshpp INTERFACE cxx_std_17)
+target_link_libraries(socketshpp INTERFACE 
+    nlohmann_json::nlohmann_json
+    bshoshany-thread-pool::bshoshany-thread-pool)
+
+# Use in your project
+add_executable(myapp main.cpp)
+target_link_libraries(myapp PRIVATE socketshpp)
+```
+
+#### Option 3: CMake FetchContent (Recommended for CMake-Native Projects)
+
+Best for projects wanting zero external dependencies beyond CMake.
+
+```cmake
+include(FetchContent)
+
+# Fetch SocketsHpp
+FetchContent_Declare(socketshpp
+    GIT_REPOSITORY https://github.com/maxgolov/SocketsHpp.git
+    GIT_TAG main
+)
+
+# Fetch dependencies
+FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+
+FetchContent_Declare(thread_pool
+    GIT_REPOSITORY https://github.com/bshoshany/thread-pool.git
+    GIT_TAG v4.1.0
+)
+
+FetchContent_MakeAvailable(nlohmann_json thread_pool)
+
+# Manually handle SocketsHpp (header-only)
+FetchContent_GetProperties(socketshpp)
+if(NOT socketshpp_POPULATED)
+    FetchContent_Populate(socketshpp)
+    
+    add_library(socketshpp INTERFACE)
+    target_include_directories(socketshpp INTERFACE
+        ${socketshpp_SOURCE_DIR}/include)
+    target_compile_features(socketshpp INTERFACE cxx_std_17)
+    target_link_libraries(socketshpp INTERFACE 
+        nlohmann_json::nlohmann_json)
+endif()
+
+# Use in your project
+add_executable(myapp main.cpp)
+target_link_libraries(myapp PRIVATE socketshpp)
+```
+
+#### Option 4: Manual Installation (Simple Projects)
+
+Best for minimal projects or when modifying library source.
+
+```bash
+# Clone repository
+git clone https://github.com/maxgolov/SocketsHpp.git
+
+# Copy headers to your project
+cp -r SocketsHpp/include/SocketsHpp /path/to/your/project/external/include/
+cp -r SocketsHpp/include/sockets.hpp /path/to/your/project/external/include/
+```
+
+**CMakeLists.txt:**
+```cmake
+add_executable(myapp main.cpp)
+target_include_directories(myapp PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/include)
+target_compile_features(myapp PRIVATE cxx_std_17)
+```
+
+**Note:** You'll need to manually install dependencies (nlohmann-json, thread-pool) as well.
+
+#### Basic Usage
 
 Simply include the main header in your project:
 
