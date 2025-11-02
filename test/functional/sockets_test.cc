@@ -118,12 +118,8 @@ namespace testing
         test.Stop();
     }
 
-    // NOTE: UDP echo server test is currently disabled because SocketServer
-    // doesn't properly support UDP datagram handling. The server's reactor-based
-    // architecture is designed for connection-oriented protocols (TCP/Unix sockets)
-    // and doesn't handle the connectionless nature of UDP correctly.
-    // TODO: Fix SocketServer to properly handle UDP datagrams
-    TEST(SocketTests, DISABLED_BasicUdpEchoTest)
+    // UDP echo server test - now enabled with proper datagram handling
+    TEST(SocketTests, BasicUdpEchoTest)
     {
         SocketParams params{ AF_INET, SOCK_DGRAM, 0 };
         SocketAddr destination("127.0.0.1:4000");
@@ -219,3 +215,9 @@ namespace testing
     }
 
 }  // namespace testing
+
+int main(int argc, char **argv)
+{
+    testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

@@ -191,13 +191,39 @@ namespace net
                 else
                 {
                     // UDP datagram connection.
-                    // Read the contents in one shot.
+                    // For UDP, we need to store the connection temporarily to handle async response.
+                    // Create a unique pseudo-socket identifier using server socket + client address hash.
                     Connection conn_udp;
-                    conn_udp.socket = socket;
+                    conn_udp.socket = socket;  // Server socket
                     conn_udp.state = { Connection::Receiving };
+                    
+                    // Read datagram and capture client address
                     ReadDatagramBuffer(conn_udp);
-                    onRequest(conn_udp);
-                    HandleConnection(conn_udp);
+                    
+                    if (conn_udp.state.count(Connection::Receiving))
+                    {
+                        // Store connection in map for async handling
+                        // Use a pseudo-socket based on client address hash
+                        Socket pseudo_socket;
+                        pseudo_socket.m_sock = static_cast<Socket::Type>(
+                            std::hash<std::string>{}(conn_udp.client.toString()));
+                        
+                        LOCKGUARD(connections_mutex);
+                        Connection& stored_conn = connections[pseudo_socket];
+                        stored_conn = conn_udp;
+                        stored_conn.socket = socket;  // Keep real server socket
+                        
+                        // Process request
+                        onRequest(stored_conn);
+                        HandleConnection(stored_conn);
+                        
+                        // For UDP, if response is ready, send immediately and cleanup
+                        if (stored_conn.state.count(Connection::Responding))
+                        {
+                            WriteResponseBuffer(stored_conn);
+                            connections.erase(pseudo_socket);
+                        }
+                    }
                 }
             }
 

@@ -37,3 +37,9 @@ out/**
 # Build directories
 build/
 build-*/
+
+# ARM64 environment
+.arm64-env/
+
+# vcpkg installed packages
+vcpkg_installed/

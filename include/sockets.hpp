@@ -12,3 +12,6 @@
 #include "SocketsHpp/http/server/http_server.h"
 #include "SocketsHpp/http/server/http_file_server.h"
 #include "SocketsHpp/http/client/http_client.h"
+
+// Utilities
+#include "SocketsHpp/utils/base64.h"

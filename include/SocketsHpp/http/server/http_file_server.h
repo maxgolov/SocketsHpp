@@ -3,14 +3,13 @@
 #pragma once
 
 #include <SocketsHpp/config.h>
+#include <SocketsHpp/http/server/http_server.h>
 
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#include "./http_server.h"
 
 SOCKETSHPP_NS_BEGIN
 namespace http

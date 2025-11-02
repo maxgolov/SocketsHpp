@@ -3,12 +3,12 @@
 #pragma once
 
 #include <SocketsHpp/config.h>
+#include <SocketsHpp/net/common/socket_tools.h>
+#include <SocketsHpp/http/common/http_constants.h>
 
 #include <functional>
 #include <list>
 #include <map>
-
-#include "../../net/common/socket_tools.h"
 
 SOCKETSHPP_NS_BEGIN
 namespace http
@@ -21,11 +21,205 @@ namespace http
         using SocketAddr = net::utils::SocketAddr;
         using SocketParams = net::utils::SocketParams;
 
-        static constexpr const char* CONTENT_TYPE = "Content-Type";
-        static constexpr const char* CONTENT_TYPE_TEXT = "text/plain";
-        static constexpr const char* CONTENT_TYPE_BIN = "application/octet-stream";
-        static constexpr const char* CONTENT_TYPE_SSE = "text/event-stream";
-        static constexpr const char* CONTENT_TYPE_JSON = "application/json";
+        // Import commonly used constants into server namespace for convenience
+        using constants::CONTENT_TYPE;
+        using constants::CONTENT_TYPE_TEXT;
+        using constants::CONTENT_TYPE_BINARY;
+        using constants::CONTENT_TYPE_SSE;
+        using constants::CONTENT_TYPE_JSON;
+        using constants::MCP_SESSION_ID;
+        using constants::LAST_EVENT_ID;
+        using constants::ACCESS_CONTROL_ALLOW_ORIGIN;
+        using constants::ACCESS_CONTROL_ALLOW_METHODS;
+        using constants::ACCESS_CONTROL_ALLOW_HEADERS;
+        using constants::ACCESS_CONTROL_EXPOSE_HEADERS;
+        using constants::ACCESS_CONTROL_MAX_AGE;
+
+        // Session management with event history for Last-Event-ID support
+        class SessionManager
+        {
+        private:
+            struct SessionData
+            {
+                std::chrono::steady_clock::time_point lastAccess;
+                std::vector<std::pair<std::string, std::string>> eventHistory; // <eventId, eventData>
+                size_t maxHistorySize = 1000;
+            };
+            
+            std::map<std::string, SessionData> m_sessions;
+            std::mutex m_mutex;
+            std::chrono::seconds m_sessionTimeout{3600}; // 1 hour default
+            std::chrono::milliseconds m_historyDuration{300000}; // 5 minutes default
+            size_t m_maxHistorySize = 1000;
+            bool m_resumabilityEnabled = false;
+            
+        public:
+            void enableResumability(bool enabled, std::chrono::milliseconds historyDuration = std::chrono::milliseconds(300000), size_t maxHistorySize = 1000)
+            {
+                m_resumabilityEnabled = enabled;
+                m_historyDuration = historyDuration;
+                m_maxHistorySize = maxHistorySize;
+            }
+            
+            std::string createSession()
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                
+                // Generate session ID (simple implementation - production should use crypto-random)
+                auto now = std::chrono::steady_clock::now();
+                auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()).count();
+                
+                std::ostringstream ss;
+                ss << "session-" << timestamp << "-" << (rand() % 100000);
+                std::string sessionId = ss.str();
+                
+                SessionData data;
+                data.lastAccess = now;
+                data.maxHistorySize = m_maxHistorySize;
+                m_sessions[sessionId] = data;
+                return sessionId;
+            }
+            
+            bool validateSession(const std::string& sessionId)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto it = m_sessions.find(sessionId);
+                if (it == m_sessions.end())
+                {
+                    return false;
+                }
+                
+                // Check if session has expired
+                auto now = std::chrono::steady_clock::now();
+                if (now - it->second.lastAccess > m_sessionTimeout)
+                {
+                    m_sessions.erase(it);
+                    return false;
+                }
+                
+                // Update last access time
+                it->second.lastAccess = now;
+                return true;
+            }
+            
+            bool terminateSession(const std::string& sessionId)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                return m_sessions.erase(sessionId) > 0;
+            }
+            
+            void setSessionTimeout(std::chrono::seconds timeout)
+            {
+                m_sessionTimeout = timeout;
+            }
+            
+            /// @brief Add event to session history for Last-Event-ID support
+            /// @param sessionId Session identifier
+            /// @param eventId Event identifier
+            /// @param eventData Event data (SSE formatted)
+            void addEvent(const std::string& sessionId, const std::string& eventId, const std::string& eventData)
+            {
+                if (!m_resumabilityEnabled)
+                {
+                    return;
+                }
+                
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto it = m_sessions.find(sessionId);
+                if (it == m_sessions.end())
+                {
+                    return;
+                }
+                
+                auto& history = it->second.eventHistory;
+                history.emplace_back(eventId, eventData);
+                
+                // Limit history size
+                if (history.size() > it->second.maxHistorySize)
+                {
+                    history.erase(history.begin(), history.begin() + (history.size() - it->second.maxHistorySize));
+                }
+            }
+            
+            /// @brief Get events since a specific event ID
+            /// @param sessionId Session identifier
+            /// @param lastEventId Last event ID received by client
+            /// @return Vector of events that occurred after lastEventId
+            std::vector<std::string> getEventsSince(const std::string& sessionId, const std::string& lastEventId)
+            {
+                std::vector<std::string> events;
+                
+                if (!m_resumabilityEnabled)
+                {
+                    return events;
+                }
+                
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto it = m_sessions.find(sessionId);
+                if (it == m_sessions.end())
+                {
+                    return events;
+                }
+                
+                const auto& history = it->second.eventHistory;
+                
+                // If no lastEventId, return all recent events
+                if (lastEventId.empty())
+                {
+                    for (const auto& event : history)
+                    {
+                        events.push_back(event.second);
+                    }
+                    return events;
+                }
+                
+                // Find the position of lastEventId and return events after it
+                bool found = false;
+                for (const auto& event : history)
+                {
+                    if (found)
+                    {
+                        events.push_back(event.second);
+                    }
+                    else if (event.first == lastEventId)
+                    {
+                        found = true;
+                    }
+                }
+                
+                return events;
+            }
+            
+            void cleanupExpiredSessions()
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto now = std::chrono::steady_clock::now();
+                
+                for (auto it = m_sessions.begin(); it != m_sessions.end();)
+                {
+                    if (now - it->second.lastAccess > m_sessionTimeout)
+                    {
+                        it = m_sessions.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+            }
+        };
+        
+        // CORS configuration
+        struct CorsConfig
+        {
+            bool enabled = false;
+            std::string allowOrigin = constants::CORS_ALLOW_ORIGIN_ALL;
+            std::string allowMethods = constants::CORS_DEFAULT_METHODS;
+            std::string allowHeaders = constants::CORS_DEFAULT_ALLOW_HEADERS;
+            std::string exposeHeaders = constants::CORS_DEFAULT_EXPOSE_HEADERS;
+            std::string maxAge = constants::CORS_DEFAULT_MAX_AGE;
+        };
 
         // SSE (Server-Sent Events) helper class
         class SSEEvent
@@ -94,6 +288,163 @@ namespace http
             std::string protocol;
             std::map<std::string, std::string> headers;
             std::string content;
+            
+            /// @brief Parse query parameters from URI
+            /// @return Map of query parameter key-value pairs
+            /// @note Performs URL decoding of values
+            std::map<std::string, std::string> parse_query() const
+            {
+                std::map<std::string, std::string> params;
+                
+                // Find query string start
+                size_t qpos = uri.find('?');
+                if (qpos == std::string::npos)
+                {
+                    return params;
+                }
+                
+                std::string query = uri.substr(qpos + 1);
+                size_t start = 0;
+                
+                while (start < query.length())
+                {
+                    // Find key=value pair
+                    size_t eq = query.find('=', start);
+                    if (eq == std::string::npos)
+                    {
+                        break;
+                    }
+                    
+                    size_t amp = query.find('&', eq);
+                    size_t end = (amp == std::string::npos) ? query.length() : amp;
+                    
+                    std::string key = query.substr(start, eq - start);
+                    std::string value = query.substr(eq + 1, end - eq - 1);
+                    
+                    // URL decode the value
+                    std::string decoded;
+                    decoded.reserve(value.length());
+                    
+                    for (size_t i = 0; i < value.length(); ++i)
+                    {
+                        if (value[i] == '%' && i + 2 < value.length())
+                        {
+                            // Decode %XX
+                            char hex[3] = {value[i + 1], value[i + 2], 0};
+                            char* end_ptr;
+                            long ch = strtol(hex, &end_ptr, 16);
+                            if (end_ptr == hex + 2)
+                            {
+                                decoded += static_cast<char>(ch);
+                                i += 2;
+                            }
+                            else
+                            {
+                                decoded += value[i];
+                            }
+                        }
+                        else if (value[i] == '+')
+                        {
+                            decoded += ' ';
+                        }
+                        else
+                        {
+                            decoded += value[i];
+                        }
+                    }
+                    
+                    params[key] = decoded;
+                    start = (amp == std::string::npos) ? query.length() : amp + 1;
+                }
+                
+                return params;
+            }
+            
+            /// @brief Get accepted MIME types from Accept header
+            /// @return Vector of MIME types sorted by quality factor
+            std::vector<std::string> get_accepted_types() const
+            {
+                std::vector<std::string> types;
+                
+                auto it = headers.find("Accept");
+                if (it == headers.end())
+                {
+                    return types;
+                }
+                
+                std::string accept = it->second;
+                size_t start = 0;
+                
+                while (start < accept.length())
+                {
+                    // Find next comma
+                    size_t comma = accept.find(',', start);
+                    size_t end = (comma == std::string::npos) ? accept.length() : comma;
+                    
+                    std::string type = accept.substr(start, end - start);
+                    
+                    // Trim whitespace
+                    size_t first = type.find_first_not_of(" \t");
+                    size_t last = type.find_last_not_of(" \t");
+                    
+                    if (first != std::string::npos && last != std::string::npos)
+                    {
+                        type = type.substr(first, last - first + 1);
+                        
+                        // Remove quality factor if present (e.g., ";q=0.8")
+                        size_t semi = type.find(';');
+                        if (semi != std::string::npos)
+                        {
+                            type = type.substr(0, semi);
+                        }
+                        
+                        types.push_back(type);
+                    }
+                    
+                    start = (comma == std::string::npos) ? accept.length() : comma + 1;
+                }
+                
+                return types;
+            }
+            
+            /// @brief Check if request accepts a specific MIME type
+            /// @param mime_type The MIME type to check (e.g., "application/json")
+            /// @return true if the type is accepted or no Accept header present
+            bool accepts(const std::string& mime_type) const
+            {
+                auto it = headers.find("Accept");
+                if (it == headers.end())
+                {
+                    return true;  // No Accept header = accept all
+                }
+                
+                std::string accept = it->second;
+                
+                // Check for */* (accept all)
+                if (accept.find("*/*") != std::string::npos)
+                {
+                    return true;
+                }
+                
+                // Check for exact match
+                if (accept.find(mime_type) != std::string::npos)
+                {
+                    return true;
+                }
+                
+                // Check for wildcard match (e.g., "application/*")
+                size_t slash = mime_type.find('/');
+                if (slash != std::string::npos)
+                {
+                    std::string wildcard = mime_type.substr(0, slash + 1) + "*";
+                    if (accept.find(wildcard) != std::string::npos)
+                    {
+                        return true;
+                    }
+                }
+                
+                return false;
+            }
         };
 
         struct HttpResponse
@@ -225,6 +576,9 @@ namespace http
 
             std::map<Socket, Connection> m_connections;
             size_t m_maxRequestHeadersSize, m_maxRequestContentSize;
+            
+            SessionManager m_sessionManager;
+            CorsConfig m_corsConfig;
 
         public:
             void setKeepalive(bool keepAlive) { allowKeepalive = keepAlive; }
@@ -259,6 +613,41 @@ namespace http
             }
 
             void setServerName(std::string const& name) { m_serverHost = name; }
+            
+            // CORS configuration
+            void enableCors(bool enabled = true) { m_corsConfig.enabled = enabled; }
+            
+            void setCorsOrigin(const std::string& origin) { m_corsConfig.allowOrigin = origin; }
+            
+            void setCorsHeaders(const std::string& allowHeaders, const std::string& exposeHeaders = "")
+            {
+                m_corsConfig.allowHeaders = allowHeaders;
+                if (!exposeHeaders.empty())
+                {
+                    m_corsConfig.exposeHeaders = exposeHeaders;
+                }
+            }
+            
+            // Session management
+            void setSessionTimeout(std::chrono::seconds timeout)
+            {
+                m_sessionManager.setSessionTimeout(timeout);
+            }
+            
+            std::string createSession()
+            {
+                return m_sessionManager.createSession();
+            }
+            
+            bool validateSession(const std::string& sessionId)
+            {
+                return m_sessionManager.validateSession(sessionId);
+            }
+            
+            bool terminateSession(const std::string& sessionId)
+            {
+                return m_sessionManager.terminateSession(sessionId);
+            }
 
             int addListeningPort(int port)
             {
@@ -479,21 +868,21 @@ namespace http
                             conn.request.protocol.c_str());
                         conn.receiveBuffer.erase(0, ofs + (lfOnly ? 2 : 4));
 
-                        conn.keepalive = (conn.request.protocol == "HTTP/1.1");
-                        auto const connection = conn.request.headers.find("Connection");
+                        conn.keepalive = (conn.request.protocol == constants::HTTP_1_1);
+                        auto const connection = conn.request.headers.find(constants::CONNECTION);
                         if (connection != conn.request.headers.end())
                         {
-                            if (equalsLowercased(connection->second, "keep-alive"))
+                            if (equalsLowercased(connection->second, constants::CONNECTION_KEEP_ALIVE))
                             {
                                 conn.keepalive = true;
                             }
-                            else if (equalsLowercased(connection->second, "close"))
+                            else if (equalsLowercased(connection->second, constants::CONNECTION_CLOSE))
                             {
                                 conn.keepalive = false;
                             }
                         }
 
-                        auto const contentLength = conn.request.headers.find("Content-Length");
+                        auto const contentLength = conn.request.headers.find(constants::CONTENT_LENGTH);
                         if (contentLength != conn.request.headers.end())
                         {
                             conn.contentLength = atoi(contentLength->second.c_str());
@@ -512,10 +901,10 @@ namespace http
                             continue;
                         }
 
-                        auto const expect = conn.request.headers.find("Expect");
-                        if (expect != conn.request.headers.end() && conn.request.protocol == "HTTP/1.1")
+                        auto const expect = conn.request.headers.find(constants::EXPECT);
+                        if (expect != conn.request.headers.end() && conn.request.protocol == constants::HTTP_1_1)
                         {
-                            if (!equalsLowercased(expect->second, "100-continue"))
+                            if (!equalsLowercased(expect->second, constants::EXPECT_100_CONTINUE))
                             {
                                 LOG_WARN("HttpServer: [%s] unknown expectation - %s", conn.request.client.c_str(),
                                     expect->second.c_str());
@@ -868,7 +1257,78 @@ namespace http
                 conn.response.useChunkedEncoding = false;
                 conn.response.streamCallback = nullptr;
 
-                if (conn.response.code == 0)
+                // Store original method for HEAD handling
+                std::string originalMethod = conn.request.method;
+                bool isHeadRequest = (conn.request.method == "HEAD");
+                
+                // Treat HEAD as GET for processing, but skip body in response
+                if (isHeadRequest)
+                {
+                    conn.request.method = "GET";
+                }
+                
+                // Handle OPTIONS method for CORS preflight
+                if (originalMethod == "OPTIONS")
+                {
+                    if (m_corsConfig.enabled)
+                    {
+                        conn.response.code = 204;  // No Content
+                        conn.response.message = "No Content";
+                    }
+                    else
+                    {
+                        conn.response.code = 405;  // Method Not Allowed
+                        conn.response.message = "Method Not Allowed";
+                    }
+                }
+                // Handle DELETE method for session termination
+                else if (originalMethod == "DELETE")
+                {
+                    // Check for session ID in headers
+                    auto sessionIt = conn.request.headers.find(MCP_SESSION_ID);
+                    if (sessionIt != conn.request.headers.end())
+                    {
+                        if (m_sessionManager.terminateSession(sessionIt->second))
+                        {
+                            conn.response.code = 200;  // OK
+                            conn.response.message = "Session terminated";
+                        }
+                        else
+                        {
+                            conn.response.code = 404;  // Not Found
+                            conn.response.message = "Session not found";
+                        }
+                    }
+                    else
+                    {
+                        conn.response.code = 400;  // Bad Request
+                        conn.response.message = "Missing session ID";
+                    }
+                }
+                // Handle PUT method - route to handlers like POST
+                else if (originalMethod == "PUT" && conn.response.code == 0)
+                {
+                    conn.response.code = 404;  // Not Found
+                    for (auto& handler : m_handlers)
+                    {
+                        if (conn.request.uri.length() >= handler.first.length() &&
+                            strncmp(conn.request.uri.c_str(), handler.first.c_str(), handler.first.length()) == 0)
+                        {
+                            LOG_TRACE("HttpServer: [%s] using handler for %s (PUT)", conn.request.client.c_str(),
+                                handler.first.c_str());
+                            int result = handler.second->onHttpRequest(conn.request, conn.response);
+                            if (result != 0)
+                            {
+                                conn.response.code = result;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Restore original method for response
+                    conn.request.method = originalMethod;
+                }
+                else if (conn.response.code == 0)
                 {
                     conn.response.code = 404;  // Not Found
                     for (auto& handler : m_handlers)
@@ -901,9 +1361,23 @@ namespace http
                     conn.response.message = getDefaultResponseMessage(conn.response.code);
                 }
 
-                conn.response.headers["Host"] = m_serverHost;
-                conn.response.headers["Connection"] = (conn.keepalive ? "keep-alive" : "close");
-                conn.response.headers["Date"] = formatTimestamp(time(nullptr));
+                conn.response.headers[constants::HOST] = m_serverHost;
+                conn.response.headers[constants::CONNECTION] = (conn.keepalive ? constants::CONNECTION_KEEP_ALIVE : constants::CONNECTION_CLOSE);
+                conn.response.headers[constants::DATE] = formatTimestamp(time(nullptr));
+                
+                // Add CORS headers if enabled
+                if (m_corsConfig.enabled)
+                {
+                    conn.response.headers[ACCESS_CONTROL_ALLOW_ORIGIN] = m_corsConfig.allowOrigin;
+                    conn.response.headers[ACCESS_CONTROL_ALLOW_METHODS] = m_corsConfig.allowMethods;
+                    conn.response.headers[ACCESS_CONTROL_ALLOW_HEADERS] = m_corsConfig.allowHeaders;
+                    conn.response.headers[ACCESS_CONTROL_EXPOSE_HEADERS] = m_corsConfig.exposeHeaders;
+                    
+                    if (conn.request.method == "OPTIONS")
+                    {
+                        conn.response.headers[ACCESS_CONTROL_MAX_AGE] = m_corsConfig.maxAge;
+                    }
+                }
                 
                 // Handle streaming vs regular response
                 if (conn.response.streaming && conn.response.streamCallback)
@@ -914,22 +1388,34 @@ namespace http
                     // Use chunked encoding for streaming
                     if (conn.response.useChunkedEncoding || conn.request.protocol == "HTTP/1.1")
                     {
-                        conn.response.headers["Transfer-Encoding"] = "chunked";
-                        conn.response.headers.erase("Content-Length");
+                        conn.response.headers[constants::TRANSFER_ENCODING] = constants::TRANSFER_ENCODING_CHUNKED;
+                        conn.response.headers.erase(constants::CONTENT_LENGTH);
                     }
                     
                     // SSE-specific headers
                     if (conn.response.headers[CONTENT_TYPE] == CONTENT_TYPE_SSE)
                     {
-                        conn.response.headers["Cache-Control"] = "no-cache";
-                        conn.response.headers["X-Accel-Buffering"] = "no";  // Disable nginx buffering
+                        conn.response.headers[constants::CACHE_CONTROL] = constants::CACHE_CONTROL_NO_CACHE;
+                        conn.response.headers[constants::X_ACCEL_BUFFERING] = "no";  // Disable nginx buffering
                         conn.keepalive = true;  // Keep connection alive for SSE
                     }
                 }
                 else
                 {
-                    conn.response.headers["Content-Length"] = std::to_string(conn.response.body.size());
+                    // For HEAD requests, calculate Content-Length but clear body
+                    if (isHeadRequest)
+                    {
+                        conn.response.headers[constants::CONTENT_LENGTH] = std::to_string(conn.response.body.size());
+                        conn.response.body.clear();
+                    }
+                    else
+                    {
+                        conn.response.headers[constants::CONTENT_LENGTH] = std::to_string(conn.response.body.size());
+                    }
                 }
+                
+                // Restore original method
+                conn.request.method = originalMethod;
             }
 
             static std::string formatTimestamp(time_t time)

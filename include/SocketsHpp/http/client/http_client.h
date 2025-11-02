@@ -3,15 +3,15 @@
 #pragma once
 
 #include <SocketsHpp/config.h>
+#include <SocketsHpp/net/common/socket_tools.h>
+#include <SocketsHpp/http/common/url_parser.h>
+#include <SocketsHpp/http/common/http_constants.h>
 
 #include <functional>
 #include <map>
 #include <sstream>
 #include <string>
 #include <vector>
-
-#include "../../net/common/socket_tools.h"
-#include "../common/url_parser.h"
 
 SOCKETSHPP_NS_BEGIN
 namespace http
@@ -23,11 +23,29 @@ namespace http
         using SocketParams = net::utils::SocketParams;
         using UrlParser = http::common::UrlParser;
 
+        // Import commonly used constants
+        using constants::CONTENT_TYPE;
+        using constants::CONTENT_LENGTH;
+        using constants::TRANSFER_ENCODING;
+        using constants::TRANSFER_ENCODING_CHUNKED;
+        using constants::CONNECTION;
+        using constants::CONNECTION_CLOSE;
+        using constants::HOST;
+        using constants::ACCEPT;
+        using constants::HTTP_1_1;
+        using constants::METHOD_GET;
+        using constants::METHOD_POST;
+        using constants::METHOD_PUT;
+        using constants::METHOD_DELETE;
+        using constants::METHOD_HEAD;
+        using constants::METHOD_OPTIONS;
+        using constants::METHOD_PATCH;
+
         struct HttpClientRequest
         {
-            std::string method = "GET";
+            std::string method = METHOD_GET;
             std::string uri;
-            std::string protocol = "HTTP/1.1";
+            std::string protocol = HTTP_1_1;
             std::map<std::string, std::string> headers;
             std::string body;
 
@@ -40,7 +58,7 @@ namespace http
             // Common headers
             void setContentType(const std::string& contentType)
             {
-                headers["Content-Type"] = contentType;
+                headers[CONTENT_TYPE] = contentType;
             }
 
             void setUserAgent(const std::string& userAgent)
@@ -50,7 +68,7 @@ namespace http
 
             void setAccept(const std::string& accept)
             {
-                headers["Accept"] = accept;
+                headers[ACCEPT] = accept;
             }
         };
 
@@ -93,6 +111,7 @@ namespace http
             HttpClient() = default;
 
             void setUserAgent(const std::string& userAgent) { m_userAgent = userAgent; }
+            const std::string& getUserAgent() const { return m_userAgent; }
             void setConnectTimeout(int ms) { m_connectTimeoutMs = ms; }
             void setReadTimeout(int ms) { m_readTimeoutMs = ms; }
             void setFollowRedirects(bool follow) { m_followRedirects = follow; }
@@ -102,7 +121,7 @@ namespace http
             bool get(const std::string& url, HttpClientResponse& response)
             {
                 HttpClientRequest request;
-                request.method = "GET";
+                request.method = METHOD_GET;
                 request.uri = url;
                 return send(request, response);
             }
@@ -111,7 +130,7 @@ namespace http
             bool post(const std::string& url, const std::string& body, HttpClientResponse& response)
             {
                 HttpClientRequest request;
-                request.method = "POST";
+                request.method = METHOD_POST;
                 request.uri = url;
                 request.body = body;
                 return send(request, response);
@@ -129,25 +148,25 @@ namespace http
                 }
 
                 // Set default headers
-                if (request.headers.find("Host") == request.headers.end())
+                if (request.headers.find(HOST) == request.headers.end())
                 {
-                    request.headers["Host"] = url.host_;
+                    request.headers[HOST] = url.host_;
                 }
                 if (request.headers.find("User-Agent") == request.headers.end())
                 {
                     request.headers["User-Agent"] = m_userAgent;
                 }
-                if (request.headers.find("Accept") == request.headers.end())
+                if (request.headers.find(ACCEPT) == request.headers.end())
                 {
-                    request.headers["Accept"] = "*/*";
+                    request.headers[ACCEPT] = "*/*";
                 }
-                if (!request.body.empty() && request.headers.find("Content-Length") == request.headers.end())
+                if (!request.body.empty() && request.headers.find(CONTENT_LENGTH) == request.headers.end())
                 {
-                    request.headers["Content-Length"] = std::to_string(request.body.size());
+                    request.headers[CONTENT_LENGTH] = std::to_string(request.body.size());
                 }
-                if (request.headers.find("Connection") == request.headers.end())
+                if (request.headers.find(CONNECTION) == request.headers.end())
                 {
-                    request.headers["Connection"] = "close";
+                    request.headers[CONNECTION] = CONNECTION_CLOSE;
                 }
 
                 // Connect to server
@@ -230,15 +249,15 @@ namespace http
                 std::string bodyBuffer = buffer.substr(headerEnd + 4);
 
                 // Check if response uses chunked encoding
-                auto transferEncoding = response.getHeader("Transfer-Encoding");
-                if (transferEncoding.find("chunked") != std::string::npos)
+                auto transferEncoding = response.getHeader(TRANSFER_ENCODING);
+                if (transferEncoding.find(TRANSFER_ENCODING_CHUNKED) != std::string::npos)
                 {
                     response.isChunked = true;
                     return receiveChunkedBody(socket, bodyBuffer, response);
                 }
 
                 // Check if we have Content-Length
-                auto contentLengthStr = response.getHeader("Content-Length");
+                auto contentLengthStr = response.getHeader(CONTENT_LENGTH);
                 if (!contentLengthStr.empty())
                 {
                     size_t contentLength = std::stoul(contentLengthStr);

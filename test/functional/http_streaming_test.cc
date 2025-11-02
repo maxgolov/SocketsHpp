@@ -244,3 +244,9 @@ TEST(SSEEventTest, MultilineData)
     EXPECT_TRUE(formatted.find("data: line2") != std::string::npos);
     EXPECT_TRUE(formatted.find("data: line3") != std::string::npos);
 }
+
+int main(int argc, char **argv)
+{
+    testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}
