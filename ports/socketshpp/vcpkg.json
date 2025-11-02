@@ -1,0 +1,21 @@
+{
+  "name": "socketshpp",
+  "version": "1.0.0",
+  "description": "Header-only C++ sockets library with HTTP/1.1 and MCP support",
+  "homepage": "https://github.com/maxgolov/SocketsHpp",
+  "license": "Apache-2.0",
+  "supports": "!(uwp | arm)",
+  "dependencies": [
+    {
+      "name": "vcpkg-cmake",
+      "host": true
+    },
+    {
+      "name": "vcpkg-cmake-config",
+      "host": true
+    },
+    "nlohmann-json",
+    "cpp-jwt",
+    "bshoshany-thread-pool"
+  ]
+}

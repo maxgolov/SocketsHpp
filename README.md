@@ -75,77 +75,45 @@ cmake --build build/linux-x64
 
 SocketsHpp is a header-only library that can be integrated into your C++ project using several methods:
 
-#### Option 1: vcpkg Overlay Ports (Recommended for vcpkg Users)
+#### Option 1: vcpkg Package Manager (Recommended for vcpkg Users)
 
 Best for projects already using vcpkg. Provides full dependency management and binary caching.
 
-1. **Create overlay port structure:**
+SocketsHpp includes a ready-to-use vcpkg port in `./ports/socketshpp/`. See [Example 11: vcpkg Consumption](./examples/11-vcpkg-consumption/) for a complete working example.
+
+**Quick Install:**
 ```bash
-mkdir -p my-vcpkg-overlay/ports/socketshpp
+# From the SocketsHpp repository root
+vcpkg install socketshpp --overlay-ports=./ports
 ```
 
-2. **Create `my-vcpkg-overlay/ports/socketshpp/vcpkg.json`:**
+**Use in your project's `vcpkg.json`:**
 ```json
 {
-  "name": "socketshpp",
+  "name": "my-project",
   "version": "1.0.0",
-  "description": "Modern C++ socket library",
-  "homepage": "https://github.com/maxgolov/SocketsHpp",
-  "license": "Apache-2.0",
-  "dependencies": [
-    "nlohmann-json",
-    "bshoshany-thread-pool"
-  ]
-}
-```
-
-3. **Create `my-vcpkg-overlay/ports/socketshpp/portfile.cmake`:**
-```cmake
-vcpkg_from_github(
-    OUT_SOURCE_PATH SOURCE_PATH
-    REPO maxgolov/SocketsHpp
-    REF main
-    SHA512 0
-    HEAD_REF main
-)
-
-file(INSTALL "${SOURCE_PATH}/include/" 
-     DESTINATION "${CURRENT_PACKAGES_DIR}/include")
-
-file(INSTALL "${SOURCE_PATH}/LICENSE" 
-     DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}" 
-     RENAME copyright)
-```
-
-4. **Configure vcpkg in your project's `vcpkg-configuration.json`:**
-```json
-{
-  "overlay-ports": ["../my-vcpkg-overlay/ports"],
-  "default-registry": {
-    "kind": "git",
-    "repository": "https://github.com/microsoft/vcpkg"
+  "dependencies": ["socketshpp"],
+  "vcpkg-configuration": {
+    "overlay-ports": ["path/to/SocketsHpp/ports"]
   }
 }
 ```
 
-5. **Add to your project's `vcpkg.json`:**
-```json
-{
-  "dependencies": ["socketshpp"]
-}
-```
-
-6. **Use in CMakeLists.txt:**
+**CMakeLists.txt integration:**
 ```cmake
-find_package(nlohmann_json CONFIG REQUIRED)
-find_package(bshoshany-thread-pool CONFIG REQUIRED)
+# Find the package
+find_package(SocketsHpp CONFIG REQUIRED)
 
+# Link to your target
 add_executable(myapp main.cpp)
-target_include_directories(myapp PRIVATE 
-    ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include)
-target_link_libraries(myapp PRIVATE 
-    nlohmann_json::nlohmann_json
-    bshoshany-thread-pool::bshoshany-thread-pool)
+target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
+
+# Platform-specific libraries (automatic on most systems)
+if(WIN32)
+    target_link_libraries(myapp PRIVATE ws2_32)
+else()
+    target_link_libraries(myapp PRIVATE pthread)
+endif()
 ```
 
 #### Option 2: Git Submodules (Recommended for Version Control)

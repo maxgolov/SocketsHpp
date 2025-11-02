@@ -1,0 +1,16 @@
+SocketsHpp is a header-only library. No linking is required.
+
+To use SocketsHpp in your CMake project:
+
+    find_package(SocketsHpp CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE SocketsHpp::SocketsHpp)
+
+Or simply include the headers:
+
+    #include <sockets.hpp>
+    #include <SocketsHpp/http/server/http_server.h>
+
+Dependencies (automatically handled by vcpkg):
+- nlohmann-json
+- cpp-jwt  
+- bshoshany-thread-pool

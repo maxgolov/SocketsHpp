@@ -92,6 +92,11 @@ if(BUILD_EXAMPLES)
     add_subdirectory(examples/08-compression)
     add_subdirectory(examples/09-full-featured)
     add_subdirectory(examples/10-typescript-interop)
+    
+    # Example 11 is special - it demonstrates vcpkg consumption using find_package()
+    # It's designed to be built standalone with: ./setup-windows.ps1 or ./setup-linux.sh
+    # Skip it in the main build to avoid vcpkg toolchain conflicts
+    # add_subdirectory(examples/11-vcpkg-consumption)
 endif()
 
 # Examples are standalone - build them separately from their own directories
