@@ -130,7 +130,6 @@ if ($BuildExamples) {
         Write-Warning "Some examples were not built. Check CMakeLists.txt configuration."
     }
     
-    Write-Host "`nNote: Examples 06-09 use incompatible SocketServer API - disabled pending rewrite." -ForegroundColor Yellow
     Write-Host "Note: Examples require manual testing. See examples/README.md for usage." -ForegroundColor Yellow
 }if (-not $SkipTests) {
     Write-Host "`nRunning tests..." -ForegroundColor Cyan

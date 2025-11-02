@@ -176,26 +176,24 @@ namespace net
             virtual void onSocketReadable(Socket socket) override
             {
                 LOG_TRACE("Server: reading socket fd=0x%x", static_cast<int>(socket.m_sock));
-                int size = 0;
                 decltype(connections)::iterator it;
                 {
                     LOCKGUARD(connections_mutex);
                     it = connections.find(socket);
+                    if (it != connections.end())
+                    {
+                        // TCP or Unix domain connection.
+                        Connection& conn_tcp = it->second;
+                        ReadStreamBuffer(conn_tcp);
+                        onRequest(conn_tcp);
+                        HandleConnection(conn_tcp);
+                        return;
+                    }
                 }
-                if (it != connections.end())
-                {
-                    // TCP or Unix domain connection.
-                    Connection& conn_tcp = it->second;
-                    ReadStreamBuffer(conn_tcp);
-                    onRequest(conn_tcp);
-                    HandleConnection(conn_tcp);
-                }
-                else
-                {
-                    // UDP datagram connection.
-                    // For UDP, we need to store the connection temporarily to handle async response.
-                    // Create a unique pseudo-socket identifier using server socket + client address hash.
-                    Connection conn_udp;
+                // UDP datagram connection (not found in connections map)
+                // For UDP, we need to store the connection temporarily to handle async response.
+                // Create a unique pseudo-socket identifier using server socket + client address hash.
+                Connection conn_udp;
                     conn_udp.socket = socket;  // Server socket
                     conn_udp.state = { Connection::Receiving };
                     
@@ -226,7 +224,6 @@ namespace net
                             connections.erase(pseudo_socket);
                         }
                     }
-                }
             }
 
             /**
@@ -236,15 +233,12 @@ namespace net
             virtual void onSocketWritable(Socket socket) override
             {
                 LOG_TRACE("Server: writing socket fd=0x%llx", socket.m_sock);
-                decltype(connections)::iterator it;
+                LOCKGUARD(connections_mutex);
+                auto it = connections.find(socket);
+                if (it == connections.end())
                 {
-                    LOCKGUARD(connections_mutex);
-                    it = connections.find(socket);
-                    if (it == connections.end())
-                    {
-                        LOG_ERROR("Server: socket not found in connections map!");
-                        return;
-                    }
+                    LOG_ERROR("Server: socket not found in connections map!");
+                    return;
                 }
                 Connection& conn = it->second;
                 conn.state.insert(Connection::Responding);

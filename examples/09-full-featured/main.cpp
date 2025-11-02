@@ -4,351 +4,190 @@
 /*
  * Full-Featured HTTP Server Example
  * 
- * Demonstrates all enterprise features working together:
- * - Proxy awareness (X-Forwarded headers)
- * - Authentication (Bearer tokens, API keys, Basic auth)
- * - Compression (automatic content negotiation)
+ * Demonstrates combining proxy awareness with authentication.
+ * Shows real client IPs from behind proxies while enforcing auth.
  * 
- * This shows a production-ready server configuration.
+ * Features:
+ * - Proxy-aware headers (X-Forwarded-*)
+ * - Bearer token authentication
+ * - API key authentication
+ * - Public and protected endpoints
  */
 
 #include <sockets.hpp>
 #include <SocketsHpp/http/server/http_server.h>
 #include <SocketsHpp/http/server/proxy_aware.h>
-#include <SocketsHpp/http/server/authentication.h>
-#include <SocketsHpp/http/server/compression.h>
-#include <SocketsHpp/http/server/compression_simple.h>
-#ifdef _WIN32
-#include <SocketsHpp/http/server/compression_windows.h>
-#endif
 #include <iostream>
 #include <string>
 #include <map>
+#include <sstream>
 
 using namespace SOCKETSHPP_NS;
-using namespace SOCKETSHPP_NS::net::common;
+using namespace SOCKETSHPP_NS::http::server;
 
-
-// HTTP request/response structures
-struct HttpRequest
-{
-    std::string method;
-    std::string path;
-    std::map<std::string, std::string> headers;
-    std::string remoteAddr;
-    
-    bool has_header(const std::string& name) const
-    {
-        auto it = headers.find(name);
-        if (it != headers.end()) return true;
-        
-        std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        for (const auto& [key, value] : headers)
-        {
-            std::string keyLower = key;
-            std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), ::tolower);
-            if (keyLower == lower) return true;
-        }
-        return false;
-    }
-    
-    std::string get_header_value(const std::string& name) const
-    {
-        auto it = headers.find(name);
-        if (it != headers.end()) return it->second;
-        
-        std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        for (const auto& [key, value] : headers)
-        {
-            std::string keyLower = key;
-            std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), ::tolower);
-            if (keyLower == lower) return value;
-        }
-        return "";
-    }
-};
-
-struct HttpResponse
-{
-    int status = 200;
-    std::string statusText = "OK";
-    std::map<std::string, std::string> headers;
-    std::string body;
-    
-    void set_header(const std::string& name, const std::string& value)
-    {
-        headers[name] = value;
-    }
-    
-    void set_content(const std::string& content)
-    {
-        body = content;
-    }
-    
-    std::string toString() const
-    {
-        std::ostringstream response;
-        response << "HTTP/1.1 " << status << " " << statusText << "\r\n";
-        
-        for (const auto& [name, value] : headers)
-        {
-            response << name << ": " << value << "\r\n";
-        }
-        
-        response << "Content-Length: " << body.length() << "\r\n";
-        response << "Connection: close\r\n";
-        response << "\r\n";
-        response << body;
-        
-        return response.str();
-    }
-};
-
-// Mock databases
-std::map<std::string, std::string> validTokens = {
+// Mock authentication database
+std::map<std::string, std::string> validBearerTokens = {
     {"secret_token_123", "user1"},
-    {"admin_token_456", "admin"},
+    {"admin_token_456", "admin"}
 };
 
 std::map<std::string, std::string> validApiKeys = {
-    {"api_key_abc", "service1"},
+    {"api_key_abc", "service1"}
 };
 
-std::map<std::string, std::string> validUsers = {
-    {"alice", "password123"},
-};
-
-// Auth callbacks
-SOCKETSHPP_NS::http::server::AuthResult validateBearerToken(const std::string& token)
+// Check authentication and return username, or empty string if unauthorized
+std::string checkAuth(const HttpRequest& req)
 {
-    auto it = validTokens.find(token);
-    return it != validTokens.end() ? AuthResult::success(it->second) : AuthResult::failure("Invalid token");
-}
-
-SOCKETSHPP_NS::http::server::AuthResult validateApiKey(const std::string& apiKey)
-{
-    auto it = validApiKeys.find(apiKey);
-    return it != validApiKeys.end() ? AuthResult::success(it->second) : AuthResult::failure("Invalid API key");
-}
-
-SOCKETSHPP_NS::http::server::AuthResult validateBasicAuth(const std::string& username, const std::string& password)
-{
-    auto it = validUsers.find(username);
-    return (it != validUsers.end() && it->second == password) ? AuthResult::success(username) : AuthResult::failure("Invalid credentials");
-}
-
-// Request parser
-HttpRequest parseRequest(const std::string& requestData, const std::string& remoteAddr)
-{
-    HttpRequest req;
-    req.remoteAddr = remoteAddr;
-    std::istringstream stream(requestData);
-    std::string line;
-    
-    if (std::getline(stream, line))
+    // Check Bearer token authentication
+    if (req.has_header("Authorization"))
     {
-        std::istringstream lineStream(line);
-        lineStream >> req.method >> req.path;
-    }
-    
-    while (std::getline(stream, line) && !line.empty() && line != "\r")
-    {
-        if (line.back() == '\r') line.pop_back();
-        
-        auto colonPos = line.find(':');
-        if (colonPos != std::string::npos)
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.substr(0, 7) == "Bearer " && auth.length() > 7)
         {
-            std::string name = line.substr(0, colonPos);
-            std::string value = line.substr(colonPos + 1);
-            value.erase(0, value.find_first_not_of(" \t"));
-            value.erase(value.find_last_not_of(" \t") + 1);
-            req.headers[name] = value;
+            std::string token = auth.substr(7);
+            auto it = validBearerTokens.find(token);
+            if (it != validBearerTokens.end())
+            {
+                return it->second;
+            }
         }
     }
-    
-    return req;
+
+    // Check API Key authentication
+    if (req.has_header("X-API-Key"))
+    {
+        std::string apiKey = req.get_header_value("X-API-Key");
+        auto it = validApiKeys.find(apiKey);
+        if (it != validApiKeys.end())
+        {
+            return it->second;
+        }
+    }
+
+    return "";
 }
+
 
 int main()
 {
     try
     {
-        // Configure proxy trust
-        SOCKETSHPP_NS::http::server::TrustProxyConfig proxyConfig;
-        proxyConfig.setTrustMode(SOCKETSHPP_NS::http::server::TrustProxyConfig::SOCKETSHPP_NS::http::server::TrustProxyConfig::TrustMode::TrustSpecific);
-        proxyConfig.addTrustedProxy("127.0.0.1");
+        // Configure proxy trust settings
+        // In production, only trust specific proxy IPs for security
+        TrustProxyConfig config;
         
-        // Configure authentication
-        SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::AuthenticationMiddleware<HttpRequest, HttpResponse> authMiddleware;
-        authMiddleware.addStrategy(std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::BearerTokenAuth<HttpRequest>>(validateBearerToken));
-        authMiddleware.addStrategy(std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::ApiKeyAuth<HttpRequest>>(validateApiKey, "X-API-Key"));
-        authMiddleware.addStrategy(std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::BasicAuth<HttpRequest>>(validateBasicAuth));
+        // Option 1: Trust all proxies (INSECURE - only for testing)
+        // config.setMode(TrustProxyConfig::TrustMode::TrustAll);
         
-        authMiddleware.setAuthenticatedCallback([](HttpRequest& req, const SOCKETSHPP_NS::http::server::AuthResult& SOCKETSHPP_NS::http::server::AuthResult)
-        {
-            std::cout << "  ✓ Authenticated: " << SOCKETSHPP_NS::http::server::AuthResult.userId << "\n";
-        });
-        
-        // Configure compression
-        SOCKETSHPP_NS::http::server::compression::registerSimpleCompression();
-#ifdef _WIN32
-        SOCKETSHPP_NS::http::server::compression::registerWindowsCompression();
-#endif
-        
-        SOCKETSHPP_NS::http::server::compression::CompressionMiddleware SOCKETSHPP_NS::http::server::compression::CompressionMiddleware;
-        SOCKETSHPP_NS::http::server::compression::CompressionMiddleware.setMinSize(500);
-        SOCKETSHPP_NS::http::server::compression::CompressionMiddleware.setLevel(6);
+        // Option 2: Trust specific proxy IPs (RECOMMENDED)
+        config.setMode(TrustProxyConfig::TrustMode::TrustSpecific);
+        config.addTrustedProxy("127.0.0.1");     // localhost nginx
+        config.addTrustedProxy("10.0.0.1");      // internal load balancer
+        config.addTrustedProxy("172.16.0.1");    // reverse proxy
         
         std::cout << "Full-Featured HTTP Server\n";
-        std::cout << "==========================\n";
-        std::cout << "Features:\n";
-        std::cout << "  • Proxy awareness (X-Forwarded headers)\n";
-        std::cout << "  • Multi-strategy authentication\n";
-        std::cout << "  • Automatic compression\n";
-        std::cout << "\nListening on http://localhost:8080\n\n";
+        std::cout << "=========================\n";
+        std::cout << "Features: Proxy awareness + Authentication\n";
+        std::cout << "Listening on http://localhost:8080\n\n";
         
-        tcp::SocketServer<> server(8080);
+        // Create HTTP server
+        HttpServer server("localhost", 8080);
         
-        server.onConnect([&](tcp::SocketConnection<>& connection)
+        // Public endpoint with proxy awareness
+        server.route("/", [&config](const HttpRequest& req, HttpResponse& res) -> int
         {
-            connection.onMessage([&](const std::string& message)
-            {
-                HttpRequest req = parseRequest(message, connection.remoteAddress());
-                HttpResponse res;
-                
-                // Extract real client info (proxy-aware)
-                std::string clientIP = ProxyAwareHelpers::getClientIP(req, proxyConfig);
-                std::string protocol = ProxyAwareHelpers::getProtocol(req, proxyConfig);
-                bool isSecure = ProxyAwareHelpers::isSecure(req, proxyConfig);
-                
-                std::cout << req.method << " " << req.path << " from " << clientIP 
-                          << " (" << (isSecure ? "HTTPS" : "HTTP") << ")\n";
-                
-                // Public endpoints
-                if (req.path == "/" || req.path == "/public")
-                {
-                    std::ostringstream html;
-                    html << "<!DOCTYPE html>\n<html>\n<head><title>Full-Featured Server</title></head>\n<body>\n";
-                    html << "<h1>Full-Featured Server</h1>\n";
-                    html << "<h2>Your Request</h2>\n";
-                    html << "<ul>\n";
-                    html << "<li>Real IP: " << clientIP << "</li>\n";
-                    html << "<li>Protocol: " << protocol << "</li>\n";
-                    html << "<li>Secure: " << (isSecure ? "Yes" : "No") << "</li>\n";
-                    html << "</ul>\n";
-                    html << "<h2>Try These Endpoints</h2>\n";
-                    html << "<ul>\n";
-                    html << "<li><code>GET /public</code> - This page (no auth)</li>\n";
-                    html << "<li><code>GET /api/user</code> - Requires authentication</li>\n";
-                    html << "<li><code>GET /api/data</code> - Large JSON (compressed)</li>\n";
-                    html << "</ul>\n";
-                    
-                    // Pad to make compressible
-                    for (int i = 0; i < 20; i++)
-                    {
-                        html << "<p>Lorem ipsum dolor sit amet. " << i << "</p>\n";
-                    }
-                    
-                    html << "</body>\n</html>\n";
-                    res.set_content(html.str());
-                    res.set_header("Content-Type", "text/html");
-                }
-                else if (req.path.find("/api/") == 0)
-                {
-                    // Protected endpoints - require authentication
-                    SOCKETSHPP_NS::http::server::AuthResult SOCKETSHPP_NS::http::server::AuthResult = authMiddleware.authenticate(req, res);
-                    
-                    if (!SOCKETSHPP_NS::http::server::AuthResult)
-                    {
-                        res.status = 401;
-                        res.statusText = "Unauthorized";
-                        res.set_content("{\"error\": \"" + SOCKETSHPP_NS::http::server::AuthResult.errorMessage + "\"}");
-                        res.set_header("Content-Type", "application/json");
-                        std::cout << "  ✗ Authentication failed\n";
-                    }
-                    else
-                    {
-                        // Handle API routes
-                        if (req.path == "/api/user")
-                        {
-                            std::ostringstream json;
-                            json << "{\n  \"userId\": \"" << SOCKETSHPP_NS::http::server::AuthResult.userId << "\",\n";
-                            json << "  \"clientIP\": \"" << clientIP << "\",\n";
-                            json << "  \"protocol\": \"" << protocol << "\",\n";
-                            json << "  \"secure\": " << (isSecure ? "true" : "false") << "\n}\n";
-                            
-                            res.set_content(json.str());
-                            res.set_header("Content-Type", "application/json");
-                        }
-                        else if (req.path == "/api/data")
-                        {
-                            // Large JSON response (will be compressed)
-                            std::ostringstream json;
-                            json << "{\n  \"userId\": \"" << SOCKETSHPP_NS::http::server::AuthResult.userId << "\",\n  \"data\": [\n";
-                            for (int i = 0; i < 100; i++)
-                            {
-                                json << "    {\"id\": " << i << ", \"value\": \"Item " << i << "\"}";
-                                if (i < 99) json << ",";
-                                json << "\n";
-                            }
-                            json << "  ]\n}\n";
-                            
-                            res.set_content(json.str());
-                            res.set_header("Content-Type", "application/json");
-                        }
-                        else
-                        {
-                            res.status = 404;
-                            res.statusText = "Not Found";
-                            res.set_content("{\"error\": \"Not found\"}");
-                            res.set_header("Content-Type", "application/json");
-                        }
-                    }
-                }
-                else
-                {
-                    res.status = 404;
-                    res.statusText = "Not Found";
-                    res.set_content("404 Not Found");
-                    res.set_header("Content-Type", "text/plain");
-                }
-                
-                // Apply compression
-                size_t originalSize = res.body.size();
-                std::string encoding;
-                bool compressed = SOCKETSHPP_NS::http::server::compression::CompressionMiddleware.compressResponse(
-                    req.get_header_value("Accept-Encoding"),
-                    res.headers["Content-Type"],
-                    res.body,
-                    encoding
-                );
-                
-                if (compressed)
-                {
-                    res.set_header("Content-Encoding", encoding);
-                    res.set_header("Vary", "Accept-Encoding");
-                    float ratio = (1.0f - (float)res.body.size() / originalSize) * 100.0f;
-                    std::cout << "  ⚡ Compressed: " << originalSize << " → " << res.body.size() 
-                              << " bytes (" << ratio << "% reduction)\n";
-                }
-                
-                connection.send(res.toString());
-                connection.close();
-                std::cout << "\n";
-            });
+            std::string clientIP = ProxyAwareHelpers::getClientIP(req.headers, req.client, config);
+            std::string protocol = ProxyAwareHelpers::getProtocol(req.headers, req.client, config);
+            std::string host = ProxyAwareHelpers::getHost(req.headers, req.client, config, "localhost:8080");
+
+            std::ostringstream html;
+            html << "<html><body>"
+                 << "<h1>Full-Featured Server Example</h1>"
+                 << "<h2>Request Information (Proxy-Aware)</h2>"
+                 << "<ul>"
+                 << "<li>Client IP: " << clientIP << "</li>"
+                 << "<li>Protocol: " << protocol << "</li>"
+                 << "<li>Host: " << host << "</li>"
+                 << "<li>URI: " << req.uri << "</li>"
+                 << "</ul>"
+                 << "<h2>Features Demonstrated</h2>"
+                 << "<ul>"
+                 << "<li>Proxy awareness (X-Forwarded-* headers)</li>"
+                 << "<li>Authentication (Bearer tokens, API keys)</li>"
+                 << "<li>Multiple routes and HTTP methods</li>"
+                 << "</ul>"
+                 << "<h2>Try Protected Endpoints</h2>"
+                 << "<pre>"
+                 << "curl -H \"Authorization: Bearer secret_token_123\" http://localhost:8080/api/protected\n"
+                 << "curl -H \"X-API-Key: api_key_abc\" http://localhost:8080/api/service"
+                 << "</pre>"
+                 << "</body></html>";
+
+            res.set_header("Content-Type", "text/html");
+            res.set_content(html.str());
+            return 200;
         });
+
+        // Protected endpoint requiring authentication
+        server.route("/api/protected", [&config](const HttpRequest& req, HttpResponse& res) -> int {
+            std::string user = checkAuth(req);
+            if (user.empty())
+            {
+                res.set_status(401);
+                res.set_header("Content-Type", "application/json");
+                res.set_header("WWW-Authenticate", "Bearer");
+                res.set_content("{\"error\": \"Unauthorized\", \"message\": \"Valid Bearer token required\"}");
+                return 401;
+            }
+
+            std::string clientIP = ProxyAwareHelpers::getClientIP(req.headers, req.client, config);
+            std::ostringstream json;
+            json << "{"
+                 << "\"user\": \"" << user << "\","
+                 << "\"endpoint\": \"/api/protected\","
+                 << "\"clientIP\": \"" << clientIP << "\","
+                 << "\"authenticated\": true"
+                 << "}";
+
+            res.set_header("Content-Type", "application/json");
+            res.set_content(json.str());
+            return 200;
+        });
+
+        // Service endpoint requiring API key
+        server.route("/api/service", [](const HttpRequest& req, HttpResponse& res) -> int {
+            std::string service = checkAuth(req);
+            if (service.empty())
+            {
+                res.set_status(401);
+                res.set_header("Content-Type", "application/json");
+                res.set_content("{\"error\": \"Unauthorized\", \"message\": \"Valid X-API-Key header required\"}");
+                return 401;
+            }
+
+            std::ostringstream json;
+            json << "{"
+                 << "\"service\": \"" << service << "\","
+                 << "\"endpoint\": \"/api/service\","
+                 << "\"authenticated\": true"
+                 << "}";
+
+            res.set_header("Content-Type", "application/json");
+            res.set_content(json.str());
+            return 200;
+        });
+
+        std::cout << "Test commands:\n";
+        std::cout << "  curl http://localhost:8080/\n";
+        std::cout << "  curl -H \"Authorization: Bearer secret_token_123\" http://localhost:8080/api/protected\n";
+        std::cout << "  curl -H \"X-API-Key: api_key_abc\" http://localhost:8080/api/service\n";
         
-        std::cout << "Test commands:\n\n";
-        std::cout << "Public:\n";
-        std::cout << "  curl http://localhost:8080/public\n\n";
-        std::cout << "Authenticated + Compressed:\n";
-        std::cout << "  curl -H \"Authorization: Bearer secret_token_123\" -H \"Accept-Encoding: rle\" http://localhost:8080/api/data\n\n";
-        std::cout << "With proxy headers:\n";
-        std::cout << "  curl -H \"X-Forwarded-For: 203.0.113.42\" -H \"X-Forwarded-Proto: https\" http://localhost:8080/public\n\n";
+        server.start();
         
-        server.run();
+        // Keep server running
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
     catch (const std::exception& e)
     {

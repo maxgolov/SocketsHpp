@@ -1,340 +1,139 @@
 // Copyright Max Golovanov.
 // SPDX-License-Identifier: Apache-2.0
 
-/*
- * Authenticated API Server Example
- * 
- * Demonstrates using the authentication framework with multiple strategies:
- * - Bearer tokens (OAuth 2.0 style)
- * - API keys (custom X-API-Key header)
- * - HTTP Basic authentication
- * 
- * Real-world usage would integrate with a database or OAuth provider.
- */
+/// @file main.cpp
+/// @brief HTTP server with authentication example
+///
+/// This example demonstrates:
+/// - Bearer token authentication
+/// - API key authentication
+/// - Protected and public endpoints
 
 #include <sockets.hpp>
-#include <SocketsHpp/http/server/http_server.h>
-#include <SocketsHpp/http/server/authentication.h>
 #include <iostream>
 #include <string>
 #include <map>
 
 using namespace SOCKETSHPP_NS;
-using namespace SOCKETSHPP_NS::net::common;
+using namespace SOCKETSHPP_NS::http::server;
 
-// Simple HTTP request/response structures
-struct HttpRequest
-{
-    std::string method;
-    std::string path;
-    std::map<std::string, std::string> headers;
-    std::string body;
-    
-    bool has_header(const std::string& name) const
-    {
-        auto it = headers.find(name);
-        if (it != headers.end()) return true;
-        
-        std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        for (const auto& [key, value] : headers)
-        {
-            std::string keyLower = key;
-            std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), ::tolower);
-            if (keyLower == lower) return true;
-        }
-        return false;
-    }
-    
-    std::string get_header_value(const std::string& name) const
-    {
-        auto it = headers.find(name);
-        if (it != headers.end()) return it->second;
-        
-        std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        for (const auto& [key, value] : headers)
-        {
-            std::string keyLower = key;
-            std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), ::tolower);
-            if (keyLower == lower) return value;
-        }
-        return "";
-    }
-};
-
-struct HttpResponse
-{
-    int status = 200;
-    std::string statusText = "OK";
-    std::map<std::string, std::string> headers;
-    std::string body;
-    
-    void set_header(const std::string& name, const std::string& value)
-    {
-        headers[name] = value;
-    }
-    
-    void set_content(const std::string& content)
-    {
-        body = content;
-    }
-    
-    std::string toString() const
-    {
-        std::ostringstream response;
-        response << "HTTP/1.1 " << status << " " << statusText << "\r\n";
-        
-        for (const auto& [name, value] : headers)
-        {
-            response << name << ": " << value << "\r\n";
-        }
-        
-        response << "Content-Length: " << body.length() << "\r\n";
-        response << "Connection: close\r\n";
-        response << "\r\n";
-        response << body;
-        
-        return response.str();
-    }
-};
-
-// Mock user database
-std::map<std::string, std::string> validTokens = {
+// Mock authentication database
+std::map<std::string, std::string> validBearerTokens = {
     {"secret_token_123", "user1"},
-    {"admin_token_456", "admin"},
+    {"admin_token_456", "admin"}
 };
 
 std::map<std::string, std::string> validApiKeys = {
     {"api_key_abc", "service1"},
-    {"api_key_xyz", "service2"},
+    {"api_key_xyz", "service2"}
 };
 
-std::map<std::string, std::string> validUsers = {
-    {"alice", "password123"},
-    {"bob", "securepass"},
-};
-
-// Token validator callback
-SOCKETSHPP_NS::http::server::AuthResult validateBearerToken(const std::string& token)
+// Check authentication and return username, or empty string if unauthorized
+std::string checkAuth(const HttpRequest& req)
 {
-    auto it = validTokens.find(token);
-    if (it != validTokens.end())
+    // Check Bearer token authentication
+    if (req.has_header("Authorization"))
     {
-        // Return success with user ID
-        return SOCKETSHPP_NS::http::server::AuthResult::success(it->second);
-    }
-    return SOCKETSHPP_NS::http::server::AuthResult::failure("Invalid token");
-}
-
-// API key validator callback
-SOCKETSHPP_NS::http::server::AuthResult validateApiKey(const std::string& apiKey)
-{
-    auto it = validApiKeys.find(apiKey);
-    if (it != validApiKeys.end())
-    {
-        return SOCKETSHPP_NS::http::server::AuthResult::success(it->second);
-    }
-    return SOCKETSHPP_NS::http::server::AuthResult::failure("Invalid API key");
-}
-
-// Basic auth validator callback
-SOCKETSHPP_NS::http::server::AuthResult validateBasicAuth(const std::string& username, const std::string& password)
-{
-    auto it = validUsers.find(username);
-    if (it != validUsers.end() && it->second == password)
-    {
-        return SOCKETSHPP_NS::http::server::AuthResult::success(username);
-    }
-    return SOCKETSHPP_NS::http::server::AuthResult::failure("Invalid credentials");
-}
-
-// Simple request parser
-HttpRequest parseRequest(const std::string& requestData)
-{
-    HttpRequest req;
-    std::istringstream stream(requestData);
-    std::string line;
-    
-    if (std::getline(stream, line))
-    {
-        std::istringstream lineStream(line);
-        lineStream >> req.method >> req.path;
-    }
-    
-    while (std::getline(stream, line) && !line.empty() && line != "\r")
-    {
-        if (line.back() == '\r') line.pop_back();
-        
-        auto colonPos = line.find(':');
-        if (colonPos != std::string::npos)
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.substr(0, 7) == "Bearer " && auth.length() > 7)
         {
-            std::string name = line.substr(0, colonPos);
-            std::string value = line.substr(colonPos + 1);
-            value.erase(0, value.find_first_not_of(" \t"));
-            value.erase(value.find_last_not_of(" \t") + 1);
-            req.headers[name] = value;
+            std::string token = auth.substr(7);
+            auto it = validBearerTokens.find(token);
+            if (it != validBearerTokens.end())
+            {
+                return it->second;
+            }
         }
     }
-    
-    // Read body (simplified)
-    std::string bodyContent;
-    while (std::getline(stream, line))
+
+    // Check API Key authentication
+    if (req.has_header("X-API-Key"))
     {
-        bodyContent += line + "\n";
+        std::string apiKey = req.get_header_value("X-API-Key");
+        auto it = validApiKeys.find(apiKey);
+        if (it != validApiKeys.end())
+        {
+            return it->second;
+        }
     }
-    req.body = bodyContent;
-    
-    return req;
+
+    return "";
 }
 
 int main()
 {
     try
     {
-        std::cout << "Authenticated API Server\n";
-        std::cout << "========================\n";
-        std::cout << "Listening on http://localhost:8080\n\n";
-        
-        // Create authentication middleware with multiple strategies
-        SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::AuthenticationMiddleware<HttpRequest, HttpResponse> authMiddleware;
-        
-        // Add Bearer token authentication
-        auto bearerAuth = std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::BearerTokenAuth<HttpRequest>>(validateBearerToken);
-        authMiddleware.addStrategy(bearerAuth);
-        
-        // Add API key authentication
-        auto apiKeyAuth = std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::ApiKeyAuth<HttpRequest>>(validateApiKey, "X-API-Key");
-        authMiddleware.addStrategy(apiKeyAuth);
-        
-        // Add Basic authentication
-        auto basicAuth = std::make_shared<SOCKETSHPP_NS::http::server::SOCKETSHPP_NS::http::server::BasicAuth<HttpRequest>>(validateBasicAuth);
-        authMiddleware.addStrategy(basicAuth);
-        
-        // Set authentication callback
-        authMiddleware.setAuthenticatedCallback([](HttpRequest& req, const SOCKETSHPP_NS::http::server::AuthResult& SOCKETSHPP_NS::http::server::AuthResult)
-        {
-            std::cout << "Authenticated user: " << SOCKETSHPP_NS::http::server::AuthResult.userId << "\n";
+        HttpServer server("localhost", 8080);
+
+        // Public endpoint - no authentication required
+        server.route("/", [](const HttpRequest& req, HttpResponse& res) -> int {
+            res.set_header("Content-Type", "text/html");
+            res.set_content(
+                "<html><body>"
+                "<h1>Authentication Example</h1>"
+                "<p>Public endpoint - no authentication required</p>"
+                "<h2>Try authenticated endpoints:</h2>"
+                "<ul>"
+                "<li>curl -H \"Authorization: Bearer secret_token_123\" http://localhost:8080/api/user</li>"
+                "<li>curl -H \"X-API-Key: api_key_abc\" http://localhost:8080/api/service</li>"
+                "</ul>"
+                "</body></html>"
+            );
+            return 200;
         });
-        
-        tcp::SocketServer<> server(8080);
-        
-        server.onConnect([&authMiddleware](tcp::SocketConnection<>& connection)
-        {
-            connection.onMessage([&authMiddleware, &connection](const std::string& message)
+
+        // Protected endpoint - requires authentication
+        server.route("/api/user", [](const HttpRequest& req, HttpResponse& res) -> int {
+            std::string user = checkAuth(req);
+            if (user.empty())
             {
-                HttpRequest req = parseRequest(message);
-                HttpResponse res;
-                
-                std::cout << req.method << " " << req.path << "\n";
-                
-                // Public endpoint (no auth required)
-                if (req.path == "/" || req.path == "/public")
-                {
-                    res.set_content("Public endpoint - no authentication required");
-                    connection.send(res.toString());
-                    connection.close();
-                    return;
-                }
-                
-                // Protected endpoint - requires authentication
-                SOCKETSHPP_NS::http::server::AuthResult SOCKETSHPP_NS::http::server::AuthResult = authMiddleware.authenticate(req, res);
-                
-                if (!SOCKETSHPP_NS::http::server::AuthResult)
-                {
-                    // Authentication failed
-                    res.status = 401;
-                    res.statusText = "Unauthorized";
-                    res.set_content("{\"error\": \"" + SOCKETSHPP_NS::http::server::AuthResult.errorMessage + "\"}");
-                    res.set_header("Content-Type", "application/json");
-                    
-                    std::cout << "  Authentication failed: " << SOCKETSHPP_NS::http::server::AuthResult.errorMessage << "\n";
-                    
-                    connection.send(res.toString());
-                    connection.close();
-                    return;
-                }
-                
-                // Authentication successful - handle protected routes
-                if (req.path == "/api/user")
-                {
-                    std::ostringstream json;
-                    json << "{\n";
-                    json << "  \"userId\": \"" << SOCKETSHPP_NS::http::server::AuthResult.userId << "\",\n";
-                    json << "  \"message\": \"Welcome to the protected API!\",\n";
-                    json << "  \"claims\": {\n";
-                    
-                    bool first = true;
-                    for (const auto& [key, value] : SOCKETSHPP_NS::http::server::AuthResult.claims)
-                    {
-                        if (!first) json << ",\n";
-                        json << "    \"" << key << "\": \"" << value << "\"";
-                        first = false;
-                    }
-                    
-                    json << "\n  }\n";
-                    json << "}\n";
-                    
-                    res.set_content(json.str());
-                    res.set_header("Content-Type", "application/json");
-                }
-                else if (req.path == "/api/admin")
-                {
-                    // Admin-only endpoint
-                    if (SOCKETSHPP_NS::http::server::AuthResult.userId != "admin")
-                    {
-                        res.status = 403;
-                        res.statusText = "Forbidden";
-                        res.set_content("{\"error\": \"Admin access required\"}");
-                        res.set_header("Content-Type", "application/json");
-                    }
-                    else
-                    {
-                        res.set_content("{\"message\": \"Admin panel access granted\"}");
-                        res.set_header("Content-Type", "application/json");
-                    }
-                }
-                else
-                {
-                    res.status = 404;
-                    res.statusText = "Not Found";
-                    res.set_content("{\"error\": \"Endpoint not found\"}");
-                    res.set_header("Content-Type", "application/json");
-                }
-                
-                connection.send(res.toString());
-                connection.close();
-            });
+                res.set_status(401);
+                res.set_header("Content-Type", "application/json");
+                res.set_header("WWW-Authenticate", "Bearer");
+                res.set_content("{\"error\": \"Unauthorized\", \"message\": \"Valid Bearer token required\"}");
+                return 401;
+            }
+
+            res.set_header("Content-Type", "application/json");
+            res.set_content("{\"user\": \"" + user + "\", \"endpoint\": \"/api/user\"}");
+            return 200;
         });
+
+        // Protected service endpoint - requires API key
+        server.route("/api/service", [](const HttpRequest& req, HttpResponse& res) -> int {
+            std::string service = checkAuth(req);
+            if (service.empty())
+            {
+                res.set_status(401);
+                res.set_header("Content-Type", "application/json");
+                res.set_content("{\"error\": \"Unauthorized\", \"message\": \"Valid X-API-Key header required\"}");
+                return 401;
+            }
+
+            res.set_header("Content-Type", "application/json");
+            res.set_content("{\"service\": \"" + service + "\", \"endpoint\": \"/api/service\"}");
+            return 200;
+        });
+
+        std::cout << "Authentication server listening on http://localhost:8080\n";
+        std::cout << "Test commands:\n";
+        std::cout << "  curl http://localhost:8080/\n";
+        std::cout << "  curl -H \"Authorization: Bearer secret_token_123\" http://localhost:8080/api/user\n";
+        std::cout << "  curl -H \"X-API-Key: api_key_abc\" http://localhost:8080/api/service\n";
+
+        server.start();
         
-        std::cout << "Test with:\n\n";
-        std::cout << "Public endpoint:\n";
-        std::cout << "  curl http://localhost:8080/public\n\n";
-        
-        std::cout << "Bearer token (OAuth style):\n";
-        std::cout << "  curl -H \"Authorization: Bearer secret_token_123\" http://localhost:8080/api/user\n\n";
-        
-        std::cout << "API key:\n";
-        std::cout << "  curl -H \"X-API-Key: api_key_abc\" http://localhost:8080/api/user\n\n";
-        
-        std::cout << "Basic authentication:\n";
-        std::cout << "  curl -u alice:password123 http://localhost:8080/api/user\n\n";
-        
-        std::cout << "Admin endpoint:\n";
-        std::cout << "  curl -H \"Authorization: Bearer admin_token_456\" http://localhost:8080/api/admin\n\n";
-        
-        std::cout << "Unauthorized (should fail):\n";
-        std::cout << "  curl http://localhost:8080/api/user\n\n";
-        
-        server.run();
+        // Keep server running
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
     catch (const std::exception& e)
     {
-        std::cerr << "Error: " << e.what() << "\n";
+        std::cerr << "Server error: " << e.what() << std::endl;
         return 1;
     }
-    
+
     return 0;
 }
-
-
