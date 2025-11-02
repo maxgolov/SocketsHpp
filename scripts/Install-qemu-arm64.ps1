@@ -33,7 +33,7 @@ Write-Host ""
 
 if ($SkipBuild) {
     Write-Host "Skipping build, running tests only..."
-    wsl -d Ubuntu-24.04 bash -c "export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu && cd /mnt/c/build/maxgolov/SocketsHpp/build-arm64 && ctest --output-on-failure"
+    wsl -d Ubuntu-24.04 bash -c "export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu && cd /mnt/c/build/maxgolov/SocketsHpp/build/linux-arm64 && ctest --output-on-failure"
 } else {
     Write-Host "Building and testing on ARM64..."
     wsl -d Ubuntu-24.04 bash -c "cd /mnt/c/build/maxgolov/SocketsHpp && ./scripts/build-arm64.sh"
@@ -46,7 +46,7 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "========================================"
     Write-Host ""
     Write-Host "Architecture: aarch64 (ARM64)"
-    Write-Host "Build directory: build-arm64/"
+    Write-Host "Build directory: build/linux-arm64/"
     Write-Host "Emulation: QEMU ARM64"
     Write-Host ""
 } else {

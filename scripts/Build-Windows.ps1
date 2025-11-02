@@ -43,8 +43,8 @@ if (-not (Test-Path $VcpkgToolchain)) {
 # Clean build directory if requested
 if ($Clean) {
     Write-Host "Cleaning build directory..." -ForegroundColor Yellow
-    if (Test-Path "$ProjectRoot\build") {
-        Remove-Item -Recurse -Force "$ProjectRoot\build"
+    if (Test-Path "$ProjectRoot\build\windows-x64") {
+        Remove-Item -Recurse -Force "$ProjectRoot\build\windows-x64"
     }
 }
 
@@ -53,7 +53,7 @@ Write-Host "`nConfiguring project with CMake..." -ForegroundColor Cyan
 Push-Location $ProjectRoot
 
 $ConfigureArgs = @(
-    "-B", "build",
+    "-B", "build/windows-x64",
     "-S", ".",
     "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain",
     "-DCMAKE_BUILD_TYPE=$Configuration"
@@ -71,7 +71,7 @@ if ($LASTEXITCODE -ne 0) {
 # Build with CMake
 Write-Host "`nBuilding project..." -ForegroundColor Cyan
 $BuildArgs = @(
-    "--build", "build",
+    "--build", "build/windows-x64",
     "--config", $Configuration
 )
 
@@ -93,7 +93,7 @@ Write-Host "`nBuild completed successfully!" -ForegroundColor Green
 # Run tests
 if (-not $SkipTests) {
     Write-Host "`nRunning tests..." -ForegroundColor Cyan
-    Push-Location "$ProjectRoot\build"
+    Push-Location "$ProjectRoot\build\windows-x64"
     
     $TestArgs = @(
         "-C", $Configuration,

@@ -4,8 +4,10 @@
 // Uncomment this line for additional debugging:
 // #define HAVE_CONSOLE_LOG
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <list>
 #include <map>
 #include <set>
@@ -118,7 +120,7 @@ namespace testing
         test.Stop();
     }
 
-    // UDP echo server test - now enabled with proper datagram handling
+    // UDP echo server test
     TEST(SocketTests, BasicUdpEchoTest)
     {
         SocketParams params{ AF_INET, SOCK_DGRAM, 0 };
@@ -157,7 +159,7 @@ namespace testing
         EXPECT_EQ(total_bytes_sent, request_text.size());
         
         // Give server time to process
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         
         // For UDP, use single recv() not readall()
         std::string response_text;

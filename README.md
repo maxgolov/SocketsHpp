@@ -8,9 +8,10 @@
 - **Cross-Platform**: Windows, Linux, macOS, iOS, Android, embedded systems
 - **C++17 Standard**: Modern C++ with minimal dependencies
 - **Enterprise HTTP**: Production-ready server with middleware, authentication, compression, and proxy awareness
+- **Optional Multi-Threading**: BS::thread_pool integration for concurrent request processing
 - **Real-Time Streaming**: Server-Sent Events (SSE) for live data streaming
 - **MCP Support**: Full Model Context Protocol server and client implementation
-- **Comprehensive Testing**: 231 unit and integration tests (100% passing)
+- **Comprehensive Testing**: 231 unit and integration tests on Windows, 183 on Linux/ARM64 (100% passing)
 
 ## Origins
 
@@ -29,20 +30,45 @@ Extensively refactored and enhanced for modern application development. See [LIC
 
 ### Building
 
-**Windows:**
+**All Platforms (Windows):**
+```cmd
+build-all.cmd
+```
+Builds and tests for Windows x64, Linux x64 (WSL), and Linux ARM64 (QEMU).
+
+**Windows x64 Only:**
 ```cmd
 build.cmd
 ```
+or
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\Build-Windows.ps1
+```
 
-**Linux/macOS:**
+**Linux x64 (Native or WSL):**
 ```bash
-./build.sh
+./scripts/build-linux.sh
+```
+
+**Linux ARM64 (Cross-Compilation):**
+```bash
+./scripts/build-arm64.sh
+```
+
+**Legacy Build (Deprecated):**
+```bash
+./build.sh  # Creates out/ directory with Ninja build
 ```
 
 **Custom CMake:**
 ```bash
-cmake -B build -S .
-cmake --build build --config Release
+# Windows
+cmake -B build/windows-x64 -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build/windows-x64 --config Release
+
+# Linux
+cmake -B build/linux-x64 -S . -DCMAKE_BUILD_TYPE=Release -G Ninja
+cmake --build build/linux-x64
 ```
 
 ### Integration
@@ -212,6 +238,30 @@ server.addHandler("/api/data", [&compressor](const auto& req, auto& res) {
 server.start();
 ```
 
+### HTTP Server with Multi-Threading (Optional)
+
+```cpp
+#include <sockets.hpp>
+
+HttpServer server("0.0.0.0", 8080);
+
+// Enable thread pool for concurrent request processing (optional)
+server.enableThreadPool(4);  // 4 worker threads (0 = hardware_concurrency)
+
+server.addHandler("/api/compute", [](const auto& req, auto& res) {
+    // CPU-intensive work offloaded to worker threads
+    // Reactor thread remains responsive for I/O
+    auto result = performExpensiveComputation();
+    res.body = result;
+});
+
+server.start();
+server.waitExit();
+
+// Thread pool is automatically stopped on server shutdown
+// Can also disable manually: server.disableThreadPool();
+```
+
 ### Server-Sent Events (SSE) Streaming
 
 ```cpp
@@ -320,20 +370,32 @@ Each example includes a README.md and CMakeLists.txt for standalone building.
 
 ## Testing
 
-The project includes 231 comprehensive tests:
+The project includes 231 comprehensive tests on Windows, 183 on Linux/ARM64:
 
 ```bash
-# Build and run all tests
-cmake -B build -S .
-cmake --build build --config Debug
-cd build
-ctest -C Debug
+# Build and run all platforms (Windows)
+build-all.cmd
+
+# Windows x64 only
+powershell -ExecutionPolicy Bypass -File scripts\Build-Windows.ps1
+
+# Linux x64 (WSL or native)
+./scripts/build-linux.sh
+
+# Linux ARM64 (cross-compilation with QEMU)
+./scripts/build-arm64.sh
+
+# Run tests manually after build
+cd build/windows-x64  # or build/linux-x64, build/linux-arm64
+ctest --output-on-failure
 ```
 
 Test coverage:
 - **71 unit tests** for new features (proxy, auth, compression, MCP, SSE, JSON-RPC)
 - **160 functional tests** for core networking and HTTP
-- **100% pass rate** on Windows x64, Linux, and ARM64
+- **100% pass rate** on Windows x64, Linux x64, and Linux ARM64
+- **231 tests on Windows** (48 Windows-specific tests)
+- **183 tests on Linux/ARM64** (cross-platform core)
 
 ## Documentation
 
@@ -347,6 +409,7 @@ Test coverage:
 ### Runtime (Header-Only Mode)
 - C++17 standard library
 - System socket library (POSIX sockets or WinSock)
+- **[BS::thread_pool](https://github.com/bshoshany/thread-pool)** (optional) - Multi-threading support
 
 ### Build & Testing
 - **[vcpkg](https://vcpkg.io/)** - Package manager
@@ -371,8 +434,10 @@ All test dependencies are automatically managed by vcpkg.
 
 - **Header-Only**: Zero compilation, instant integration
 - **Minimal Dependencies**: Only C++17 stdlib and system sockets for core functionality
+- **Optional Multi-Threading**: BS::thread_pool integration available but not required
 - **Platform Agnostic**: Abstracts BSD sockets and WinSock differences
 - **Modern C++**: Uses C++17 features, no legacy baggage
+- **Minimalist & Practical**: ~75% HTTP/1.1 compliance, optimized for <10K concurrent connections
 - **Production-Ready**: Enterprise features with comprehensive testing
 - **Developer-Friendly**: Clear APIs, extensive examples, detailed documentation
 

@@ -9,6 +9,9 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <mutex>
+#include <optional>
+#include <BS_thread_pool.hpp>
 
 SOCKETSHPP_NS_BEGIN
 namespace http
@@ -517,6 +520,7 @@ namespace http
                     Sending100Continue,
                     ReceivingBody,
                     Processing,
+                    ProcessingAsync,  // New: processing in thread pool
                     SendingHeaders,
                     SendingBody,
                     StreamingChunked,  // New: sending chunked data
@@ -575,6 +579,8 @@ namespace http
             std::list<HttpRequestHandler> m_handlers;
 
             std::map<Socket, Connection> m_connections;
+            std::mutex m_connectionsMutex;  // Protects m_connections
+            std::optional<BS::thread_pool<>> m_threadPool;  // Optional thread pool for async request processing
             size_t m_maxRequestHeadersSize, m_maxRequestContentSize;
             
             SessionManager m_sessionManager;
@@ -613,6 +619,29 @@ namespace http
             }
 
             void setServerName(std::string const& name) { m_serverHost = name; }
+            
+            // Thread pool configuration
+            void enableThreadPool(size_t numThreads = 0)
+            {
+                if (numThreads == 0)
+                {
+                    numThreads = std::thread::hardware_concurrency();
+                    if (numThreads == 0) numThreads = 4;  // Fallback
+                }
+                m_threadPool.emplace(numThreads);
+                LOG_INFO("HttpServer: Thread pool enabled with %zu threads", numThreads);
+            }
+            
+            void disableThreadPool()
+            {
+                m_threadPool.reset();
+                LOG_INFO("HttpServer: Thread pool disabled");
+            }
+            
+            bool isThreadPoolEnabled() const
+            {
+                return m_threadPool.has_value();
+            }
             
             // CORS configuration
             void enableCors(bool enabled = true) { m_corsConfig.enabled = enabled; }
@@ -706,23 +735,25 @@ namespace http
                 if (socket.accept(csocket, caddr))
                 {
                     csocket.setNonBlocking();
-                    Connection& conn = m_connections[csocket];
-                    conn.socket = csocket;
-                    conn.state = Connection::Idle;
-                    conn.request.client = caddr.toString();
+                    {
+                        std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                        Connection& conn = m_connections[csocket];
+                        conn.socket = csocket;
+                        conn.state = Connection::Idle;
+                        conn.request.client = caddr.toString();
+                    }
                     m_reactor.addSocket(csocket, Reactor::Readable | Reactor::Closed);
-                    LOG_TRACE("HttpServer: [%s] accepted", conn.request.client.c_str());
+                    LOG_TRACE("HttpServer: [%s] accepted", caddr.toString().c_str());
                 }
             }
 
             virtual void onSocketReadable(Socket socket) override
             {
                 LOG_TRACE("HttpServer: reading socket fd=0x%llx", socket.m_sock);
-                // No thread-safety here!
                 assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
                     m_listeningSockets.end());
 
-                // No thread-safety here!
+                std::lock_guard<std::mutex> lock(m_connectionsMutex);
                 auto connIt = m_connections.find(socket);
                 if (connIt == m_connections.end())
                 {
@@ -747,11 +778,10 @@ namespace http
             {
                 LOG_TRACE("HttpServer: writing socket fd=0x%llx", socket.m_sock);
 
-                // No thread-safety here!
                 assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
                     m_listeningSockets.end());
 
-                // No thread-safety here!
+                std::lock_guard<std::mutex> lock(m_connectionsMutex);
                 auto connIt = m_connections.find(socket);
                 if (connIt == m_connections.end())
                 {
@@ -771,6 +801,7 @@ namespace http
                 assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
                     m_listeningSockets.end());
 
+                std::lock_guard<std::mutex> lock(m_connectionsMutex);
                 auto connIt = m_connections.find(socket);
                 if (connIt == m_connections.end())
                 {
@@ -958,7 +989,60 @@ namespace http
 
                     if (conn.state == Connection::Processing)
                     {
-                        processRequest(conn);
+                        // If thread pool is enabled, offload to worker thread
+                        if (m_threadPool.has_value())
+                        {
+                            // Capture socket for async processing
+                            Socket sock = conn.socket;
+                            conn.state = Connection::ProcessingAsync;
+                            LOG_TRACE("HttpServer: [%s] offloading to thread pool", conn.request.client.c_str());
+                            
+                            // Submit task to thread pool
+                            m_threadPool->detach_task([this, sock]() {
+                                // Process request in worker thread
+                                {
+                                    std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                                    auto it = m_connections.find(sock);
+                                    if (it == m_connections.end())
+                                    {
+                                        return;  // Connection closed while queued
+                                    }
+                                    
+                                    Connection& asyncConn = it->second;
+                                    if (asyncConn.state != Connection::ProcessingAsync)
+                                    {
+                                        return;  // State changed, skip
+                                    }
+                                    
+                                    processRequest(asyncConn);
+                                    
+                                    // Build response headers
+                                    std::ostringstream os;
+                                    os << asyncConn.request.protocol << ' ' << asyncConn.response.code << ' ' 
+                                       << asyncConn.response.message << "\r\n";
+                                    for (auto const& header : asyncConn.response.headers)
+                                    {
+                                        os << header.first << ": " << header.second << "\r\n";
+                                    }
+                                    os << "\r\n";
+                                    
+                                    asyncConn.sendBuffer = os.str();
+                                    asyncConn.state = Connection::SendingHeaders;
+                                }
+                                
+                                // Signal reactor that socket is ready to write
+                                // This will trigger onSocketWritable on the reactor thread
+                                m_reactor.addSocket(sock, Reactor::Writable | Reactor::Closed);
+                            });
+                            
+                            // Return immediately - reactor will be notified when processing completes
+                            return;
+                        }
+                        else
+                        {
+                            // Synchronous processing (original behavior)
+                            processRequest(conn);
+                        }
 
                         std::ostringstream os;
                         os << conn.request.protocol << ' ' << conn.response.code << ' ' << conn.response.message
@@ -972,6 +1056,12 @@ namespace http
                         conn.sendBuffer = os.str();
                         conn.state = Connection::SendingHeaders;
                         LOG_TRACE("HttpServer: [%s] sending headers", conn.request.client.c_str());
+                    }
+                    
+                    if (conn.state == Connection::ProcessingAsync)
+                    {
+                        // Still processing in thread pool, wait
+                        return;
                     }
 
                     if (conn.state == Connection::SendingHeaders)

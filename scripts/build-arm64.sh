@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 if ! dpkg -l | grep -q gcc-aarch64-linux-gnu; then
     echo "Installing ARM64 cross-compilation toolchain..."
     sudo apt-get update
-    sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu git
+    sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu git wget
 fi
 
 # Check for QEMU user-mode emulation
@@ -65,35 +65,46 @@ fi
 # Create ARM64 build directory
 cd /mnt/c/build/maxgolov/SocketsHpp
 echo "Creating ARM64 build directory..."
-rm -rf build-arm64
-mkdir -p build-arm64
-cd build-arm64
+rm -rf build/linux-arm64
+mkdir -p build/linux-arm64/external/include
+
+# Copy BS thread pool header (header-only library from Windows vcpkg)
+echo "Copying BS thread pool header..."
+if [ -f build/windows-x64/vcpkg_installed/x64-windows/include/BS_thread_pool.hpp ]; then
+    cp build/windows-x64/vcpkg_installed/x64-windows/include/BS_thread_pool.hpp build/linux-arm64/external/include/
+    echo "BS thread pool header copied successfully"
+else
+    echo "Warning: BS thread pool header not found in Windows build, attempting to continue..."
+fi
 
 # Configure for ARM64
 echo "Configuring CMake for ARM64..."
-cmake -B . -S .. \
+# Set QEMU_LD_PREFIX for test discovery during build
+export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+
+cmake -B build/linux-arm64 -S . \
     -GNinja \
     -DCMAKE_SYSTEM_NAME=Linux \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
     -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
     -DCMAKE_PREFIX_PATH=$GTEST_ARM64_DIR \
-    -DCMAKE_FIND_ROOT_PATH="/usr/aarch64-linux-gnu;$GTEST_ARM64_DIR" \
+    -DCMAKE_FIND_ROOT_PATH="/usr/aarch64-linux-gnu;$GTEST_ARM64_DIR;$(pwd)/build/linux-arm64/external" \
     -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
     -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
     -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
 
 echo ""
 echo "Building for ARM64 architecture..."
-cmake --build . -j $(nproc)
+cmake --build build/linux-arm64 -j $(nproc)
 
 # Verify build artifacts
 echo ""
 echo "========================================"
 echo "ARM64 Build Artifacts"
 echo "========================================"
-file test/url_parser_test test/socket_addr_test test/socket_basic_test 2>/dev/null | head -3 || true
-file test/sockets_test test/http_server_test 2>/dev/null | head -2 || true
+file build/linux-arm64/test/url_parser_test build/linux-arm64/test/socket_addr_test build/linux-arm64/test/socket_basic_test 2>/dev/null | head -3 || true
+file build/linux-arm64/test/sockets_test build/linux-arm64/test/http_server_test 2>/dev/null | head -2 || true
 
 echo ""
 echo "========================================"
@@ -108,7 +119,9 @@ if which qemu-aarch64-static >/dev/null 2>&1; then
     
     # Use QEMU directly with library path
     export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+    cd build/linux-arm64
     ctest --output-on-failure
+    cd ../..
 else
     echo "Warning: QEMU ARM64 emulation not available."
     echo "Tests were built but cannot be executed."
@@ -121,7 +134,7 @@ echo ""
 echo "========================================"
 echo "ARM64 Build Complete!"
 echo "========================================"
-echo "Build directory: build-arm64"
+echo "Build directory: build/linux-arm64"
 echo "Architecture: aarch64 (ARM64)"
 echo "Compiler: aarch64-linux-gnu-g++"
 echo ""

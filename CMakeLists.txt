@@ -18,6 +18,13 @@ include(CTest)
 include_directories(include)
 include_directories(external/simple-uri-parser)
 
+# Find BS thread pool header
+find_path(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS "BS_thread_pool.hpp")
+if(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS)
+    include_directories(${BSHOSHANY_THREAD_POOL_INCLUDE_DIRS})
+    message(STATUS "Found BS thread pool: ${BSHOSHANY_THREAD_POOL_INCLUDE_DIRS}")
+endif()
+
 find_package(GTest)
 if (GTest_FOUND)
   add_subdirectory(test)

@@ -94,31 +94,33 @@ fi
 # Check for vcpkg or install Google Test via apt
 if [ ! -d "$HOME/vcpkg" ]; then
     echo -e "${YELLOW}vcpkg not found. Installing Google Test via apt...${NC}"
-    sudo apt-get update
-    sudo apt-get install -y libgtest-dev
+    sudo apt-get update 2>/dev/null || true  # Ignore apt update errors
+    sudo apt-get install -y libgtest-dev 2>/dev/null || true
     
     # Build and install gtest if needed
     if [ ! -f /usr/lib/libgtest.a ] && [ ! -f /usr/lib/x86_64-linux-gnu/libgtest.a ]; then
-        echo -e "${YELLOW}Building Google Test...${NC}"
-        cd /usr/src/gtest
-        sudo cmake CMakeLists.txt
-        sudo make
-        sudo cp lib/*.a /usr/lib/ 2>/dev/null || sudo cp *.a /usr/lib/
-        cd "$PROJECT_ROOT"
+        if [ -d /usr/src/gtest ]; then
+            echo -e "${YELLOW}Building Google Test...${NC}"
+            cd /usr/src/gtest
+            sudo cmake CMakeLists.txt
+            sudo make
+            sudo cp lib/*.a /usr/lib/ 2>/dev/null || sudo cp *.a /usr/lib/
+            cd "$PROJECT_ROOT"
+        fi
     fi
 fi
 
 # Clean build directory if requested
 if [ "$CLEAN" = true ]; then
     echo -e "${YELLOW}Cleaning build directory...${NC}"
-    rm -rf build
+    rm -rf build/linux-x64
 fi
 
 # Configure with CMake
 echo -e "\n${CYAN}Configuring project with CMake...${NC}"
 
 CMAKE_ARGS=(
-    -B build
+    -B build/linux-x64
     -S .
     -DCMAKE_BUILD_TYPE="$CONFIGURATION"
 )
@@ -140,7 +142,7 @@ fi
 echo -e "\n${CYAN}Building project...${NC}"
 
 BUILD_ARGS=(
-    --build build
+    --build build/linux-x64
     --config "$CONFIGURATION"
 )
 
@@ -164,7 +166,7 @@ echo -e "\n${GREEN}Build completed successfully!${NC}"
 # Run tests
 if [ "$SKIP_TESTS" = false ]; then
     echo -e "\n${CYAN}Running tests...${NC}"
-    cd build
+    cd build/linux-x64
     
     TEST_ARGS=(
         --output-on-failure

@@ -115,6 +115,8 @@ namespace net
                 else
                 {
                     // In UDP mode we read in a loop, no need to accept.
+                    // Set socket to non-blocking so recvfrom() doesn't block indefinitely
+                    server_socket.setNonBlocking();
                     reactor.addSocket(server_socket, Reactor::Readable);
                 }
 
