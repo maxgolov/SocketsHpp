@@ -255,7 +255,7 @@ namespace net
 
                 // Convert IPv4 or IPv6 address to binary form
                 size_t numColons = std::count(ipAddress.begin(), ipAddress.end(), ':');
-                
+
                 if (numColons > 1)
                 {
                     // IPv6 address
@@ -269,21 +269,40 @@ namespace net
                         // Remove square brackets
                         ipAddress = ipAddress.substr(1, ipAddress.length() - 2);
                     }
-                    if (!::inet_pton(inet6.sin6_family, ipAddress.c_str(), pAddrBuf))
+                    if (::inet_pton(inet6.sin6_family, ipAddress.c_str(), pAddrBuf) != 1)
                     {
                         LOG_ERROR("Invalid IPv6 address: %s", addr);
+                        throw std::invalid_argument("Invalid IPv6 address: " + std::string(addr));
                     }
                 }
                 else
                 {
-                    // IPv4 address
+                    // IPv4 address or hostname
                     sockaddr_in& inet = m_data_in;
                     inet.sin_family = AF_INET;
                     inet.sin_port = htons(port);
                     void* pAddrBuf = &inet.sin_addr;
-                    if (!::inet_pton(inet.sin_family, ipAddress.c_str(), pAddrBuf))
+
+                    // Try inet_pton first for IP addresses
+                    if (::inet_pton(inet.sin_family, ipAddress.c_str(), pAddrBuf) != 1)
                     {
-                        LOG_ERROR("Invalid IPv4 address: %s", addr);
+                        // inet_pton failed, try getaddrinfo for hostname resolution
+                        struct addrinfo hints = {};
+                        struct addrinfo* result = nullptr;
+                        hints.ai_family = AF_INET;
+                        hints.ai_socktype = SOCK_STREAM;
+
+                        if (::getaddrinfo(ipAddress.c_str(), nullptr, &hints, &result) == 0 && result != nullptr)
+                        {
+                            sockaddr_in* resolved = reinterpret_cast<sockaddr_in*>(result->ai_addr);
+                            inet.sin_addr = resolved->sin_addr;
+                            ::freeaddrinfo(result);
+                        }
+                        else
+                        {
+                            LOG_ERROR("Invalid IPv4 address or hostname: %s", addr);
+                            throw std::invalid_argument("Invalid IPv4 address or hostname: " + std::string(addr));
+                        }
                     }
                 }
             }
@@ -304,7 +323,16 @@ namespace net
                 {
                     m_data_un.sun_family = AF_UNIX;
                     // Max length of Unix domain filename is up to 108 chars
-                    strncpy_s(m_data_un.sun_path, sizeof(m_data_un.sun_path), addr, sizeof(m_data_un.sun_path));
+                    size_t pathLen = strlen(addr);
+                    if (pathLen >= sizeof(m_data_un.sun_path))
+                    {
+                        throw std::invalid_argument("Unix socket path too long (max " +
+                            std::to_string(sizeof(m_data_un.sun_path) - 1) + " chars): " + std::string(addr));
+                    }
+                    // Use memcpy for safety and ensure null termination
+                    memset(m_data_un.sun_path, 0, sizeof(m_data_un.sun_path));
+                    memcpy(m_data_un.sun_path, addr, pathLen);
+                    m_data_un.sun_path[pathLen] = '\0';
                     return;
                 }
 #endif
@@ -336,9 +364,10 @@ namespace net
                         // Remove square brackets
                         ipAddress = ipAddress.substr(1, ipAddress.length() - 2);
                     }
-                    if (!::inet_pton(inet6.sin6_family, ipAddress.c_str(), pAddrBuf))
+                    if (::inet_pton(inet6.sin6_family, ipAddress.c_str(), pAddrBuf) != 1)
                     {
                         LOG_ERROR("Invalid IPv6 address: %s", addr);
+                        throw std::invalid_argument("Invalid IPv6 address: " + std::string(addr));
                     }
                 }
                 else
@@ -347,9 +376,27 @@ namespace net
                     inet.sin_family = AF_INET;
                     inet.sin_port = htons(port);
                     void* pAddrBuf = &inet.sin_addr;
-                    if (!::inet_pton(inet.sin_family, ipAddress.c_str(), pAddrBuf))
+
+                    // Try inet_pton first for IP addresses
+                    if (::inet_pton(inet.sin_family, ipAddress.c_str(), pAddrBuf) != 1)
                     {
-                        LOG_ERROR("Invalid IPv4 address: %s", addr);
+                        // inet_pton failed, try getaddrinfo for hostname resolution
+                        struct addrinfo hints = {};
+                        struct addrinfo* result = nullptr;
+                        hints.ai_family = AF_INET;
+                        hints.ai_socktype = SOCK_STREAM;
+
+                        if (::getaddrinfo(ipAddress.c_str(), nullptr, &hints, &result) == 0 && result != nullptr)
+                        {
+                            sockaddr_in* resolved = reinterpret_cast<sockaddr_in*>(result->ai_addr);
+                            inet.sin_addr = resolved->sin_addr;
+                            ::freeaddrinfo(result);
+                        }
+                        else
+                        {
+                            LOG_ERROR("Invalid IPv4 address or hostname: %s", addr);
+                            throw std::invalid_argument("Invalid IPv4 address or hostname: " + std::string(addr));
+                        }
                     }
                 }
             }
@@ -472,7 +519,10 @@ namespace net
         };
 
         /// <summary>
-        /// Encapsulation of a socket (non-exclusive ownership)
+        /// Encapsulation of a socket (non-exclusive ownership).
+        /// IMPORTANT: This class does NOT automatically close the socket in its destructor
+        /// for backward compatibility and to support non-owning references.
+        /// Users MUST call close() explicitly, or use ScopedSocket for RAII behavior.
         /// </summary>
         struct Socket
         {
@@ -486,23 +536,61 @@ namespace net
 
             Type m_sock;
 
+            /// @brief Construct socket from parameters
             Socket(SocketParams params) : Socket(params.af, params.type, params.proto) {}
 
-            Socket(Type sock = Invalid) : m_sock(sock) {}
+            /// @brief Construct socket from existing handle (non-owning)
+            Socket(Type sock = Invalid) noexcept : m_sock(sock) {}
 
-            Socket(int af, int type, int proto) { m_sock = ::socket(af, type, proto); }
+            /// @brief Create new socket with specified parameters
+            /// @throws std::runtime_error if socket creation fails
+            Socket(int af, int type, int proto)
+            {
+                m_sock = ::socket(af, type, proto);
+                if (m_sock == Invalid)
+                {
+#ifdef _WIN32
+                    int err = ::WSAGetLastError();
+                    throw std::runtime_error("Failed to create socket, error: " + std::to_string(err));
+#else
+                    throw std::runtime_error("Failed to create socket: " + std::string(strerror(errno)));
+#endif
+                }
+            }
 
-            ~Socket() {}
+            // Copy operations allowed (non-owning semantics)
+            Socket(Socket const& other) = default;
+            Socket& operator=(Socket const& other) = default;
 
-            operator Socket::Type() const { return m_sock; }
+            // Move operations (transfers handle without closing)
+            Socket(Socket&& other) noexcept : m_sock(other.m_sock)
+            {
+                other.m_sock = Invalid;
+            }
 
-            bool operator==(Socket const& other) const { return (m_sock == other.m_sock); }
+            Socket& operator=(Socket&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    m_sock = other.m_sock;
+                    other.m_sock = Invalid;
+                }
+                return *this;
+            }
 
-            bool operator!=(Socket const& other) const { return (m_sock != other.m_sock); }
+            /// @brief Destructor does NOT close socket (call close() explicitly)
+            ~Socket() = default;
 
-            bool operator<(Socket const& other) const { return (m_sock < other.m_sock); }
+            operator Socket::Type() const noexcept { return m_sock; }
 
-            bool invalid() const { return (m_sock == Invalid); }
+            bool operator==(Socket const& other) const noexcept { return (m_sock == other.m_sock); }
+
+            bool operator!=(Socket const& other) const noexcept { return (m_sock != other.m_sock); }
+
+            bool operator<(Socket const& other) const noexcept { return (m_sock < other.m_sock); }
+
+            /// @brief Check if socket handle is invalid
+            bool invalid() const noexcept { return (m_sock == Invalid); }
 
             void setNonBlocking()
             {
@@ -745,6 +833,85 @@ namespace net
         };
 
         /// <summary>
+        /// RAII wrapper for Socket providing automatic cleanup.
+        /// Use this when you want automatic socket closure on scope exit.
+        /// </summary>
+        class ScopedSocket
+        {
+        private:
+            Socket m_socket;
+            bool m_owned;
+
+        public:
+            /// @brief Construct from Socket, taking ownership
+            explicit ScopedSocket(Socket&& sock) noexcept
+                : m_socket(std::move(sock)), m_owned(true) {}
+
+            /// @brief Create new socket with parameters
+            ScopedSocket(int af, int type, int proto)
+                : m_socket(af, type, proto), m_owned(true) {}
+
+            /// @brief Non-copyable
+            ScopedSocket(ScopedSocket const&) = delete;
+            ScopedSocket& operator=(ScopedSocket const&) = delete;
+
+            /// @brief Movable
+            ScopedSocket(ScopedSocket&& other) noexcept
+                : m_socket(std::move(other.m_socket)), m_owned(other.m_owned)
+            {
+                other.m_owned = false;
+            }
+
+            ScopedSocket& operator=(ScopedSocket&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    if (m_owned && !m_socket.invalid())
+                    {
+                        m_socket.close();
+                    }
+                    m_socket = std::move(other.m_socket);
+                    m_owned = other.m_owned;
+                    other.m_owned = false;
+                }
+                return *this;
+            }
+
+            /// @brief Auto-close socket on destruction
+            ~ScopedSocket()
+            {
+                if (m_owned && !m_socket.invalid())
+                {
+                    m_socket.close();
+                }
+            }
+
+            /// @brief Get underlying socket (non-owning reference)
+            Socket& get() noexcept { return m_socket; }
+            Socket const& get() const noexcept { return m_socket; }
+
+            /// @brief Release ownership (caller must close)
+            Socket release() noexcept
+            {
+                m_owned = false;
+                return m_socket;
+            }
+
+            /// @brief Forwarding methods to underlying socket
+            bool invalid() const noexcept { return m_socket.invalid(); }
+            void setNonBlocking() { m_socket.setNonBlocking(); }
+            bool setReuseAddr() { return m_socket.setReuseAddr(); }
+            bool setNoDelay() { return m_socket.setNoDelay(); }
+            bool connect(SocketAddr const& addr) { return m_socket.connect(addr); }
+            int send(void const* buffer, size_t size) { return m_socket.send(buffer, size); }
+            int recv(void* buffer, size_t size, int flags = 0) { return m_socket.recv(buffer, size, flags); }
+            int bind(SocketAddr const& addr) { return m_socket.bind(addr); }
+            bool listen(size_t backlog) { return m_socket.listen(backlog); }
+            bool accept(Socket& csock, SocketAddr& caddr) { return m_socket.accept(csock, caddr); }
+            void close() { if (m_owned) m_socket.close(); m_owned = false; }
+        };
+
+        /// <summary>
         /// Socket Data
         /// </summary>
         struct SocketData
@@ -752,9 +919,9 @@ namespace net
             Socket socket;
             int flags;
 
-            SocketData() : socket(), flags(0) {}
+            SocketData() noexcept : socket(), flags(0) {}
 
-            bool operator==(Socket s) { return (socket == s); }
+            bool operator==(Socket s) const noexcept { return (socket == s); }
         };
 
         /// <summary>
@@ -805,8 +972,8 @@ namespace net
 
 #ifdef TARGET_OS_MAC
             /* use kqueue on Mac */
-#  define KQUEUE_SIZE 32
             int kq{ 0 };
+            static constexpr int KQUEUE_SIZE = config::KQUEUE_DEFAULT_SIZE;
             struct kevent m_events[KQUEUE_SIZE];
 #endif
 
@@ -1107,7 +1274,7 @@ namespace net
                     //
 #ifdef _WIN32
                     DWORD dwResult = ::WSAWaitForMultipleEvents(static_cast<DWORD>(m_events.size()),
-                        m_events.data(), FALSE, 500, FALSE);
+                        m_events.data(), FALSE, config::REACTOR_POLL_TIMEOUT_MS, FALSE);
                     if (dwResult == WSA_WAIT_TIMEOUT)
                     {
                         continue;
@@ -1154,7 +1321,7 @@ namespace net
 #ifdef __linux__
                     {
                         epoll_event events[4];
-                        int result = ::epoll_wait(m_epollFd, events, sizeof(events) / sizeof(events[0]), 500);
+                        int result = ::epoll_wait(m_epollFd, events, sizeof(events) / sizeof(events[0]), config::REACTOR_POLL_TIMEOUT_MS);
                         if (result == 0)
                             continue;
                         if (result < 0)
@@ -1199,7 +1366,7 @@ namespace net
 #if defined(TARGET_OS_MAC)
                     {
                         LOCKGUARD(m_sockets_mutex);
-                        unsigned waitms = 500;  // never block for more than 500ms
+                        constexpr unsigned waitms = config::REACTOR_POLL_TIMEOUT_MS;
                         struct timespec timeout;
                         timeout.tv_sec = waitms / 1000;
                         timeout.tv_nsec = (waitms % 1000) * 1000 * 1000;

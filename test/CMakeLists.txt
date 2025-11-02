@@ -17,6 +17,7 @@ endif()
 # Unit tests - test individual components in isolation
 set(UNIT_TESTS
   url_parser_test
+  url_security_test
   socket_addr_test
   socket_basic_test
   base64_test

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(xargs ls:*)",
+      "Bash(build-all.cmd)",
+      "Bash(cmd /c build-all.cmd)",
+      "Bash(powershell.exe -ExecutionPolicy Bypass -File \"scripts/Build-Windows.ps1\" -Configuration Debug)",
+      "Bash(ctest:*)",
+      "Bash(cmake --build:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

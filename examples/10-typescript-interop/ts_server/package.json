@@ -1,0 +1,9 @@
+{
+  "name": "interop-ts-server",
+  "type": "module",
+  "main": "server.ts",
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "dotenv": "^16.3.1"
+  }
+}

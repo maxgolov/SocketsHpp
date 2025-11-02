@@ -11,6 +11,8 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
+#include <unordered_map>
 #include <BS_thread_pool.hpp>
 
 SOCKETSHPP_NS_BEGIN
@@ -46,14 +48,15 @@ namespace http
             {
                 std::chrono::steady_clock::time_point lastAccess;
                 std::vector<std::pair<std::string, std::string>> eventHistory; // <eventId, eventData>
-                size_t maxHistorySize = 1000;
+                size_t maxHistorySize = config::DEFAULT_MAX_HISTORY_SIZE;
             };
-            
+
             std::map<std::string, SessionData> m_sessions;
             std::mutex m_mutex;
-            std::chrono::seconds m_sessionTimeout{3600}; // 1 hour default
-            std::chrono::milliseconds m_historyDuration{300000}; // 5 minutes default
-            size_t m_maxHistorySize = 1000;
+            std::chrono::seconds m_sessionTimeout{config::DEFAULT_SESSION_TIMEOUT_SECONDS};
+            std::chrono::milliseconds m_historyDuration{config::DEFAULT_HISTORY_DURATION_MS};
+            size_t m_maxHistorySize = config::DEFAULT_MAX_HISTORY_SIZE;
+            size_t m_maxSessions = config::DEFAULT_MAX_SESSIONS;
             bool m_resumabilityEnabled = false;
             
         public:
@@ -67,16 +70,36 @@ namespace http
             std::string createSession()
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                
-                // Generate session ID (simple implementation - production should use crypto-random)
+
+                // Enforce session limit
+                if (m_sessions.size() >= m_maxSessions)
+                {
+                    // Clean up expired sessions first
+                    cleanupExpiredSessionsLocked();
+
+                    // If still at limit after cleanup, reject new session
+                    if (m_sessions.size() >= m_maxSessions)
+                    {
+                        throw std::runtime_error("Maximum session limit reached (" +
+                            std::to_string(m_maxSessions) + ")");
+                    }
+                }
+
+                // Generate cryptographically secure session ID
                 auto now = std::chrono::steady_clock::now();
                 auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now.time_since_epoch()).count();
-                
+
+                // Use random_device for cryptographic randomness
+                std::random_device rd;
+                std::mt19937_64 gen(rd());
+                std::uniform_int_distribution<uint64_t> dis;
+
                 std::ostringstream ss;
-                ss << "session-" << timestamp << "-" << (rand() % 100000);
+                ss << "session-" << std::hex << timestamp << "-"
+                   << dis(gen) << "-" << dis(gen);
                 std::string sessionId = ss.str();
-                
+
                 SessionData data;
                 data.lastAccess = now;
                 data.maxHistorySize = m_maxHistorySize;
@@ -197,8 +220,29 @@ namespace http
             void cleanupExpiredSessions()
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                cleanupExpiredSessionsLocked();
+            }
+
+            /// @brief Set maximum number of sessions allowed
+            void setMaxSessions(size_t maxSessions)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_maxSessions = maxSessions;
+            }
+
+            /// @brief Get current session count
+            size_t getSessionCount() const
+            {
+                std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_mutex));
+                return m_sessions.size();
+            }
+
+        private:
+            /// @brief Internal cleanup without acquiring lock (must be called with lock held)
+            void cleanupExpiredSessionsLocked()
+            {
                 auto now = std::chrono::steady_clock::now();
-                
+
                 for (auto it = m_sessions.begin(); it != m_sessions.end();)
                 {
                     if (now - it->second.lastAccess > m_sessionTimeout)
@@ -283,6 +327,73 @@ namespace http
             }
         };
 
+        /// @brief Securely decode URL-encoded string
+        /// @param encoded URL-encoded string
+        /// @param maxLength Maximum allowed length after decoding
+        /// @return Decoded string
+        /// @throws std::invalid_argument on invalid encoding or length exceeded
+        inline std::string urlDecode(const std::string& encoded, size_t maxLength = config::MAX_QUERY_VALUE_LENGTH)
+        {
+            std::string decoded;
+            decoded.reserve(encoded.length());
+
+            for (size_t i = 0; i < encoded.length(); ++i)
+            {
+                if (decoded.length() >= maxLength)
+                {
+                    throw std::invalid_argument("URL-decoded value exceeds maximum length");
+                }
+
+                if (encoded[i] == '%')
+                {
+                    // Need at least 2 more characters
+                    if (i + 2 >= encoded.length())
+                    {
+                        throw std::invalid_argument("Invalid URL encoding: incomplete % sequence");
+                    }
+
+                    // Validate hex characters
+                    char hex1 = encoded[i + 1];
+                    char hex2 = encoded[i + 2];
+
+                    if (!std::isxdigit(static_cast<unsigned char>(hex1)) ||
+                        !std::isxdigit(static_cast<unsigned char>(hex2)))
+                    {
+                        throw std::invalid_argument("Invalid URL encoding: non-hex characters after %");
+                    }
+
+                    // Decode hex
+                    char hex[3] = {hex1, hex2, 0};
+                    unsigned long val = std::strtoul(hex, nullptr, 16);
+
+                    // Reject null bytes (security risk)
+                    if (val == 0)
+                    {
+                        throw std::invalid_argument("Invalid URL encoding: null byte (%00) not allowed");
+                    }
+
+                    // Reject control characters (0x01-0x1F, 0x7F-0x9F)
+                    if (val < 0x20 || (val >= 0x7F && val <= 0x9F))
+                    {
+                        throw std::invalid_argument("Invalid URL encoding: control character not allowed");
+                    }
+
+                    decoded += static_cast<char>(val);
+                    i += 2;
+                }
+                else if (encoded[i] == '+')
+                {
+                    decoded += ' ';
+                }
+                else
+                {
+                    decoded += encoded[i];
+                }
+            }
+
+            return decoded;
+        }
+
         struct HttpRequest
         {
             std::string client;
@@ -292,74 +403,100 @@ namespace http
             std::map<std::string, std::string> headers;
             std::string content;
             
-            /// @brief Parse query parameters from URI
+            /// @brief Parse query parameters from URI with security validation
             /// @return Map of query parameter key-value pairs
-            /// @note Performs URL decoding of values
+            /// @throws std::invalid_argument on invalid encoding or exceeded limits
+            /// @note Performs URL decoding and validates all inputs
             std::map<std::string, std::string> parse_query() const
             {
                 std::map<std::string, std::string> params;
-                
+
                 // Find query string start
                 size_t qpos = uri.find('?');
                 if (qpos == std::string::npos)
                 {
                     return params;
                 }
-                
+
+                // Strip fragment if present (# should not be sent by client, but handle it)
                 std::string query = uri.substr(qpos + 1);
+                size_t fragment = query.find('#');
+                if (fragment != std::string::npos)
+                {
+                    query = query.substr(0, fragment);
+                }
+
                 size_t start = 0;
-                
+                size_t paramCount = 0;
+
                 while (start < query.length())
                 {
-                    // Find key=value pair
+                    // Enforce parameter count limit
+                    if (paramCount >= config::MAX_QUERY_PARAMS)
+                    {
+                        throw std::invalid_argument("Too many query parameters (max: " +
+                            std::to_string(config::MAX_QUERY_PARAMS) + ")");
+                    }
+
+                    // Find next key=value pair
                     size_t eq = query.find('=', start);
                     if (eq == std::string::npos)
                     {
+                        // No more '=' found, could be trailing param without value
                         break;
                     }
-                    
+
                     size_t amp = query.find('&', eq);
                     size_t end = (amp == std::string::npos) ? query.length() : amp;
-                    
+
+                    // Extract and validate key
                     std::string key = query.substr(start, eq - start);
-                    std::string value = query.substr(eq + 1, end - eq - 1);
-                    
-                    // URL decode the value
-                    std::string decoded;
-                    decoded.reserve(value.length());
-                    
-                    for (size_t i = 0; i < value.length(); ++i)
+
+                    if (key.empty())
                     {
-                        if (value[i] == '%' && i + 2 < value.length())
+                        throw std::invalid_argument("Empty query parameter key");
+                    }
+
+                    if (key.length() > config::MAX_QUERY_KEY_LENGTH)
+                    {
+                        throw std::invalid_argument("Query parameter key too long (max: " +
+                            std::to_string(config::MAX_QUERY_KEY_LENGTH) + ")");
+                    }
+
+                    // Validate key contains only allowed characters (alphanumeric, _, -, .)
+                    for (char c : key)
+                    {
+                        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-' && c != '.')
                         {
-                            // Decode %XX
-                            char hex[3] = {value[i + 1], value[i + 2], 0};
-                            char* end_ptr;
-                            long ch = strtol(hex, &end_ptr, 16);
-                            if (end_ptr == hex + 2)
-                            {
-                                decoded += static_cast<char>(ch);
-                                i += 2;
-                            }
-                            else
-                            {
-                                decoded += value[i];
-                            }
-                        }
-                        else if (value[i] == '+')
-                        {
-                            decoded += ' ';
-                        }
-                        else
-                        {
-                            decoded += value[i];
+                            throw std::invalid_argument("Invalid character in query parameter key: '" +
+                                std::string(1, c) + "'");
                         }
                     }
-                    
+
+                    // Extract value
+                    std::string value = query.substr(eq + 1, end - eq - 1);
+
+                    if (value.length() > config::MAX_QUERY_VALUE_LENGTH)
+                    {
+                        throw std::invalid_argument("Query parameter value too long (max: " +
+                            std::to_string(config::MAX_QUERY_VALUE_LENGTH) + ")");
+                    }
+
+                    // URL decode the value (validates encoding)
+                    std::string decoded = urlDecode(value, config::MAX_QUERY_VALUE_LENGTH);
+
+                    // Check for duplicate keys
+                    if (params.find(key) != params.end())
+                    {
+                        LOG_WARN("Duplicate query parameter '%s' - overwriting previous value", key.c_str());
+                    }
+
                     params[key] = decoded;
+                    paramCount++;
+
                     start = (amp == std::string::npos) ? query.length() : amp + 1;
                 }
-                
+
                 return params;
             }
             
@@ -582,7 +719,8 @@ namespace http
             std::mutex m_connectionsMutex;  // Protects m_connections
             std::optional<BS::thread_pool<>> m_threadPool;  // Optional thread pool for async request processing
             size_t m_maxRequestHeadersSize, m_maxRequestContentSize;
-            
+            size_t m_maxSessions;  // Maximum allowed sessions
+
             SessionManager m_sessionManager;
             CorsConfig m_corsConfig;
 
@@ -593,8 +731,9 @@ namespace http
                 : m_serverHost("unnamed"),
                 allowKeepalive(true),
                 m_reactor(*this),
-                m_maxRequestHeadersSize(8192),
-                m_maxRequestContentSize(2 * 1024 * 1024) {};
+                m_maxRequestHeadersSize(config::MAX_HTTP_HEADER_SIZE),
+                m_maxRequestContentSize(config::MAX_HTTP_BODY_SIZE),
+                m_maxSessions(config::DEFAULT_MAX_SESSIONS) {};
 
             HttpServer(std::string serverHost, int port = 30000) : HttpServer()
             {
@@ -685,10 +824,25 @@ namespace http
                 socket.setReuseAddr();
 
                 SocketAddr addr(static_cast<u_long>(0), port);
-                socket.bind(addr);
-                socket.getsockname(addr);
+                if (socket.bind(addr) != 0)
+                {
+                    int err = socket.error();
+                    throw std::runtime_error("Failed to bind to port " + std::to_string(port) +
+                        ", error: " + std::to_string(err));
+                }
 
-                socket.listen(10);
+                if (!socket.getsockname(addr))
+                {
+                    throw std::runtime_error("Failed to get socket name after bind");
+                }
+
+                if (!socket.listen(config::SOCKET_LISTEN_BACKLOG))
+                {
+                    int err = socket.error();
+                    throw std::runtime_error("Failed to listen on port " + std::to_string(port) +
+                        ", error: " + std::to_string(err));
+                }
+
                 m_listeningSockets.push_back(socket);
                 m_reactor.addSocket(socket, Reactor::Acceptable);
                 LOG_INFO("HttpServer: Listening on %s", addr.toString().c_str());
@@ -761,7 +915,7 @@ namespace http
                 }
                 Connection& conn = connIt->second;
 
-                char buffer[2048] = { 0 };
+                char buffer[config::HTTP_RECV_BUFFER_SIZE] = { 0 };
                 int received = socket.recv(buffer, sizeof(buffer));
                 LOG_TRACE("HttpServer: [%s] received %d", conn.request.client.c_str(), received);
                 if (received <= 0)
@@ -1209,7 +1363,36 @@ namespace http
                 {
                     return false;
                 }
+
+                // Validate method length
+                size_t methodLen = ptr - begin;
+                if (methodLen == 0 || methodLen > config::MAX_METHOD_LENGTH)
+                {
+                    LOG_WARN("HTTP method length invalid: %zu", methodLen);
+                    return false;
+                }
+
                 conn.request.method.assign(begin, ptr);
+
+                // Validate method is in whitelist
+                static const char* allowedMethods[] = {
+                    "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT"
+                };
+                bool validMethod = false;
+                for (const char* allowed : allowedMethods)
+                {
+                    if (conn.request.method == allowed)
+                    {
+                        validMethod = true;
+                        break;
+                    }
+                }
+                if (!validMethod)
+                {
+                    LOG_WARN("Invalid HTTP method: %s", conn.request.method.c_str());
+                    return false;
+                }
+
                 while (*ptr == ' ')
                 {
                     ptr++;
@@ -1225,7 +1408,27 @@ namespace http
                 {
                     return false;
                 }
+
+                // Validate URI length
+                size_t uriLen = ptr - begin;
+                if (uriLen == 0 || uriLen > config::MAX_URI_LENGTH)
+                {
+                    LOG_WARN("HTTP URI length invalid: %zu (max: %zu)", uriLen, config::MAX_URI_LENGTH);
+                    return false;
+                }
+
                 conn.request.uri.assign(begin, ptr);
+
+                // Validate URI doesn't contain control characters
+                for (char c : conn.request.uri)
+                {
+                    if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F)
+                    {
+                        LOG_WARN("HTTP URI contains control character: 0x%02X", static_cast<unsigned char>(c));
+                        return false;
+                    }
+                }
+
                 while (*ptr == ' ')
                 {
                     ptr++;
@@ -1241,7 +1444,24 @@ namespace http
                 {
                     return false;
                 }
+
+                // Validate protocol length
+                size_t protoLen = ptr - begin;
+                if (protoLen == 0 || protoLen > config::MAX_PROTOCOL_LENGTH)
+                {
+                    LOG_WARN("HTTP protocol length invalid: %zu", protoLen);
+                    return false;
+                }
+
                 conn.request.protocol.assign(begin, ptr);
+
+                // Validate protocol format (HTTP/x.y)
+                if (conn.request.protocol.substr(0, 5) != "HTTP/" ||
+                    conn.request.protocol.length() < 8)
+                {
+                    LOG_WARN("Invalid HTTP protocol: %s", conn.request.protocol.c_str());
+                    return false;
+                }
                 if (*ptr == '\r')
                 {
                     ptr++;
@@ -1266,6 +1486,15 @@ namespace http
                     {
                         return false;
                     }
+
+                    // Validate header name length
+                    size_t nameLen = ptr - begin;
+                    if (nameLen == 0 || nameLen > config::MAX_HEADER_NAME_LENGTH)
+                    {
+                        LOG_WARN("HTTP header name length invalid: %zu", nameLen);
+                        return false;
+                    }
+
                     std::string name = normalizeHeaderName(begin, ptr);
                     ptr++;
                     while (*ptr == ' ')
@@ -1279,6 +1508,31 @@ namespace http
                     {
                         ptr++;
                     }
+
+                    // Validate header value length
+                    size_t valueLen = ptr - begin;
+                    if (valueLen > config::MAX_HEADER_VALUE_LENGTH)
+                    {
+                        LOG_WARN("HTTP header value length invalid: %zu", valueLen);
+                        return false;
+                    }
+
+                    // Validate header value doesn't contain control characters (except tab)
+                    for (const char* p = begin; p < ptr; ++p)
+                    {
+                        unsigned char c = static_cast<unsigned char>(*p);
+                        if (c < 0x20 && c != '\t')  // Allow tab (0x09) but not other control chars
+                        {
+                            LOG_WARN("HTTP header value contains control character: 0x%02X", c);
+                            return false;
+                        }
+                        if (c == 0x7F)  // DEL character
+                        {
+                            LOG_WARN("HTTP header value contains DEL character");
+                            return false;
+                        }
+                    }
+
                     conn.request.headers[name] = std::string(begin, ptr);
                     if (*ptr == '\r')
                     {

@@ -1,11 +1,38 @@
 ﻿cmake_minimum_required (VERSION 3.8.0)
 
-project ("SocketsHpp")
+project ("SocketsHpp" VERSION 1.0.0)
 
 # Set C++17 standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Enable strict compiler warnings
+if(MSVC)
+    add_compile_options(/W4)
+    # Disable specific warnings that are too noisy for this codebase
+    add_compile_options(/wd4267)  # conversion from size_t to int (WinSock vs POSIX)
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic)
+    # Disable specific warnings
+    add_compile_options(-Wno-unused-parameter)
+endif()
+
+# Optional: Enable sanitizers for debug builds
+option(ENABLE_ASAN "Enable Address Sanitizer" OFF)
+option(ENABLE_UBSAN "Enable Undefined Behavior Sanitizer" OFF)
+
+if(ENABLE_ASAN AND NOT MSVC)
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+    message(STATUS "Address Sanitizer enabled")
+endif()
+
+if(ENABLE_UBSAN AND NOT MSVC)
+    add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=undefined)
+    message(STATUS "Undefined Behavior Sanitizer enabled")
+endif()
 
 # Import to detect the platform target architecture
 include(cmake/target-arch.cmake)
