@@ -10,6 +10,10 @@ echo ""
 
 cd "$(dirname "$0")/.."
 
+# Initialize git submodules (simple-uri-parser, nlohmann-json)
+echo "Initializing git submodules..."
+git submodule update --init --recursive
+
 # Install ARM64 cross-compilation tools if needed
 if ! dpkg -l | grep -q gcc-aarch64-linux-gnu; then
     echo "Installing ARM64 cross-compilation toolchain..."

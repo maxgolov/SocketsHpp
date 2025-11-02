@@ -66,8 +66,9 @@ PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 cd "$PROJECT_ROOT"
 
-# Install dependencies if needed
-echo -e "${CYAN}Checking dependencies...${NC}"
+# Initialize git submodules (simple-uri-parser, nlohmann-json)
+echo -e "${CYAN}Initializing git submodules...${NC}"
+git submodule update --init --recursive
 
 # Check for CMake
 if ! command -v cmake &> /dev/null; then
@@ -88,26 +89,8 @@ fi
 # Check for g++ or clang++
 if ! command -v g++ &> /dev/null && ! command -v clang++ &> /dev/null; then
     echo -e "${YELLOW}C++ compiler not found. Installing g++...${NC}"
+    sudo apt-get update
     sudo apt-get install -y build-essential
-fi
-
-# Check for vcpkg or install Google Test via apt
-if [ ! -d "$HOME/vcpkg" ]; then
-    echo -e "${YELLOW}vcpkg not found. Installing Google Test via apt...${NC}"
-    sudo apt-get update 2>/dev/null || true  # Ignore apt update errors
-    sudo apt-get install -y libgtest-dev 2>/dev/null || true
-    
-    # Build and install gtest if needed
-    if [ ! -f /usr/lib/libgtest.a ] && [ ! -f /usr/lib/x86_64-linux-gnu/libgtest.a ]; then
-        if [ -d /usr/src/gtest ]; then
-            echo -e "${YELLOW}Building Google Test...${NC}"
-            cd /usr/src/gtest
-            sudo cmake CMakeLists.txt
-            sudo make
-            sudo cp lib/*.a /usr/lib/ 2>/dev/null || sudo cp *.a /usr/lib/
-            cd "$PROJECT_ROOT"
-        fi
-    fi
 fi
 
 # Clean build directory if requested
