@@ -16,6 +16,7 @@ include(cmake/detect-vcpkg.cmake)
 include(CTest)
 
 include_directories(include)
+include_directories(external/simple-uri-parser)
 
 find_package(GTest)
 if (GTest_FOUND)

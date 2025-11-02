@@ -10,7 +10,8 @@
       "platform": "!arm64"
     },
     "nlohmann-json",
-    "cpp-jwt"
+    "cpp-jwt",
+    "bshoshany-thread-pool"
   ],
   "features": {
     "mcp": {

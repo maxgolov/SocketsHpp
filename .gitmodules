@@ -1,0 +1,3 @@
+[submodule "external/simple-uri-parser"]
+	path = external/simple-uri-parser
+	url = https://github.com/jholloc/simple-uri-parser.git
