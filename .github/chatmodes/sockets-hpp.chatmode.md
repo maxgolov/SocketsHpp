@@ -1,6 +1,6 @@
 ---
 description: 'SocketsHpp - Cross-platform C++17 header-only networking library with HTTP/1.1 and MCP protocol support'
-tools: ['edit', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'github/github-mcp-server/*', 'perplexity/*', 'Microsoft Docs/*', 'usages', 'vscodeAPI', 'problems', 'changes', 'testFailure', 'openSimpleBrowser', 'fetch', 'githubRepo', 'extensions', 'todos']
+tools: ['edit', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'Microsoft Docs/*', 'Azure MCP/search', 'perplexity/*', 'azure/azure-mcp/search', 'github/*', 'usages', 'vscodeAPI', 'problems', 'changes', 'testFailure', 'openSimpleBrowser', 'fetch', 'githubRepo', 'github.vscode-pull-request-github/copilotCodingAgent', 'github.vscode-pull-request-github/activePullRequest', 'github.vscode-pull-request-github/openPullRequest', 'extensions', 'todos']
 ---
 
 # SocketsHpp Development Chat Mode

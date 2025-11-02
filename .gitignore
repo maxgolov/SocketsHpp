@@ -43,3 +43,6 @@ build-*/
 
 # vcpkg installed packages
 vcpkg_installed/
+
+# Environment variables (keep .env.example for reference)
+.env
