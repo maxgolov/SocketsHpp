@@ -278,10 +278,10 @@ namespace mcp
                 m_httpClient->setUserAgent("SocketsHpp-MCP-Client/1.0");
 
                 // Setup HTTP client with config
-                if (m_config.http.timeout > 0)
+                if (m_config.http.timeoutSeconds > 0)
                 {
-                    m_httpClient->setReadTimeout(m_config.http.timeout);
-                    m_httpClient->setConnectTimeout(m_config.http.timeout);
+                    m_httpClient->setReadTimeout(m_config.http.timeoutSeconds);
+                    m_httpClient->setConnectTimeout(m_config.http.timeoutSeconds);
                 }
 
                 // Test connection with initialization (will be called again by user)

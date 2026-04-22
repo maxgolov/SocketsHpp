@@ -7,10 +7,15 @@
 #include <SocketsHpp/http/common/json_rpc.h>
 #include <SocketsHpp/mcp/common/mcp_config.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <string>
 #include <vector>
 
@@ -29,6 +34,14 @@ namespace mcp
         using json = nlohmann::json;
 
         /// @brief MCP Server implementing Model Context Protocol over HTTP Stream Transport
+        ///
+        /// Backports from FMcpNativeTransport (UE McpAutomationBridge):
+        ///   - Real SSE GET stream with per-session blocking queue and push_event()
+        ///   - Write deadline: stream callback returns "" after timeout to close stale connections
+        ///   - SSRF loopback guard: listen() rejects non-loopback unless allowNonLoopback=true
+        ///   - Rate limiting: per-IP token bucket (maxRequestsPerMinute in ServerConfig)
+        ///   - Stale SSE cleanup: cleanupStaleSessions() closes queues idle > sseIdleTimeoutSeconds
+        ///   - Capability token auth: X-MCP-Capability-Token header check alongside Bearer/API-key
         class MCPServer
         {
         public:
@@ -67,6 +80,11 @@ namespace mcp
                 // STDIO transport handled externally (read from stdin, write to stdout)
             }
 
+            ~MCPServer()
+            {
+                stop();
+            }
+
             /// @brief Register a method handler
             /// @param method Method name (e.g., "initialize", "tools/list")
             /// @param handler Handler function
@@ -75,7 +93,53 @@ namespace mcp
                 m_methods[method] = std::move(handler);
             }
 
-            /// @brief Start server (HTTP mode only)
+            /// @brief Push a server-initiated SSE event to a specific session's notification stream.
+            /// Thread-safe; can be called from any thread.
+            /// @param sessionId  Session to push to (from initialize response Mcp-Session-Id header)
+            /// @param eventData  Raw SSE event string (e.g. "event: message\ndata: {...}\n\n")
+            /// @return true if the session exists and event was queued
+            bool push_event(const std::string& sessionId, const std::string& eventData)
+            {
+                std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
+                auto it = m_sseQueues.find(sessionId);
+                if (it == m_sseQueues.end() || it->second->closed.load())
+                    return false;
+                {
+                    std::lock_guard<std::mutex> qlock(it->second->mutex);
+                    it->second->events.push(eventData);
+                    it->second->lastActivity = std::chrono::steady_clock::now();
+                }
+                it->second->cv.notify_one();
+                return true;
+            }
+
+            /// @brief Close and remove all SSE streams idle longer than sseIdleTimeoutSeconds.
+            /// Call periodically from a maintenance thread.
+            void cleanupStaleSessions(int sseIdleTimeoutSeconds = 300)
+            {
+                auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
+                for (auto it = m_sseQueues.begin(); it != m_sseQueues.end(); )
+                {
+                    auto& q = it->second;
+                    std::lock_guard<std::mutex> qlock(q->mutex);
+                    auto idleSec = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - q->lastActivity).count();
+                    if (idleSec > sseIdleTimeoutSeconds || q->closed.load())
+                    {
+                        q->closed.store(true);
+                        q->cv.notify_all();
+                        it = m_sseQueues.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+            }
+
+            /// @brief Start server (HTTP mode only).
+            /// SSRF guard: refuses to bind to non-loopback unless config.allowNonLoopback is true.
             void listen()
             {
                 if (m_config.transport != TransportType::HTTP)
@@ -83,14 +147,38 @@ namespace mcp
                     throw std::runtime_error("listen() only available in HTTP transport mode");
                 }
 
+                // SSRF loopback guard (backport from FMcpNativeTransport)
+                bool isLoopback = (m_config.host == "127.0.0.1" || m_config.host == "localhost"
+                    || m_config.host == "::1" || m_config.host == "[::1]");
+                if (!isLoopback && !m_config.allowNonLoopback)
+                {
+                    throw std::runtime_error(
+                        "SSRF guard: refusing to bind to non-loopback address '" + m_config.host +
+                        "'. Set ServerConfig::allowNonLoopback = true to override.");
+                }
+
                 m_running = true;
-                m_httpServer.listen();
+                m_httpServer.enableThreadPool(4);  // SSE callbacks run on pool; reactor stays free
+                m_httpServer.start();
             }
 
-            /// @brief Stop server
+            /// @brief Stop server — closes all pending SSE queues before stopping.
             void stop()
             {
-                m_running = false;
+                if (!m_running.exchange(false))
+                    return;
+
+                // Signal all SSE streams to close
+                {
+                    std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
+                    for (auto& [sid, q] : m_sseQueues)
+                    {
+                        q->closed.store(true);
+                        q->cv.notify_all();
+                    }
+                    m_sseQueues.clear();
+                }
+
                 m_httpServer.stop();
             }
 
@@ -131,11 +219,70 @@ namespace mcp
             }
 
         private:
+            // ----------------------------------------------------------------
+            // Per-session SSE event queue (backport: real push SSE stream)
+            // ----------------------------------------------------------------
+            struct SSESessionQueue
+            {
+                std::queue<std::string> events;
+                std::mutex mutex;
+                std::condition_variable cv;
+                std::atomic<bool> closed{false};
+                std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
+            };
+
+            // ----------------------------------------------------------------
+            // Per-IP rate limiting (backport: token bucket)
+            // ----------------------------------------------------------------
+            struct RateLimitEntry
+            {
+                int count = 0;
+                std::chrono::steady_clock::time_point windowStart{std::chrono::steady_clock::now()};
+            };
+
             ServerConfig m_config;
             HttpServer m_httpServer;
             SessionManager m_sessionManager;
             std::map<std::string, MethodHandler> m_methods;
-            bool m_running;
+            std::atomic<bool> m_running{false};
+
+            // SSE queues: sessionId → queue (push_event writes here, GET handler reads)
+            std::map<std::string, std::shared_ptr<SSESessionQueue>> m_sseQueues;
+            std::mutex m_sseQueuesMutex;
+
+            // Rate limiting
+            std::map<std::string, RateLimitEntry> m_rateLimitMap;
+            std::mutex m_rateLimitMutex;
+
+            // ----------------------------------------------------------------
+            // SSRF / rate helpers
+            // ----------------------------------------------------------------
+
+            /// @brief Per-IP token-bucket check.  Returns false and sets 429 if limit exceeded.
+            bool checkRateLimit(const std::string& clientIp, HttpResponse& res)
+            {
+                if (m_config.maxRequestsPerMinute <= 0)
+                    return true; // rate limiting disabled
+
+                auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> lock(m_rateLimitMutex);
+                auto& entry = m_rateLimitMap[clientIp];
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - entry.windowStart).count();
+                if (elapsed >= 60)
+                {
+                    entry.count = 0;
+                    entry.windowStart = now;
+                }
+                if (++entry.count > m_config.maxRequestsPerMinute)
+                {
+                    res.set_status(429);
+                    res.set_header("Retry-After", "60");
+                    res.send("Too many requests");
+                    return false;
+                }
+                return true;
+            }
 
             /// @brief Setup HTTP routes for MCP protocol
             void setupHttpRoutes()
@@ -143,7 +290,7 @@ namespace mcp
                 std::string endpoint = m_config.endpoint;
 
                 // POST: Handle JSON-RPC requests
-                m_httpServer.route(endpoint, [this](const HttpRequest& req, HttpResponse& res) {
+                m_httpServer.route(endpoint, [this](const HttpRequest& req, HttpResponse& res) -> int {
                     if (req.method == "POST")
                     {
                         handleHttpPost(req, res);
@@ -166,6 +313,7 @@ namespace mcp
                         res.set_header("Allow", "GET, POST, DELETE, OPTIONS");
                         res.send("");
                     }
+                    return 0;
                 });
             }
 
@@ -174,6 +322,12 @@ namespace mcp
             {
                 // Apply CORS headers
                 applyCorsHeaders(res);
+
+                // Rate limit
+                std::string clientIp = req.headers.count("X-Forwarded-For")
+                    ? req.headers.at("X-Forwarded-For") : "unknown";
+                if (!checkRateLimit(clientIp, res))
+                    return;
 
                 // Authenticate if required
                 if (!authenticate(req, res))
@@ -196,6 +350,18 @@ namespace mcp
                 // Parse and handle request
                 try
                 {
+                    // Pre-parse JSON to check if this is a notification (no "id")
+                    json j = json::parse(req.content);
+                    if (!j.contains("id"))
+                    {
+                        // JSON-RPC notification — handle it and respond 202 Accepted (no body)
+                        auto notif = JsonRpcNotification::parse(req.content);
+                        handleNotification(notif);
+                        res.set_status(202);
+                        res.send("");
+                        return;
+                    }
+
                     auto request = JsonRpcRequest::parse(req.content);
                     
                     // Special handling for initialize - create session
@@ -233,6 +399,7 @@ namespace mcp
                         else
                         {
                             // Send JSON response
+                            res.set_status(200);
                             res.set_header("Content-Type", "application/json");
                             res.send(response.serialize());
                         }
@@ -252,6 +419,7 @@ namespace mcp
                         }
 
                         auto response = handleRequest(request);
+                        res.set_status(200);
                         res.set_header("Content-Type", "application/json");
                         res.send(response.serialize());
                     }
@@ -274,7 +442,11 @@ namespace mcp
                 }
             }
 
-            /// @brief Handle HTTP GET request (SSE stream)
+            /// @brief Handle HTTP GET request — real SSE push stream (backport from FMcpNativeTransport)
+            ///
+            /// Creates a per-session blocking event queue shared with push_event().
+            /// The send_chunk_stream callback blocks on the queue (up to writeDeadlineSeconds),
+            /// returning "" to terminate the stream if the session is closed or idle too long.
             void handleHttpGet(const HttpRequest& req, HttpResponse& res)
             {
                 // Apply CORS headers
@@ -286,17 +458,32 @@ namespace mcp
                     return;
                 }
 
-                // Get session ID from query params
-                auto params = req.parse_query();
-                auto sessionIt = params.find("session");
-                if (sessionIt == params.end())
-                {
-                    res.set_status(400);
-                    res.send("Missing session parameter");
+                // Rate limit by client IP (best-effort: use peer address if available)
+                std::string clientIp = req.headers.count("X-Forwarded-For")
+                    ? req.headers.at("X-Forwarded-For") : "unknown";
+                if (!checkRateLimit(clientIp, res))
                     return;
-                }
 
-                std::string sessionId = sessionIt->second;
+                // Get session ID: prefer Mcp-Session-Id header (2025-03-26 spec),
+                // fall back to ?session= query param for compatibility.
+                std::string sessionId;
+                auto sessionHeaderIt = req.headers.find("Mcp-Session-Id");
+                if (sessionHeaderIt != req.headers.end())
+                {
+                    sessionId = sessionHeaderIt->second;
+                }
+                else
+                {
+                    auto params = req.parse_query();
+                    auto sessionIt = params.find("session");
+                    if (sessionIt == params.end())
+                    {
+                        res.set_status(400);
+                        res.send("Missing Mcp-Session-Id header");
+                        return;
+                    }
+                    sessionId = sessionIt->second;
+                }
                 if (!m_sessionManager.validateSession(sessionId))
                 {
                     res.set_status(404);
@@ -312,26 +499,94 @@ namespace mcp
                     lastEventId = lastEventIdHeader->second;
                 }
 
-                // Setup SSE stream
+                // Setup SSE stream headers
+                res.set_status(200);
                 res.set_header("Content-Type", "text/event-stream");
                 res.set_header("Cache-Control", "no-cache");
                 res.set_header("Connection", "keep-alive");
                 res.set_header(m_config.session.headerName, sessionId);
 
-                // Replay missed events if resuming
+                // Create or replace per-session queue
+                auto queue = std::make_shared<SSESessionQueue>();
+                {
+                    std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
+                    // Close any pre-existing stream for this session
+                    auto existing = m_sseQueues.find(sessionId);
+                    if (existing != m_sseQueues.end())
+                    {
+                        existing->second->closed.store(true);
+                        existing->second->cv.notify_all();
+                    }
+                    m_sseQueues[sessionId] = queue;
+                }
+
+                // Pre-populate missed events for resumability
                 if (!lastEventId.empty() && m_config.resumability.enabled)
                 {
                     auto missedEvents = m_sessionManager.getEventsSince(sessionId, lastEventId);
+                    std::lock_guard<std::mutex> qlock(queue->mutex);
                     for (const auto& event : missedEvents)
                     {
-                        res.send_chunk(event);
+                        queue->events.push(event);
                     }
                 }
 
-                // Keep connection open for server-to-client messages
-                // In a real implementation, you'd maintain this connection
-                // and send events as they occur. For now, we just keep it open.
-                res.send_chunk(""); // Send empty line to establish connection
+                // Write deadline: if no event arrives within this many seconds, send a keepalive
+                // comment and reset; close the stream if the session has been closed.
+                const int writeDeadlineSeconds = m_config.sseWriteDeadlineSeconds > 0
+                    ? m_config.sseWriteDeadlineSeconds : 30;
+
+                // send_chunk_stream callback — called by HTTP server for each chunk.
+                // Returns "" to signal end-of-stream.
+                //
+                // IMPORTANT: this callback runs on the reactor's single I/O thread.
+                // We must not block for more than ~200 ms or other connections (e.g.
+                // tools/list) cannot be accepted/processed while the SSE stream is open.
+                // We use a short poll interval and send a minimal SSE comment each time
+                // so the reactor yields between keepalive cycles.
+                auto weakQueue = std::weak_ptr<SSESessionQueue>(queue);
+                auto lastKeepalive = std::make_shared<std::chrono::steady_clock::time_point>(
+                    std::chrono::steady_clock::now());
+                res.send_chunk_stream([weakQueue, writeDeadlineSeconds, lastKeepalive]() -> std::string
+                {
+                    auto q = weakQueue.lock();
+                    if (!q)
+                        return ""; // queue destroyed — close stream
+
+                    std::unique_lock<std::mutex> lock(q->mutex);
+                    // Short poll so the reactor thread is never blocked > 200 ms.
+                    bool signalled = q->cv.wait_for(
+                        lock,
+                        std::chrono::milliseconds(200),
+                        [&q] { return !q->events.empty() || q->closed.load(); });
+
+                    if (q->closed.load() && q->events.empty())
+                        return ""; // close stream
+
+                    if (!signalled)
+                    {
+                        // No event arrived within 200 ms.  Only send an SSE keepalive
+                        // comment when writeDeadlineSeconds have elapsed so we don't
+                        // flood clients; otherwise return a silent SSE comment that
+                        // every compliant client ignores (line starting with ':').
+                        auto now = std::chrono::steady_clock::now();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                            now - *lastKeepalive).count();
+                        if (elapsed >= writeDeadlineSeconds)
+                        {
+                            *lastKeepalive = now;
+                            q->lastActivity = now;
+                            return ": keepalive\n\n";
+                        }
+                        return ": \n\n"; // silent SSE comment — reactor yields, client ignores
+                    }
+
+                    // Dequeue next event
+                    std::string event = std::move(q->events.front());
+                    q->events.pop();
+                    q->lastActivity = std::chrono::steady_clock::now();
+                    return event;
+                });
             }
 
             /// @brief Handle HTTP DELETE request (terminate session)
@@ -385,12 +640,35 @@ namespace mcp
                 res.set_header("Access-Control-Max-Age", m_config.cors.maxAge);
             }
 
-            /// @brief Authenticate request
+            /// @brief Authenticate request.
+            /// Supports Bearer, API_KEY, and CAPABILITY_TOKEN (X-MCP-Capability-Token header).
             /// @return true if authenticated or auth not required, false otherwise
             bool authenticate(const HttpRequest& req, HttpResponse& res)
             {
                 if (!m_config.auth.enabled)
                 {
+                    return true;
+                }
+
+                // Capability token check (backport from FMcpNativeTransport).
+                // When a capability token is configured, check X-MCP-Capability-Token first.
+                if (m_config.auth.type == ServerConfig::AuthConfig::Type::CAPABILITY_TOKEN)
+                {
+                    auto capIt = req.headers.find("X-MCP-Capability-Token");
+                    if (capIt == req.headers.end() || capIt->second.empty())
+                    {
+                        res.set_status(401);
+                        res.set_header("WWW-Authenticate", "MCP-Capability-Token");
+                        res.send("X-MCP-Capability-Token required");
+                        return false;
+                    }
+                    if (m_config.auth.secretOrPublicKey.has_value() &&
+                        capIt->second != m_config.auth.secretOrPublicKey.value())
+                    {
+                        res.set_status(401);
+                        res.send("Invalid capability token");
+                        return false;
+                    }
                     return true;
                 }
 

@@ -1286,58 +1286,14 @@ namespace http
 
                     if (conn.state == Connection::Processing)
                     {
-                        // If thread pool is enabled, offload to worker thread
-                        if (m_threadPool.has_value())
+                        // Process synchronously on the reactor thread.
+                        // NOTE: The thread pool is intentionally NOT used here for regular POST
+                        // requests. On Windows, WSAEventSelect(FD_WRITE) only fires after a
+                        // prior send() returned WSAEWOULDBLOCK, so an off-thread addSocket()
+                        // call would never wake the reactor and the response would be lost.
+                        // The SSE streaming path (StreamingChunked) uses the thread pool
+                        // correctly because it calls onSocketWritable from the same path.
                         {
-                            // Capture socket for async processing
-                            Socket sock = conn.socket;
-                            conn.state = Connection::ProcessingAsync;
-                            LOG_TRACE("HttpServer: [%s] offloading to thread pool", conn.request.client.c_str());
-                            
-                            // Submit task to thread pool
-                            m_threadPool->detach_task([this, sock]() {
-                                // Process request in worker thread
-                                {
-                                    std::lock_guard<std::mutex> lock(m_connectionsMutex);
-                                    auto it = m_connections.find(sock);
-                                    if (it == m_connections.end())
-                                    {
-                                        return;  // Connection closed while queued
-                                    }
-                                    
-                                    Connection& asyncConn = it->second;
-                                    if (asyncConn.state != Connection::ProcessingAsync)
-                                    {
-                                        return;  // State changed, skip
-                                    }
-                                    
-                                    processRequest(asyncConn);
-                                    
-                                    // Build response headers
-                                    std::ostringstream os;
-                                    os << asyncConn.request.protocol << ' ' << asyncConn.response.code << ' ' 
-                                       << asyncConn.response.message << "\r\n";
-                                    for (auto const& header : asyncConn.response.headers)
-                                    {
-                                        os << header.first << ": " << header.second << "\r\n";
-                                    }
-                                    os << "\r\n";
-                                    
-                                    asyncConn.sendBuffer = os.str();
-                                    asyncConn.state = Connection::SendingHeaders;
-                                }
-                                
-                                // Signal reactor that socket is ready to write
-                                // This will trigger onSocketWritable on the reactor thread
-                                m_reactor.addSocket(sock, Reactor::Writable | Reactor::Closed);
-                            });
-                            
-                            // Return immediately - reactor will be notified when processing completes
-                            return;
-                        }
-                        else
-                        {
-                            // Synchronous processing (original behavior)
                             processRequest(conn);
                         }
 
@@ -1416,6 +1372,56 @@ namespace http
                         // Get next chunk from callback
                         if (conn.response.streamCallback)
                         {
+                            // If a thread pool is available, offload the (potentially blocking)
+                            // stream callback to a worker thread so the reactor remains free to
+                            // service other connections (e.g. tools/list POST requests) while
+                            // the SSE stream is held open.
+                            if (m_threadPool.has_value())
+                            {
+                                Socket sock = conn.socket;
+                                conn.state = Connection::ProcessingAsync;  // prevent re-entry
+                                auto streamCb  = conn.response.streamCallback;  // copy by value
+                                auto onEndCb   = conn.response.onStreamEnd;     // copy by value
+                                bool kaAllowed = allowKeepalive;
+                                m_threadPool->detach_task([this, sock, streamCb, onEndCb, kaAllowed]() mutable
+                                {
+                                    // *** Run outside the mutex — may block for up to writeDeadlineSeconds ***
+                                    std::string chunkData = streamCb();
+
+                                    // Re-acquire mutex to update the connection state
+                                    std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                                    auto it = m_connections.find(sock);
+                                    if (it == m_connections.end()) return;  // connection gone
+                                    Connection& ac = it->second;
+                                    if (ac.state != Connection::ProcessingAsync) return;  // state changed
+
+                                    if (chunkData.empty())
+                                    {
+                                        // End of stream: queue terminal chunk, transition to SendingBody
+                                        // so the normal send/keepalive path handles the rest.
+                                        ac.sendBuffer = "0\r\n\r\n";
+                                        ac.streamingActive = false;
+                                        ac.keepalive &= kaAllowed;
+                                        if (onEndCb) onEndCb();
+                                        ac.state = Connection::SendingBody;
+                                        LOG_TRACE("HttpServer: stream ended (thread pool path)");
+                                    }
+                                    else
+                                    {
+                                        std::ostringstream hdr;
+                                        hdr << std::hex << chunkData.size() << "\r\n";
+                                        ac.sendBuffer = hdr.str() + chunkData + "\r\n";
+                                        ac.chunksSent++;
+                                        ac.state = Connection::StreamingChunked;
+                                        LOG_TRACE("HttpServer: stream chunk #%zu ready (thread pool)", ac.chunksSent);
+                                    }
+                                    // Wake up reactor to send the buffered data
+                                    m_reactor.addSocket(sock, Reactor::Writable | Reactor::Closed);
+                                });
+                                return;  // reactor thread is now free
+                            }
+
+                            // --- Synchronous path (no thread pool) — may block reactor ---
                             std::string chunkData = conn.response.streamCallback();
                             
                             if (chunkData.empty())

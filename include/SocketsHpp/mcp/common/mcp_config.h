@@ -148,8 +148,9 @@ namespace mcp
             enum class Type
             {
                 NONE,
-                BEARER,    // Bearer token (JWT or opaque)
-                API_KEY    // x-api-key header
+                BEARER,           // Bearer token (JWT or opaque)
+                API_KEY,          // x-api-key header
+                CAPABILITY_TOKEN  // X-MCP-Capability-Token header (backport from FMcpNativeTransport)
             } type = Type::NONE;
             
             std::string headerName = "Authorization";  // For Bearer: "Authorization", for API key: "x-api-key"
@@ -158,6 +159,14 @@ namespace mcp
             // Custom validator function
             std::function<bool(const std::string& token)> validator;
         } auth;
+
+        // Security / transport hardening (backports from FMcpNativeTransport)
+        /// Allow binding to non-loopback addresses (SSRF guard — default: false = loopback only)
+        bool allowNonLoopback = false;
+        /// Max requests per IP per minute (0 = disabled). Backport of token-bucket rate limiting.
+        int maxRequestsPerMinute = 0;
+        /// Seconds before SSE stream write callback returns keepalive comment (0 = use 30s default).
+        int sseWriteDeadlineSeconds = 30;
 
         /// @brief Set transport from command-line arguments
         void parseArgs(int argc, char** argv)
