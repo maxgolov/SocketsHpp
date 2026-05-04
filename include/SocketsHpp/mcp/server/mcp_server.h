@@ -35,7 +35,7 @@ namespace mcp
 
         /// @brief MCP Server implementing Model Context Protocol over HTTP Stream Transport
         ///
-        /// Backports from FMcpNativeTransport (UE McpAutomationBridge):
+        /// Backports from FMcpNativeTransport (UE MadeHumanToolkit):
         ///   - Real SSE GET stream with per-session blocking queue and push_event()
         ///   - Write deadline: stream callback returns "" after timeout to close stale connections
         ///   - SSRF loopback guard: listen() rejects non-loopback unless allowNonLoopback=true
