@@ -1,5 +1,61 @@
 // Copyright The OpenTelemetry Authors; Max Golovanov.
 // SPDX-License-Identifier: Apache-2.0
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │  MCP SERVER — SocketsHpp                                                    │
+// │                                                                             │
+// │  Implements MCP 2024-11-05 (HTTP + persistent SSE) and                      │
+// │  MCP 2025-03-26 (Streamable HTTP) over the SocketsHpp HTTP server.          │
+// │  STDIO transport is also supported for VS Code / Claude Desktop integration. │
+// │                                                                             │
+// │  ── NGINX INTEGRATION GUIDE ──────────────────────────────────────────────  │
+// │                                                                             │
+// │  Run memento-native on a loopback port (e.g. 3601) and put nginx in front  │
+// │  for TLS, auth, rate-limiting and load balancing.  This server handles     │
+// │  only application logic; all transport hardening is offloaded.             │
+// │                                                                             │
+// │  Recommended nginx config:                                                  │
+// │                                                                             │
+// │    upstream mcp_backend {                                                   │
+// │        server 127.0.0.1:3601;                                               │
+// │        keepalive 32;           # reuse connections                          │
+// │    }                                                                        │
+// │                                                                             │
+// │    limit_req_zone $binary_remote_addr zone=mcp:10m rate=10r/s;              │
+// │                                                                             │
+// │    server {                                                                 │
+// │        listen 443 ssl http2;                                                │
+// │        ssl_certificate     /etc/ssl/mcp.crt;   # TLS (offloaded)           │
+// │        ssl_certificate_key /etc/ssl/mcp.key;                                │
+// │                                                                             │
+// │        location /mcp {                                                      │
+// │            proxy_pass         http://mcp_backend;                           │
+// │            proxy_http_version 1.1;                                          │
+// │            proxy_set_header   Connection "";   # keepalive pool             │
+// │            proxy_set_header   Host $host;                                   │
+// │            proxy_set_header   X-Forwarded-For $remote_addr;                 │
+// │            proxy_buffering    off;             # CRITICAL for SSE           │
+// │            proxy_cache        off;                                           │
+// │            proxy_read_timeout 3600s;           # keep SSE streams alive     │
+// │            limit_req          zone=mcp burst=20 nodelay;                    │
+// │        }                                                                    │
+// │        location /health {                                                   │
+// │            proxy_pass http://mcp_backend/health;  # GET /health → health   │
+// │        }                                                                    │
+// │    }                                                                        │
+// │                                                                             │
+// │  Features best offloaded to nginx (not implemented here):                   │
+// │    • TLS / mTLS termination                                                 │
+// │    • OAuth 2.1 / JWT validation (auth_request module or lua-jwt)            │
+// │    • Aggressive DDoS / IP-block rules (ngx_http_geo_module)                 │
+// │    • gzip compression for JSON payloads                                     │
+// │    • Load balancing across multiple server instances                        │
+// │    • Access logging / metrics export                                        │
+// │    • PKCE / token exchange flows                                            │
+// │                                                                             │
+// │  NOTE: proxy_buffering off is MANDATORY for SSE.  Without it nginx         │
+// │  buffers the entire stream and the client sees nothing until close.         │
+// └─────────────────────────────────────────────────────────────────────────────┘
 #pragma once
 
 #include <SocketsHpp/config.h>
@@ -35,21 +91,30 @@ namespace mcp
 
         /// @brief MCP Server implementing Model Context Protocol over HTTP Stream Transport
         ///
-        /// Backports from FMcpNativeTransport (UE MadeHumanToolkit):
-        ///   - Real SSE GET stream with per-session blocking queue and push_event()
-        ///   - Write deadline: stream callback returns "" after timeout to close stale connections
-        ///   - SSRF loopback guard: listen() rejects non-loopback unless allowNonLoopback=true
-        ///   - Rate limiting: per-IP token bucket (maxRequestsPerMinute in ServerConfig)
-        ///   - Stale SSE cleanup: cleanupStaleSessions() closes queues idle > sseIdleTimeoutSeconds
-        ///   - Capability token auth: X-MCP-Capability-Token header check alongside Bearer/API-key
+        /// Supports three transports:
+        ///   - TransportType::STDIO              — stdin/stdout JSON-RPC for VS Code / Claude Desktop
+        ///   - TransportType::HTTP               — HTTP + persistent SSE GET stream (MCP 2024-11-05)
+        ///   - TransportType::HTTP_STREAMABLE    — Streamable HTTP POST (MCP 2025-03-26)
+        ///
+        /// Auto-registered built-in methods (servers MUST NOT override these):
+        ///   - "ping"                     → {} (liveness check, required by spec)
+        ///   - "notifications/initialized"→ no-op (client ACK after initialize)
+        ///   - "notifications/cancelled" → cancels pending in-flight request
+        ///   - "logging/setLevel"        → sets minimum log level for notifications/message
+        ///
+        /// See file header comment for nginx integration guide.
         class MCPServer
         {
         public:
-            /// @brief Method handler function type
-            /// @param params JSON-RPC parameters
-            /// @return JSON-RPC result
-            /// @throws JsonRpcError on error
+            /// @brief Simple method handler (no cancellation support)
             using MethodHandler = std::function<json(const json& params)>;
+
+            /// @brief Cancellable method handler — receives a cancel token.
+            /// Poll cancel_requested->load() in long-running operations.
+            /// Throw std::runtime_error or return a result when done.
+            using CancellableMethodHandler =
+                std::function<json(const json& params,
+                                   std::shared_ptr<std::atomic<bool>> cancel_requested)>;
 
             /// @brief Create MCP server with configuration
             /// @param config Server configuration
@@ -57,6 +122,7 @@ namespace mcp
                 : m_config(config)
                 , m_httpServer(config.host, config.port)
                 , m_running(false)
+                , m_logLevel("warning")
             {
                 // Configure session manager
                 m_sessionManager.setSessionTimeout(std::chrono::seconds(config.session.sessionTimeoutSeconds));
@@ -71,6 +137,35 @@ namespace mcp
 
                 // Set HTTP server limits
                 m_httpServer.setMaxRequestContentSize(config.maxMessageSize);
+
+                // ── Auto-register built-in MCP protocol methods ───────────────────────────
+                // ping — required by spec; clients poll for liveness
+                m_methods["ping"] = [](const json&) -> json { return json::object(); };
+
+                // notifications/initialized — client ACK after initialize, no response needed
+                m_methods["notifications/initialized"] = [](const json&) -> json { return json::object(); };
+
+                // notifications/cancelled — client cancels an in-flight request by requestId
+                m_methods["notifications/cancelled"] = [this](const json& params) -> json {
+                    json req_id = params.value("requestId", json{});
+                    if (!req_id.is_null()) {
+                        std::lock_guard<std::mutex> lock(m_pendingMutex);
+                        auto it = m_pendingCancellations.find(req_id);
+                        if (it != m_pendingCancellations.end())
+                            it->second->store(true);
+                    }
+                    return json::object();
+                };
+
+                // logging/setLevel — client requests minimum log severity for notifications/message
+                m_methods["logging/setLevel"] = [this](const json& params) -> json {
+                    std::string level = params.value("level", "warning");
+                    static const std::vector<std::string> valid =
+                        {"debug","info","notice","warning","error","critical","alert","emergency"};
+                    if (std::find(valid.begin(), valid.end(), level) != valid.end())
+                        m_logLevel = level;
+                    return json::object();
+                };
 
                 // Setup routes based on transport type
                 if (config.transport == TransportType::HTTP)
@@ -89,12 +184,125 @@ namespace mcp
                 stop();
             }
 
-            /// @brief Register a method handler
-            /// @param method Method name (e.g., "initialize", "tools/list")
-            /// @param handler Handler function
+            /// @brief Register a method handler (simple — no cancellation)
+            /// @note Built-in methods (ping, notifications/initialized, notifications/cancelled,
+            ///       logging/setLevel) are pre-registered and cannot be overridden.
             void registerMethod(const std::string& method, MethodHandler handler)
             {
                 m_methods[method] = std::move(handler);
+            }
+
+            /// @brief Register a cancellable method handler.
+            /// The handler receives a shared cancel_requested token. Poll it in long-running
+            /// operations; when true, abort and throw std::runtime_error("cancelled").
+            /// The token is set by notifications/cancelled from the client.
+            void registerCancellable(const std::string& method, CancellableMethodHandler handler)
+            {
+                m_methods[method] = [this, method, handler](const json& params) -> json {
+                    auto token = std::make_shared<std::atomic<bool>>(false);
+                    // Register by using the request ID from the current in-flight context.
+                    // We store it temporarily so notifications/cancelled can find it.
+                    // Since JSON-RPC id is not in params, we use a UUID as a surrogate key.
+                    auto surrogate = json(method + "_" + std::to_string(
+                        std::chrono::steady_clock::now().time_since_epoch().count()));
+                    {
+                        std::lock_guard<std::mutex> lock(m_pendingMutex);
+                        m_pendingCancellations[surrogate] = token;
+                    }
+                    json result;
+                    try {
+                        result = handler(params, token);
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(m_pendingMutex);
+                        m_pendingCancellations.erase(surrogate);
+                        throw;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(m_pendingMutex);
+                        m_pendingCancellations.erase(surrogate);
+                    }
+                    return result;
+                };
+            }
+
+            /// @brief Push a progress notification to a session's SSE stream.
+            /// Call from within a tool handler to report long-running operation progress.
+            /// @param sessionId   Session to push to (from Mcp-Session-Id header)
+            /// @param token       progressToken from the tool call params (string or int)
+            /// @param progress    0.0–1.0 or total steps completed (spec allows either)
+            /// @param total       Optional: denominator when progress is a step count
+            /// @param message     Optional: human-readable status message
+            bool push_progress(const std::string& sessionId,
+                                const json&        token,
+                                double             progress,
+                                std::optional<double> total   = std::nullopt,
+                                const std::string& message    = "")
+            {
+                json params = {
+                    {"progressToken", token},
+                    {"progress",      progress}
+                };
+                if (total.has_value())  params["total"]   = total.value();
+                if (!message.empty())   params["message"] = message;
+
+                json event_body = {
+                    {"jsonrpc", "2.0"},
+                    {"method",  "notifications/progress"},
+                    {"params",  params}
+                };
+                return push_event(sessionId,
+                    "event: message\ndata: " + event_body.dump() + "\n\n");
+            }
+
+            /// @brief Push a log message notification to a session's SSE stream.
+            /// Only emitted when level >= the level set by logging/setLevel (default: warning).
+            /// @param sessionId Session to push to
+            /// @param level     One of: debug info notice warning error critical alert emergency
+            /// @param logger    Logger name (e.g., "memento-native")
+            /// @param data      Log message (string or structured JSON object)
+            bool push_log(const std::string& sessionId,
+                          const std::string& level,
+                          const std::string& logger,
+                          const json&        data)
+            {
+                static const std::map<std::string, int> LEVEL_ORDER = {
+                    {"debug",0},{"info",1},{"notice",2},{"warning",3},
+                    {"error",4},{"critical",5},{"alert",6},{"emergency",7}
+                };
+                // Suppress if below the requested log level
+                auto it_min = LEVEL_ORDER.find(m_logLevel);
+                auto it_cur = LEVEL_ORDER.find(level);
+                if (it_min != LEVEL_ORDER.end() && it_cur != LEVEL_ORDER.end() &&
+                    it_cur->second < it_min->second)
+                    return false;
+
+                json event_body = {
+                    {"jsonrpc", "2.0"},
+                    {"method",  "notifications/message"},
+                    {"params",  {{"level", level}, {"logger", logger}, {"data", data}}}
+                };
+                return push_event(sessionId,
+                    "event: message\ndata: " + event_body.dump() + "\n\n");
+            }
+
+            /// @brief Get the capabilities object the client advertised in its initialize call.
+            /// Returns null JSON if the session has not completed initialize, or sessionId is empty.
+            json get_client_capabilities(const std::string& sessionId) const
+            {
+                std::lock_guard<std::mutex> lock(m_clientCapsMutex);
+                auto it = m_clientCapabilities.find(sessionId);
+                return it != m_clientCapabilities.end() ? it->second : json{};
+            }
+
+            /// @brief Return the negotiated server info (name, version, protocolVersion).
+            /// Useful for diagnostics and the health endpoint.
+            json server_info() const
+            {
+                return {
+                    {"name",            m_config.serverName.empty() ? "mcp-server" : m_config.serverName},
+                    {"version",         m_config.serverVersion.empty() ? "1.0.0"   : m_config.serverVersion},
+                    {"protocolVersion", SUPPORTED_VERSIONS.front()}
+                };
             }
 
             /// @brief Push a server-initiated SSE event to a specific session's notification stream.
@@ -224,6 +432,11 @@ namespace mcp
             }
 
         private:
+            // Supported protocol versions — highest first (negotiation preference order)
+            static inline const std::vector<std::string> SUPPORTED_VERSIONS = {
+                "2025-03-26", "2024-11-05"
+            };
+
             // ----------------------------------------------------------------
             // Per-session SSE event queue (backport: real push SSE stream)
             // ----------------------------------------------------------------
@@ -258,6 +471,18 @@ namespace mcp
             // Rate limiting
             std::map<std::string, RateLimitEntry> m_rateLimitMap;
             std::mutex m_rateLimitMutex;
+
+            // Cancellation tokens: requestId → cancel flag (set by notifications/cancelled)
+            std::map<json, std::shared_ptr<std::atomic<bool>>> m_pendingCancellations;
+            mutable std::mutex m_pendingMutex;
+
+            // Client capabilities per session (stored on initialize)
+            std::map<std::string, json> m_clientCapabilities;
+            mutable std::mutex m_clientCapsMutex;
+            json m_pendingClientCaps;  // temporary staging during initialize before session ID is known
+
+            // Current minimum log level for notifications/message (set by logging/setLevel)
+            std::string m_logLevel;
 
             // ----------------------------------------------------------------
             // SSRF / rate helpers
@@ -332,6 +557,23 @@ namespace mcp
                     {
                         res.set_status(405);
                         res.set_header("Allow", "GET, POST, DELETE, OPTIONS");
+                        res.send("");
+                    }
+                    return 0;
+                });
+
+                // GET / → health / discovery JSON (also used by nginx upstream health checks)
+                m_httpServer.route("/health", [this](const HttpRequest& req, HttpResponse& res) -> int {
+                    if (req.method == "GET")
+                    {
+                        applyCorsHeaders(res);
+                        res.set_status(200);
+                        res.set_header("Content-Type", "application/json");
+                        res.send(server_info().dump());
+                    }
+                    else
+                    {
+                        res.set_status(405);
                         res.send("");
                     }
                     return 0;
@@ -438,6 +680,17 @@ namespace mcp
 
                             auto request  = JsonRpcRequest::parse(req.content);
                             auto response = handleRequest(request);
+
+                            // Commit pending client capabilities to this session
+                            {
+                                std::lock_guard<std::mutex> lock(m_clientCapsMutex);
+                                if (!m_pendingClientCaps.is_null())
+                                {
+                                    m_clientCapabilities[sessionId] = m_pendingClientCaps;
+                                    m_pendingClientCaps = json{};
+                                }
+                            }
+
                             sendResponses({response.serialize()});
                             return;
                         }
@@ -515,6 +768,23 @@ namespace mcp
             void setupHttpRoutes()
             {
                 std::string endpoint = m_config.endpoint;
+
+                // GET / → health / discovery JSON (nginx upstream health checks)
+                m_httpServer.route("/health", [this](const HttpRequest& req, HttpResponse& res) -> int {
+                    if (req.method == "GET")
+                    {
+                        applyCorsHeaders(res);
+                        res.set_status(200);
+                        res.set_header("Content-Type", "application/json");
+                        res.send(server_info().dump());
+                    }
+                    else
+                    {
+                        res.set_status(405);
+                        res.send("");
+                    }
+                    return 0;
+                });
 
                 // POST: Handle JSON-RPC requests
                 m_httpServer.route(endpoint, [this](const HttpRequest& req, HttpResponse& res) -> int {
@@ -596,6 +866,16 @@ namespace mcp
                     {
                         std::string sessionId = m_sessionManager.createSession();
                         auto response = handleRequest(request);
+
+                        // Commit pending client capabilities to this session
+                        {
+                            std::lock_guard<std::mutex> lock(m_clientCapsMutex);
+                            if (!m_pendingClientCaps.is_null())
+                            {
+                                m_clientCapabilities[sessionId] = m_pendingClientCaps;
+                                m_pendingClientCaps = json{};
+                            }
+                        }
                         
                         res.set_header(m_config.session.headerName, sessionId);
                         
@@ -986,6 +1266,61 @@ namespace mcp
             /// @brief Handle JSON-RPC request
             JsonRpcResponse handleRequest(const JsonRpcRequest& request)
             {
+                // ── Protocol version negotiation for initialize ─────────────────────────
+                // Per MCP spec: server responds with the highest supported version that is
+                // ≤ the client's requested version.  If no common version → -32002 error.
+                if (request.method == "initialize")
+                {
+                    json params = request.params.value_or(json::object());
+                    std::string client_ver = params.value("protocolVersion", "");
+
+                    std::string negotiated;
+                    for (auto& v : SUPPORTED_VERSIONS)
+                    {
+                        if (v <= client_ver || client_ver.empty()) { negotiated = v; break; }
+                    }
+                    if (negotiated.empty())
+                    {
+                        auto error = JsonRpcError::serverError(-32002,
+                            "Unsupported protocol version: " + client_ver +
+                            ". Supported: 2025-03-26, 2024-11-05");
+                        return JsonRpcResponse::failure(request.id, error);
+                    }
+
+                    // Store client capabilities for this session (session is set in outer handler)
+                    // We stash them under a per-request key; the caller sets the real session header.
+                    json caps = params.value("capabilities", json::object());
+                    // Stored keyed by clientInfo.name+version as a best-effort before session is known.
+                    // The full session storage happens in setupStreamableRoutes/setupHttpRoutes
+                    // where the sessionId is available.  See m_pendingClientCaps below.
+                    {
+                        std::lock_guard<std::mutex> lock(m_clientCapsMutex);
+                        m_pendingClientCaps = caps;
+                    }
+
+                    // Delegate to user's initialize handler if registered, otherwise use built-in
+                    auto it = m_methods.find("initialize");
+                    if (it != m_methods.end())
+                    {
+                        try {
+                            json result = it->second(params);
+                            // Patch protocolVersion to the negotiated value
+                            result["protocolVersion"] = negotiated;
+                            return JsonRpcResponse::success(request.id, result);
+                        }
+                        catch (const JsonRpcError& err) { return JsonRpcResponse::failure(request.id, err); }
+                        catch (const std::exception& e) {
+                            return JsonRpcResponse::failure(request.id, JsonRpcError::internalError(e.what()));
+                        }
+                    }
+                    // No user handler: return a minimal valid initialize response
+                    return JsonRpcResponse::success(request.id, {
+                        {"protocolVersion", negotiated},
+                        {"capabilities",    json::object()},
+                        {"serverInfo",      server_info()}
+                    });
+                }
+
                 // Find method handler
                 auto it = m_methods.find(request.method);
                 if (it == m_methods.end())

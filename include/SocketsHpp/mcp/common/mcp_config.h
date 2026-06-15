@@ -97,6 +97,10 @@ namespace mcp
     struct ServerConfig
     {
         TransportType transport = TransportType::STDIO;
+
+        // Server identity (used in initialize response and health endpoint)
+        std::string serverName    = "mcp-server";
+        std::string serverVersion = "1.0.0";
         
         // HTTP transport options
         int port = 8080;

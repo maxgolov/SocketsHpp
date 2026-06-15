@@ -407,6 +407,154 @@ TEST(StreamableHttpStdioRegression, ProcessMessageUnchanged)
     EXPECT_EQ(dl["result"]["tools"][0]["name"], "ping");
 }
 
+// ── New feature tests (protocol compliance) ────────────────────────────────────
+
+// T10: ping — built-in, auto-registered, returns {}
+TEST_F(StreamableHttpTest, PingReturnsEmptyObject)
+{
+    std::string session = do_init();
+    auto r = http_post(port_,
+        R"({"jsonrpc":"2.0","id":10,"method":"ping","params":{}})", session);
+    EXPECT_EQ(r.status, 200);
+    auto d = json::parse(r.body);
+    EXPECT_EQ(d["id"], 10);
+    EXPECT_TRUE(d["result"].is_object());
+    EXPECT_TRUE(d["result"].empty()) << "ping must return {}";
+}
+
+// T11: protocol version negotiation — client sends 2025-03-26, server agrees
+TEST_F(StreamableHttpTest, VersionNegotiationMatchesClientVersion)
+{
+    auto r = http_post(port_,
+        R"({"jsonrpc":"2.0","id":11,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})");
+    EXPECT_EQ(r.status, 200);
+    auto d = json::parse(r.body);
+    EXPECT_EQ(d["result"]["protocolVersion"], "2025-03-26");
+}
+
+// T12: protocol version negotiation — client sends older 2024-11-05
+TEST_F(StreamableHttpTest, VersionNegotiationDowngradesForOlderClient)
+{
+    auto r = http_post(port_,
+        R"({"jsonrpc":"2.0","id":12,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"old-client","version":"1"}}})");
+    EXPECT_EQ(r.status, 200);
+    auto d = json::parse(r.body);
+    // Server must not respond with a version higher than the client's
+    std::string negotiated = d["result"]["protocolVersion"].get<std::string>();
+    EXPECT_LE(negotiated, std::string("2024-11-05"));
+}
+
+// T13: protocol version negotiation — unsupported client version → -32002
+TEST_F(StreamableHttpTest, VersionNegotiationRejectsUnknownVersion)
+{
+    auto r = http_post(port_,
+        R"({"jsonrpc":"2.0","id":13,"method":"initialize","params":{"protocolVersion":"2000-01-01","capabilities":{},"clientInfo":{"name":"ancient","version":"1"}}})");
+    EXPECT_EQ(r.status, 200) << "JSON-RPC errors always return HTTP 200";
+    auto d = json::parse(r.body);
+    EXPECT_TRUE(d.contains("error"));
+    EXPECT_EQ(d["error"]["code"], -32002) << "Unsupported protocol version must be -32002";
+}
+
+// T14: GET /health → discovery JSON with server name + version
+TEST_F(StreamableHttpTest, HealthEndpointReturnsServerInfo)
+{
+    // HTTP GET via raw socket
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(port_);
+    ASSERT_EQ(::connect(sock, (sockaddr*)&addr, sizeof(addr)), 0);
+
+    std::string req_str = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    ::send(sock, req_str.c_str(), req_str.size(), 0);
+
+    std::string raw;
+    char buf[4096];
+    ssize_t n;
+    while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0) raw.append(buf, n);
+    ::close(sock);
+
+    // Parse status
+    int status = 0;
+    {
+        std::istringstream ss(raw);
+        std::string line; std::getline(ss, line);
+        std::istringstream ls(line); std::string p; ls >> p >> status;
+    }
+    EXPECT_EQ(status, 200);
+
+    // Body is after the blank line
+    auto sep = raw.find("\r\n\r\n");
+    ASSERT_NE(sep, std::string::npos);
+    auto body = raw.substr(sep + 4);
+    auto d = json::parse(body);
+    EXPECT_TRUE(d.contains("name"));
+    EXPECT_TRUE(d.contains("protocolVersion"));
+}
+
+// T15: logging/setLevel — built-in, auto-registered
+TEST_F(StreamableHttpTest, LoggingSetLevelAccepted)
+{
+    std::string session = do_init();
+    // Send logging/setLevel as a notification (no id)
+    auto r = http_post(port_,
+        R"({"jsonrpc":"2.0","method":"logging/setLevel","params":{"level":"info"}})", session);
+    // Notification → 202
+    EXPECT_EQ(r.status, 202);
+}
+
+// T16: push_progress / push_log — verify helper exists and can be called
+//      (Integration: server pushes a progress event via SSE, client receives it on GET stream)
+//      This test verifies the API compiles and the method returns false for unknown sessions.
+TEST(StreamableHttpApiCompiles, PushProgressAndLogReturnFalseForUnknownSession)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    cfg.port      = 0;
+    MCPServer srv(cfg);
+
+    // push_progress to unknown session — must return false, not crash
+    bool ok = srv.push_progress("no-such-session", json("token-1"), 0.5, 1.0, "halfway");
+    EXPECT_FALSE(ok);
+
+    // push_log to unknown session — must return false, not crash
+    bool ok2 = srv.push_log("no-such-session", "info", "test-logger", json("hello"));
+    EXPECT_FALSE(ok2);
+}
+
+// T17: get_client_capabilities — returns null for unknown session
+TEST(StreamableHttpApiCompiles, GetClientCapsNullForUnknownSession)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    cfg.port      = 0;
+    MCPServer srv(cfg);
+    auto caps = srv.get_client_capabilities("no-such-session");
+    EXPECT_TRUE(caps.is_null() || caps.is_discarded() || caps.empty())
+        << "Unknown session should return null/empty capabilities";
+}
+
+// T18: registerCancellable — handler can be called without cancellation
+TEST(StreamableHttpApiCompiles, CancellableHandlerExecutes)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    cfg.port      = 0;
+    MCPServer srv(cfg);
+
+    srv.registerCancellable("echo", [](const json& p, std::shared_ptr<std::atomic<bool>> cancel) -> json {
+        if (cancel->load()) throw std::runtime_error("cancelled");
+        return {{"echoed", p.value("text", "")}};
+    });
+
+    std::string resp = srv.processMessage(
+        R"({"jsonrpc":"2.0","id":1,"method":"echo","params":{"text":"hello"}})");
+    ASSERT_FALSE(resp.empty());
+    auto d = json::parse(resp);
+    EXPECT_EQ(d["result"]["echoed"], "hello");
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
