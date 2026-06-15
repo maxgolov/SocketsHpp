@@ -152,6 +152,65 @@ TEST(MCPConfigTest, ServerSessionConfig) {
     EXPECT_EQ(config.session.sessionTimeoutSeconds, 3600);
 }
 
+// ── Streamable HTTP (MCP 2025-03-26) config tests ────────────────────────────
+
+TEST(MCPConfigTest, TransportTypeStreamableIsDistinctFromHttpAndStdio) {
+    EXPECT_NE(TransportType::HTTP_STREAMABLE, TransportType::HTTP);
+    EXPECT_NE(TransportType::HTTP_STREAMABLE, TransportType::STDIO);
+    EXPECT_NE(TransportType::HTTP, TransportType::STDIO);
+}
+
+TEST(MCPConfigTest, ParseArgsStreamableTransport) {
+    ServerConfig config;
+    const char* argv[] = {"program", "--transport", "streamable", "--port", "3601"};
+    int argc = sizeof(argv) / sizeof(argv[0]);
+    config.parseArgs(argc, const_cast<char**>(argv));
+    EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
+    EXPECT_EQ(config.port, 3601);
+}
+
+TEST(MCPConfigTest, ParseArgsHttpStreamableAlias) {
+    ServerConfig config;
+    const char* argv[] = {"program", "--transport", "http-streamable"};
+    int argc = sizeof(argv) / sizeof(argv[0]);
+    config.parseArgs(argc, const_cast<char**>(argv));
+    EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
+}
+
+TEST(MCPConfigTest, ParseArgsHttpTransportUnchanged) {
+    ServerConfig config;
+    const char* argv[] = {"program", "--transport", "http"};
+    int argc = sizeof(argv) / sizeof(argv[0]);
+    config.parseArgs(argc, const_cast<char**>(argv));
+    EXPECT_EQ(config.transport, TransportType::HTTP);
+}
+
+TEST(MCPConfigTest, ParseArgsStdioTransportViaFlag) {
+    ServerConfig config;
+    const char* argv[] = {"program", "--transport", "stdio"};
+    int argc = sizeof(argv) / sizeof(argv[0]);
+    config.parseArgs(argc, const_cast<char**>(argv));
+    EXPECT_EQ(config.transport, TransportType::STDIO);
+}
+
+TEST(MCPConfigTest, ClientConfigFromJsonStreamable) {
+    json server_json = {
+        {"type", "streamable"},
+        {"url", "http://localhost:3601/mcp"},
+        {"headers", {{"Authorization", "Bearer tok"}}}
+    };
+    auto config = ClientConfig::fromJson(server_json);
+    EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
+    EXPECT_EQ(config.http.url, "http://localhost:3601/mcp");
+    EXPECT_EQ(config.http.headers["Authorization"], "Bearer tok");
+}
+
+TEST(MCPConfigTest, ClientConfigFromJsonHttpStreamableAlias) {
+    json server_json = {{"type", "http-streamable"}, {"url", "http://localhost:3601/mcp"}};
+    auto config = ClientConfig::fromJson(server_json);
+    EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

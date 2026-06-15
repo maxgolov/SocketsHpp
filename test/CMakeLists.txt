@@ -70,3 +70,16 @@ foreach(testname ${FUNCTIONAL_TESTS})
   target_include_directories(${testname} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   gtest_discover_tests(${testname} TEST_PREFIX functional.)
 endforeach()
+
+# Streamable HTTP functional tests (MCP 2025-03-26) — require nlohmann-json
+if(TARGET nlohmann_json::nlohmann_json)
+  add_executable(mcp_streamable_test "functional/mcp_streamable_test.cc")
+  target_link_libraries(mcp_streamable_test
+    ${GTEST_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+    nlohmann_json::nlohmann_json)
+  target_include_directories(mcp_streamable_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  gtest_discover_tests(mcp_streamable_test TEST_PREFIX functional.)
+endif()
