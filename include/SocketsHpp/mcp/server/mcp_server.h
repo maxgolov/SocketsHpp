@@ -77,6 +77,10 @@ namespace mcp
                 {
                     setupHttpRoutes();
                 }
+                else if (config.transport == TransportType::HTTP_STREAMABLE)
+                {
+                    setupStreamableRoutes();
+                }
                 // STDIO transport handled externally (read from stdin, write to stdout)
             }
 
@@ -138,13 +142,14 @@ namespace mcp
                 }
             }
 
-            /// @brief Start server (HTTP mode only).
+            /// @brief Start server (HTTP or HTTP_STREAMABLE mode).
             /// SSRF guard: refuses to bind to non-loopback unless config.allowNonLoopback is true.
             void listen()
             {
-                if (m_config.transport != TransportType::HTTP)
+                if (m_config.transport != TransportType::HTTP &&
+                    m_config.transport != TransportType::HTTP_STREAMABLE)
                 {
-                    throw std::runtime_error("listen() only available in HTTP transport mode");
+                    throw std::runtime_error("listen() only available in HTTP transport modes");
                 }
 
                 // SSRF loopback guard (backport from FMcpNativeTransport)
@@ -284,7 +289,229 @@ namespace mcp
                 return true;
             }
 
-            /// @brief Setup HTTP routes for MCP protocol
+            // ── MCP Streamable HTTP transport (2025-03-26) ────────────────────────────
+            //
+            // Unified POST endpoint:
+            //   - Client sends JSON-RPC (single or batch) via POST
+            //   - If Accept includes text/event-stream → server responds with SSE stream
+            //     (each JSON-RPC response sent as a separate `data:` event; stream closed
+            //     when all responses are sent)
+            //   - Otherwise → server responds with application/json (single) or
+            //     application/json array (batch)
+            //   - Notifications (no id) → 202 Accepted, empty body
+            //
+            // Optional GET endpoint (same URL):
+            //   - Opens a long-lived SSE notification stream for server-initiated messages
+            //   - Reuses the existing handleHttpGet() implementation
+            //
+            // Protocol version: 2025-03-26
+
+            /// @brief Setup Streamable HTTP routes (MCP 2025-03-26)
+            void setupStreamableRoutes()
+            {
+                std::string endpoint = m_config.endpoint;
+
+                m_httpServer.route(endpoint, [this](const HttpRequest& req, HttpResponse& res) -> int {
+                    if (req.method == "POST")
+                    {
+                        handleStreamablePost(req, res);
+                    }
+                    else if (req.method == "GET")
+                    {
+                        handleHttpGet(req, res);   // same SSE notification stream as 2024-11-05
+                    }
+                    else if (req.method == "DELETE")
+                    {
+                        handleHttpDelete(req, res);
+                    }
+                    else if (req.method == "OPTIONS")
+                    {
+                        handleHttpOptions(req, res);
+                    }
+                    else
+                    {
+                        res.set_status(405);
+                        res.set_header("Allow", "GET, POST, DELETE, OPTIONS");
+                        res.send("");
+                    }
+                    return 0;
+                });
+            }
+
+            /// @brief Handle Streamable HTTP POST (MCP 2025-03-26)
+            ///
+            /// Accepts:
+            ///   - Single JSON-RPC request  → JSON or SSE with one `data:` event
+            ///   - JSON-RPC batch (array)   → JSON array or SSE with one `data:` event per response
+            ///   - Notification (no id)     → 202 Accepted, no body
+            ///
+            /// Response content type is negotiated via the `Accept` header:
+            ///   Accept includes "text/event-stream" → SSE; otherwise application/json.
+            void handleStreamablePost(const HttpRequest& req, HttpResponse& res)
+            {
+                applyCorsHeaders(res);
+
+                // Rate limit
+                std::string clientIp = req.headers.count("X-Forwarded-For")
+                    ? req.headers.at("X-Forwarded-For") : "unknown";
+                if (!checkRateLimit(clientIp, res)) return;
+
+                // Authenticate
+                if (!authenticate(req, res)) return;
+
+                // Negotiate response format
+                bool wantsSSE = false;
+                {
+                    auto it = req.headers.find("Accept");
+                    if (it != req.headers.end())
+                        wantsSSE = it->second.find("text/event-stream") != std::string::npos;
+                }
+
+                // Helper: send a set of serialised responses either as SSE or JSON
+                auto sendResponses = [&](const std::vector<std::string>& resps)
+                {
+                    if (resps.empty())
+                    {
+                        res.set_status(202);
+                        res.send("");
+                        return;
+                    }
+                    if (wantsSSE)
+                    {
+                        res.set_status(200);
+                        res.set_header("Content-Type", "text/event-stream");
+                        res.set_header("Cache-Control", "no-cache");
+                        std::string body;
+                        for (auto& r : resps)
+                            body += "data: " + r + "\n\n";
+                        res.send(body);
+                    }
+                    else if (resps.size() == 1)
+                    {
+                        res.set_status(200);
+                        res.set_header("Content-Type", "application/json");
+                        res.send(resps[0]);
+                    }
+                    else
+                    {
+                        // Batch: return JSON array
+                        std::string arr = "[";
+                        for (size_t i = 0; i < resps.size(); ++i)
+                        {
+                            if (i) arr += ",";
+                            arr += resps[i];
+                        }
+                        arr += "]";
+                        res.set_status(200);
+                        res.set_header("Content-Type", "application/json");
+                        res.send(arr);
+                    }
+                };
+
+                try
+                {
+                    json body = json::parse(req.content);
+                    bool isBatch = body.is_array();
+
+                    if (!isBatch)
+                    {
+                        // Notification (no id) → 202, no response body
+                        if (!body.contains("id"))
+                        {
+                            auto notif = JsonRpcNotification::parse(req.content);
+                            handleNotification(notif);
+                            res.set_status(202);
+                            res.send("");
+                            return;
+                        }
+
+                        // initialize → create session, echo session header
+                        if (body.value("method", "") == "initialize")
+                        {
+                            std::string sessionId = m_sessionManager.createSession();
+                            // Pre-create SSE queue so the session's GET stream works immediately
+                            {
+                                std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
+                                m_sseQueues[sessionId] = std::make_shared<SSESessionQueue>();
+                            }
+                            res.set_header(m_config.session.headerName, sessionId);
+
+                            auto request  = JsonRpcRequest::parse(req.content);
+                            auto response = handleRequest(request);
+                            sendResponses({response.serialize()});
+                            return;
+                        }
+
+                        // All other requests: validate session (optional but recommended)
+                        std::string sessionId = getSessionId(req);
+                        if (!sessionId.empty() && !m_sessionManager.validateSession(sessionId))
+                        {
+                            auto error    = JsonRpcError::serverError(-32001, "Invalid or expired session");
+                            auto response = JsonRpcResponse::failure(nullptr, error);
+                            res.set_status(404);
+                            res.set_header("Content-Type", "application/json");
+                            res.send(response.serialize());
+                            return;
+                        }
+
+                        auto request  = JsonRpcRequest::parse(req.content);
+                        auto response = handleRequest(request);
+                        sendResponses({response.serialize()});
+                    }
+                    else
+                    {
+                        // Batch: validate session for the whole batch
+                        std::string sessionId = getSessionId(req);
+                        if (!sessionId.empty() && !m_sessionManager.validateSession(sessionId))
+                        {
+                            auto error    = JsonRpcError::serverError(-32001, "Invalid or expired session");
+                            auto response = JsonRpcResponse::failure(nullptr, error);
+                            res.set_status(404);
+                            res.set_header("Content-Type", "application/json");
+                            res.send(response.serialize());
+                            return;
+                        }
+
+                        std::vector<std::string> serialised;
+                        for (auto& item : body)
+                        {
+                            if (!item.contains("id"))
+                            {
+                                // Notification within batch — handle, no response
+                                try
+                                {
+                                    auto notif = JsonRpcNotification::parse(item.dump());
+                                    handleNotification(notif);
+                                }
+                                catch (...) {}
+                                continue;
+                            }
+                            auto request  = JsonRpcRequest::parse(item.dump());
+                            auto response = handleRequest(request);
+                            serialised.push_back(response.serialize());
+                        }
+                        sendResponses(serialised);
+                    }
+                }
+                catch (const json::parse_error& e)
+                {
+                    auto error    = JsonRpcError::parseError(e.what());
+                    auto response = JsonRpcResponse::failure(nullptr, error);
+                    res.set_status(400);
+                    res.set_header("Content-Type", "application/json");
+                    res.send(response.serialize());
+                }
+                catch (const std::exception& e)
+                {
+                    auto error    = JsonRpcError::internalError(e.what());
+                    auto response = JsonRpcResponse::failure(nullptr, error);
+                    res.set_status(500);
+                    res.set_header("Content-Type", "application/json");
+                    res.send(response.serialize());
+                }
+            }
+
+            /// @brief Setup routes based on transport type
             void setupHttpRoutes()
             {
                 std::string endpoint = m_config.endpoint;

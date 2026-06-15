@@ -20,8 +20,9 @@ namespace mcp
     /// @brief MCP transport type
     enum class TransportType
     {
-        STDIO,  // Standard input/output
-        HTTP    // HTTP/HTTPS with SSE
+        STDIO,            // Standard input/output (MCP 2024-11-05+)
+        HTTP,             // HTTP + persistent SSE GET stream (MCP 2024-11-05)
+        HTTP_STREAMABLE   // Streamable HTTP: POST returns JSON or SSE; GET optional (MCP 2025-03-26)
     };
 
     /// @brief Configuration for stdio transport
@@ -178,7 +179,10 @@ namespace mcp
                 if (arg == "--transport" && i + 1 < argc)
                 {
                     std::string t = argv[++i];
-                    transport = (t == "http") ? TransportType::HTTP : TransportType::STDIO;
+                    if (t == "http")              transport = TransportType::HTTP;
+                    else if (t == "streamable" ||
+                             t == "http-streamable") transport = TransportType::HTTP_STREAMABLE;
+                    else                          transport = TransportType::STDIO;
                 }
                 else if (arg == "--port" && i + 1 < argc)
                 {
@@ -222,7 +226,10 @@ namespace mcp
 
             if (auto val = getEnv("MCP_TRANSPORT"))
             {
-                transport = (*val == "http") ? TransportType::HTTP : TransportType::STDIO;
+                if (*val == "http")              transport = TransportType::HTTP;
+                else if (*val == "streamable" ||
+                         *val == "http-streamable") transport = TransportType::HTTP_STREAMABLE;
+                else                             transport = TransportType::STDIO;
             }
             if (auto val = getEnv("MCP_PORT"))
             {
@@ -301,6 +308,11 @@ namespace mcp
             else if (type == "http" || type == "sse")
             {
                 config.transport = TransportType::HTTP;
+                config.http = HttpConfig::fromJson(j);
+            }
+            else if (type == "streamable" || type == "http-streamable")
+            {
+                config.transport = TransportType::HTTP_STREAMABLE;
                 config.http = HttpConfig::fromJson(j);
             }
             
