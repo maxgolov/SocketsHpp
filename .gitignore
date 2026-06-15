@@ -37,6 +37,7 @@ out/**
 # Build directories
 build/
 build-*/
+build_test/
 
 # ARM64 environment
 .arm64-env/
