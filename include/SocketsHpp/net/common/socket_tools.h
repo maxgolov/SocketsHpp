@@ -1331,30 +1331,45 @@ namespace net
                         };
                         assert(result >= 1 && static_cast<size_t>(result) <= sizeof(events) / sizeof(events[0]));
 
-                        LOCKGUARD(m_sockets_mutex);
+                        struct ReadySocket
+                        {
+                            Socket socket;
+                            int flags;
+                            uint32_t events;
+                        };
+                        std::vector<ReadySocket> ready;
+                        ready.reserve(result);
                         for (int i = 0; i < result; i++)
                         {
+                            LOCKGUARD(m_sockets_mutex);
                             auto it = std::find(m_sockets.begin(), m_sockets.end(), events[i].data.fd);
-                            assert(it != m_sockets.end());
-                            Socket socket = it->socket;
-                            int flags = it->flags;
+                            if (it == m_sockets.end())
+                                continue;
+                            ready.push_back({it->socket, it->flags, events[i].events});
+                        }
+
+                        for (const auto& readySocket : ready)
+                        {
+                            Socket socket = readySocket.socket;
+                            int flags = readySocket.flags;
+                            uint32_t activeEvents = readySocket.events;
 
                             LOG_TRACE("Reactor: Handling socket 0x%x active flags 0x%x (armed 0x%x)",
-                                static_cast<int>(socket), events[i].events, flags);
+                                static_cast<int>(socket), activeEvents, flags);
 
-                            if ((flags & Readable) && (events[i].events & EPOLLIN))
+                            if ((flags & Readable) && (activeEvents & EPOLLIN))
                             {
                                 m_callback.onSocketReadable(socket);
                             }
-                            if ((flags & Writable) && (events[i].events & EPOLLOUT))
+                            if ((flags & Writable) && (activeEvents & EPOLLOUT))
                             {
                                 m_callback.onSocketWritable(socket);
                             }
-                            if ((flags & Acceptable) && (events[i].events & EPOLLIN))
+                            if ((flags & Acceptable) && (activeEvents & EPOLLIN))
                             {
                                 m_callback.onSocketAcceptable(socket);
                             }
-                            if ((flags & Closed) && (events[i].events & (EPOLLHUP | EPOLLERR)))
+                            if ((flags & Closed) && (activeEvents & (EPOLLHUP | EPOLLERR)))
                             {
                                 LOG_TRACE("Reactor: handling socket 0x%x onSocketClosed", static_cast<int>(socket));
                                 m_callback.onSocketClosed(socket);

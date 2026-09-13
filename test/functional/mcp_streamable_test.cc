@@ -117,6 +117,46 @@ static TestHttpResponse http_post(int port,
     return res;
 }
 
+static int open_sse_stream(int port, const std::string& session_id)
+{
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(port);
+    if (::connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
+        ::close(sock);
+        return -1;
+    }
+
+    std::ostringstream req;
+    req << "GET /mcp HTTP/1.1\r\n"
+        << "Host: 127.0.0.1:" << port << "\r\n"
+        << "Accept: text/event-stream\r\n"
+        << "Mcp-Session-Id: " << session_id << "\r\n"
+        << "Connection: keep-alive\r\n\r\n";
+    auto request = req.str();
+    if (::send(sock, request.c_str(), request.size(), 0) <= 0) {
+        ::close(sock);
+        return -1;
+    }
+
+    std::string headers;
+    char c;
+    while (headers.find("\r\n\r\n") == std::string::npos) {
+        if (::recv(sock, &c, 1, 0) != 1) {
+            ::close(sock);
+            return -1;
+        }
+        headers += c;
+        if (headers.size() > 8192) {
+            ::close(sock);
+            return -1;
+        }
+    }
+    return sock;
+}
+
 // Parse "data: {...}\n\n" SSE events
 static std::vector<json> parse_sse(const std::string& sse_body)
 {
@@ -195,6 +235,9 @@ protected:
                 std::string s = args.value("text", "");
                 std::reverse(s.begin(), s.end());
                 return {{"content", json::array({{{"type","text"},{"text",s}}})}};
+            }
+            if (name == "store_memory") {
+                return {{"content", json::array({{{"type","text"},{"text","stored"}}})}};
             }
             throw std::runtime_error("Unknown tool: " + name);
         });
@@ -287,6 +330,45 @@ TEST_F(StreamableHttpTest, ToolsListReturnsSseWhenRequested)
     ASSERT_EQ(events.size(), 1u);
     EXPECT_EQ(events[0]["id"], 3);
     EXPECT_EQ(events[0]["result"]["tools"].size(), 2u);
+}
+
+// T3b: a persistent SSE stream must not block unrelated POST requests.
+TEST_F(StreamableHttpTest, PersistentSseDoesNotBlockPostRequests)
+{
+    std::string session = do_init();
+    std::atomic<bool> stream_ready{false};
+    std::atomic<int> stream_socket{-1};
+
+    std::thread stream_thread([&]() {
+        int sock = open_sse_stream(port_, session);
+        stream_socket = sock;
+        stream_ready = true;
+        if (sock >= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            ::close(sock);
+        }
+    });
+
+    for (int i = 0; i < 100 && !stream_ready; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!stream_ready || stream_socket.load() < 0) {
+        stream_thread.join();
+        FAIL() << "persistent SSE stream did not become ready";
+    }
+
+    auto response = http_post(port_,
+        R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"store_memory","arguments":{"id":"infra-machine-seeker","namespace":"infra/sticky","tags":"infra machine seeker trust-domain lan memento vllm","text":"reachable machine operational memory"}}})",
+        session,
+        "application/json, text/event-stream");
+
+    stream_thread.join();
+
+    EXPECT_EQ(response.status, 200);
+    auto events = parse_sse(response.body);
+    ASSERT_EQ(events.size(), 1u);
+    auto& body = events[0];
+    EXPECT_EQ(body["id"], 2);
+    EXPECT_TRUE(body["result"].contains("content"));
 }
 
 // T4: batch → two SSE events
