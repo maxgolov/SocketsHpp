@@ -556,6 +556,21 @@ namespace net
                     throw std::runtime_error("Failed to create socket: " + std::string(strerror(errno)));
 #endif
                 }
+                suppressSigPipe();
+            }
+
+            /// @brief Suppress SIGPIPE for writes to a peer-closed socket.
+            /// On Apple platforms send() has no MSG_NOSIGNAL flag, so a write to
+            /// a closed connection raises SIGPIPE and terminates the process.
+            /// SO_NOSIGPIPE makes such writes fail with EPIPE instead. This is a
+            /// no-op where the option is unavailable (Linux uses MSG_NOSIGNAL,
+            /// Windows has no SIGPIPE).
+            void suppressSigPipe() noexcept
+            {
+#if defined(SO_NOSIGPIPE)
+                int on = 1;
+                ::setsockopt(m_sock, SOL_SOCKET, SO_NOSIGPIPE, reinterpret_cast<char*>(&on), sizeof(on));
+#endif
             }
 
             // Copy operations allowed (non-owning semantics)
@@ -734,7 +749,15 @@ namespace net
                 assert(m_sock != Invalid);
                 if ((m_sock == Invalid) || (buffer == nullptr) || (size == 0))
                     return 0;
-                return static_cast<int>(::send(m_sock, reinterpret_cast<char const*>(buffer), size, 0));
+                // Avoid SIGPIPE on a write to a peer-closed socket. Linux exposes
+                // MSG_NOSIGNAL; Apple relies on SO_NOSIGPIPE set at creation/accept.
+#if defined(MSG_NOSIGNAL)
+                constexpr int sendFlags = MSG_NOSIGNAL;
+#else
+                constexpr int sendFlags = 0;
+#endif
+                return static_cast<int>(
+                    ::send(m_sock, reinterpret_cast<char const*>(buffer), size, sendFlags));
             }
 
             int sendto(void const* buffer, size_t size, int flags, SocketAddr& destAddr)
@@ -791,7 +814,12 @@ namespace net
                 socklen_t addrlen = sizeof(caddr);
 #endif
                 csock = ::accept(m_sock, caddr, &addrlen);
-                return !csock.invalid();
+                if (!csock.invalid())
+                {
+                    csock.suppressSigPipe();
+                    return true;
+                }
+                return false;
             }
 
             bool shutdown(int how)
