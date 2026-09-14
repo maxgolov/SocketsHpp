@@ -7,7 +7,7 @@
     "tsx": "^4.7.0"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^2.0.59",
+    "@ai-sdk/openai": "^4.0.65",
     "ai": "^5.0.86",
     "zod": "^4.1.12"
   }
