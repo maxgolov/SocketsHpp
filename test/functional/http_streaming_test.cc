@@ -10,6 +10,11 @@
 using namespace SocketsHpp::http::server;
 using namespace SocketsHpp::http::client;
 
+// Both http::server and http::client declare an SSEEvent type. These tests
+// exercise the server-side event (which provides message()/custom()/format()),
+// so use a uniquely-named alias to avoid an ambiguous-reference build error.
+using ServerSSEEvent = SocketsHpp::http::server::SSEEvent;
+
 class HttpStreamingTest : public ::testing::Test
 {
 protected:
@@ -94,7 +99,7 @@ TEST_F(HttpStreamingTest, SSEEvents)
             if (eventCount < 2)
             {
                 eventCount++;
-                SSEEvent evt = SSEEvent::message("Event " + std::to_string(eventCount), std::to_string(eventCount));
+                ServerSSEEvent evt = ServerSSEEvent::message("Event " + std::to_string(eventCount), std::to_string(eventCount));
                 return evt.format();
             }
             return "";  // End stream
@@ -215,7 +220,7 @@ TEST_F(HttpStreamingTest, PostRequest)
 // Test SSE event formatting
 TEST(SSEEventTest, BasicFormatting)
 {
-    SSEEvent evt = SSEEvent::message("test data", "123");
+    ServerSSEEvent evt = ServerSSEEvent::message("test data", "123");
     std::string formatted = evt.format();
     
     EXPECT_TRUE(formatted.find("id: 123") != std::string::npos);
@@ -225,7 +230,7 @@ TEST(SSEEventTest, BasicFormatting)
 
 TEST(SSEEventTest, CustomEvent)
 {
-    SSEEvent evt = SSEEvent::custom("myevent", "payload", "456");
+    ServerSSEEvent evt = ServerSSEEvent::custom("myevent", "payload", "456");
     evt.retry = 5000;
     std::string formatted = evt.format();
     
@@ -237,7 +242,7 @@ TEST(SSEEventTest, CustomEvent)
 
 TEST(SSEEventTest, MultilineData)
 {
-    SSEEvent evt = SSEEvent::message("line1\nline2\nline3");
+    ServerSSEEvent evt = ServerSSEEvent::message("line1\nline2\nline3");
     std::string formatted = evt.format();
     
     EXPECT_TRUE(formatted.find("data: line1") != std::string::npos);
