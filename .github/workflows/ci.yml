@@ -60,7 +60,7 @@ jobs:
         run: >-
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
-          -DBUILD_TESTING=ON
+          -DSOCKETSHPP_BUILD_TESTS=ON
           -DBUILD_EXAMPLES=ON
 
       - name: Configure macOS
@@ -71,7 +71,7 @@ jobs:
         run: >-
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
-          -DBUILD_TESTING=ON
+          -DSOCKETSHPP_BUILD_TESTS=ON
           -DCMAKE_PREFIX_PATH="$(brew --prefix googletest)"
           -DBUILD_EXAMPLES=ON
 
@@ -79,7 +79,7 @@ jobs:
         if: runner.os == 'Windows'
         run: >-
           cmake -S . -B build -A x64
-          -DBUILD_TESTING=ON
+          -DSOCKETSHPP_BUILD_TESTS=ON
           -DBUILD_EXAMPLES=ON
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 

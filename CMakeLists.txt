@@ -41,7 +41,10 @@ include(cmake/target-arch.cmake)
 # Autodetect dependencies from vcpkg if available
 include(cmake/detect-vcpkg.cmake)
 
-option(BUILD_TESTING "Build SocketsHpp tests" OFF)
+# Tests are opt-in and require GTest. Embedded consumers (add_subdirectory) and
+# plain header-only builds are never forced to provide GTest; CI enables this
+# explicitly with -DSOCKETSHPP_BUILD_TESTS=ON.
+option(SOCKETSHPP_BUILD_TESTS "Build SocketsHpp tests" OFF)
 include(CTest)
 
 include_directories(include)
@@ -75,9 +78,9 @@ if(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS)
     message(STATUS "Found BS thread pool: ${BSHOSHANY_THREAD_POOL_INCLUDE_DIRS}")
 endif()
 
-if(BUILD_TESTING)
+if(SOCKETSHPP_BUILD_TESTS)
     find_package(GTest CONFIG REQUIRED)
-  add_subdirectory(test)
+    add_subdirectory(test)
 endif()
 
 # Build examples if requested
