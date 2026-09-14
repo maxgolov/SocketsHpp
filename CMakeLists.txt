@@ -65,6 +65,15 @@ if(NOT TARGET nlohmann_json::nlohmann_json)
     endif()
 else()
     message(STATUS "Using nlohmann-json from vcpkg")
+    # The submodule path above adds a global include directory. Do the same for
+    # the vcpkg imported target so that examples and tests which do not link
+    # nlohmann_json::nlohmann_json explicitly still resolve <nlohmann/json.hpp>
+    # (notably on Windows/MSVC, where there is no global submodule include path).
+    get_target_property(_socketshpp_njson_inc
+        nlohmann_json::nlohmann_json INTERFACE_INCLUDE_DIRECTORIES)
+    if(_socketshpp_njson_inc)
+        include_directories(${_socketshpp_njson_inc})
+    endif()
 endif()
 
 # Find BS thread pool header

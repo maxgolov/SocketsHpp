@@ -71,8 +71,10 @@ foreach(testname ${FUNCTIONAL_TESTS})
   gtest_discover_tests(${testname} TEST_PREFIX functional.)
 endforeach()
 
-# Streamable HTTP functional tests (MCP 2025-03-26) — require nlohmann-json
-if(TARGET nlohmann_json::nlohmann_json)
+# Streamable HTTP functional tests (MCP 2025-03-26) — require nlohmann-json.
+# This test drives the server over raw POSIX sockets (arpa/inet.h, sys/socket.h,
+# unistd.h), so it is POSIX-only and excluded from the Windows build.
+if(NOT WIN32 AND TARGET nlohmann_json::nlohmann_json)
   add_executable(mcp_streamable_test "functional/mcp_streamable_test.cc")
   target_link_libraries(mcp_streamable_test
     ${GTEST_LIBRARIES}
