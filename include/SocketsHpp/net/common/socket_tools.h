@@ -1380,26 +1380,76 @@ namespace net
 
 #if defined(TARGET_OS_MAC)
                     {
-                        LOCKGUARD(m_sockets_mutex);
                         constexpr unsigned waitms = config::REACTOR_POLL_TIMEOUT_MS;
                         struct timespec timeout;
                         timeout.tv_sec = waitms / 1000;
                         timeout.tv_nsec = (waitms % 1000) * 1000 * 1000;
 
                         int nev = kevent(kq, NULL, 0, m_events, KQUEUE_SIZE, &timeout);
-                        for (int i = 0; i < nev; i++)
+
+                        // Snapshot the ready sockets while holding m_sockets_mutex,
+                        // then invoke the user callbacks after releasing the lock.
+                        // Holding the lock across callbacks caused a lock inversion
+                        // with m_connectionsMutex (a persistent SSE worker holding
+                        // m_connectionsMutex may call back into the reactor), and the
+                        // previous assert(it != m_sockets.end()) aborted the process
+                        // whenever a socket was concurrently removed.
+                        struct ReadyEvent
                         {
-                            struct kevent& event = m_events[i];
-                            int fd = (int)event.ident;
-                            auto it = std::find(m_sockets.begin(), m_sockets.end(), fd);
-                            assert(it != m_sockets.end());
-                            Socket socket = it->socket;
-                            int flags = it->flags;
+                            Socket socket;
+                            int flags;
+                            int filter;
+                            unsigned evflags;
+                        };
+                        std::vector<ReadyEvent> ready;
+                        if (nev > 0)
+                        {
+                            ready.reserve(static_cast<size_t>(nev));
+                        }
 
-                            LOG_TRACE("Handling socket 0x%x active flags 0x%x (armed 0x%x)", static_cast<int>(socket),
-                                event.flags, event.fflags);
+                        {
+                            LOCKGUARD(m_sockets_mutex);
+                            for (int i = 0; i < nev; i++)
+                            {
+                                struct kevent& event = m_events[i];
+                                int fd = (int)event.ident;
+                                auto it = std::find(m_sockets.begin(), m_sockets.end(), fd);
+                                if (it == m_sockets.end())
+                                    continue;
 
-                            if (event.filter == EVFILT_READ)
+                                LOG_TRACE("Handling socket 0x%x active flags 0x%x (armed 0x%x)",
+                                    static_cast<int>(it->socket), event.flags, event.fflags);
+
+                                ready.push_back(
+                                    { it->socket, it->flags, event.filter, static_cast<unsigned>(event.flags) });
+
+                                // Perform close-related state cleanup under the lock;
+                                // the onSocketClosed callback itself is deferred below.
+                                if (event.filter != EVFILT_READ && event.filter != EVFILT_WRITE &&
+                                    ((event.flags & EV_EOF) || (event.flags & EV_ERROR)))
+                                {
+                                    it->flags = Closed;
+                                    struct kevent kevt;
+                                    EV_SET(&kevt, event.ident, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+                                    if (-1 == kevent(kq, &kevt, 1, NULL, 0, NULL))
+                                    {
+                                        LOG_ERROR("cannot delete fd=0x%x from kqueue!", event.ident);
+                                    }
+                                    EV_SET(&kevt, event.ident, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+                                    if (-1 == kevent(kq, &kevt, 1, NULL, 0, NULL))
+                                    {
+                                        LOG_ERROR("cannot delete fd=0x%x from kqueue!", event.ident);
+                                    }
+                                }
+                            }
+                        }
+
+                        for (const auto& readyEvent : ready)
+                        {
+                            Socket socket = readyEvent.socket;
+                            int flags = readyEvent.flags;
+
+                            if (readyEvent.filter == EVFILT_READ)
                             {
                                 if (flags & Acceptable)
                                 {
@@ -1412,7 +1462,7 @@ namespace net
                                 continue;
                             }
 
-                            if (event.filter == EVFILT_WRITE)
+                            if (readyEvent.filter == EVFILT_WRITE)
                             {
                                 if (flags & Writable)
                                 {
@@ -1421,22 +1471,9 @@ namespace net
                                 continue;
                             }
 
-                            if ((event.flags & EV_EOF) || (event.flags & EV_ERROR))
+                            if ((readyEvent.evflags & EV_EOF) || (readyEvent.evflags & EV_ERROR))
                             {
-                                LOG_TRACE("event.filter=%s", "EVFILT_WRITE");
                                 m_callback.onSocketClosed(socket);
-                                it->flags = Closed;
-                                struct kevent kevt;
-                                EV_SET(&kevt, event.ident, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-                                if (-1 == kevent(kq, &kevt, 1, NULL, 0, NULL))
-                                {
-                                    LOG_ERROR("cannot delete fd=0x%x from kqueue!", event.ident);
-                                }
-                                EV_SET(&kevt, event.ident, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-                                if (-1 == kevent(kq, &kevt, 1, NULL, 0, NULL))
-                                {
-                                    LOG_ERROR("cannot delete fd=0x%x from kqueue!", event.ident);
-                                }
                                 continue;
                             }
                             LOG_ERROR("Reactor: unhandled kevent!");

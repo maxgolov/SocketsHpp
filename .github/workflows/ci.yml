@@ -48,9 +48,10 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install cmake ninja googletest
 
-      - name: Install Windows dependencies
-        if: runner.os == 'Windows'
-        run: vcpkg install gtest:x64-windows nlohmann-json:x64-windows
+      # Windows resolves its dependencies (gtest, nlohmann-json, ...) through the
+      # vcpkg manifest (vcpkg.json). The CMake toolchain below auto-installs them
+      # in manifest mode during Configure, so no explicit `vcpkg install` step is
+      # needed (and explicit package arguments are rejected in manifest mode).
 
       - name: Configure Linux
         if: runner.os == 'Linux'
