@@ -3,7 +3,7 @@
   "type": "module",
   "main": "server.ts",
   "devDependencies": {
-    "tsx": "^4.7.0",
+    "tsx": "^4.23.13",
     "dotenv": "^16.3.1"
   }
 }
