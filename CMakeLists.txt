@@ -41,6 +41,7 @@ include(cmake/target-arch.cmake)
 # Autodetect dependencies from vcpkg if available
 include(cmake/detect-vcpkg.cmake)
 
+option(BUILD_TESTING "Build SocketsHpp tests" OFF)
 include(CTest)
 
 include_directories(include)
@@ -64,14 +65,18 @@ else()
 endif()
 
 # Find BS thread pool header
-find_path(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS "BS_thread_pool.hpp")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/BS_thread_pool.hpp")
+    set(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/external")
+else()
+    find_path(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS "BS_thread_pool.hpp")
+endif()
 if(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS)
     include_directories(${BSHOSHANY_THREAD_POOL_INCLUDE_DIRS})
     message(STATUS "Found BS thread pool: ${BSHOSHANY_THREAD_POOL_INCLUDE_DIRS}")
 endif()
 
-find_package(GTest)
-if (GTest_FOUND)
+if(BUILD_TESTING)
+    find_package(GTest CONFIG REQUIRED)
   add_subdirectory(test)
 endif()
 

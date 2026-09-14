@@ -538,12 +538,9 @@ cd build/windows-x64  # or build/linux-x64, build/linux-arm64
 ctest --output-on-failure
 ```
 
-Test coverage:
-- **71 unit tests** for new features (proxy, auth, compression, MCP, SSE, JSON-RPC)
-- **160 functional tests** for core networking and HTTP
-- **100% pass rate** on Windows x64, Linux x64, and Linux ARM64
-- **231 tests on Windows** (48 Windows-specific tests)
-- **183 tests on Linux/ARM64** (cross-platform core)
+Test coverage is exercised by the GitHub Actions matrix on Ubuntu GCC/Clang,
+macOS Clang, and Windows MSVC. Run `ctest --test-dir build --output-on-failure`
+locally to see the current discovered test count and results.
 
 ## Documentation
 
