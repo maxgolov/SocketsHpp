@@ -90,6 +90,30 @@ TEST(HttpMethodsTest, AcceptsMethod)
     EXPECT_FALSE(req.accepts("text/html"));
 }
 
+// accepts() parses media ranges: no substring matches, q=0 excludes, the most
+// specific range decides, names compare case-insensitively.
+TEST(HttpMethodsTest, AcceptsParsesMediaRanges)
+{
+    HttpRequest req;
+    req.headers["Accept"] = "application/json-seq";
+    EXPECT_FALSE(req.accepts("application/json"));
+
+    req.headers["Accept"] = "text/html;q=0, application/json";
+    EXPECT_FALSE(req.accepts("text/html"));
+    EXPECT_TRUE(req.accepts("application/json"));
+
+    req.headers["Accept"] = "*/*, text/event-stream;q=0";
+    EXPECT_FALSE(req.accepts("text/event-stream"));
+    EXPECT_TRUE(req.accepts("text/plain"));
+
+    req.headers["Accept"] = "text/*;q=0, text/plain;q=0.5";
+    EXPECT_TRUE(req.accepts("text/plain"));
+    EXPECT_FALSE(req.accepts("text/html"));
+
+    req.headers["Accept"] = "Application/JSON; charset=utf-8";
+    EXPECT_TRUE(req.accepts("application/json"));
+}
+
 // Test query parsing with no query string
 TEST(HttpMethodsTest, NoQueryString)
 {

@@ -1,293 +1,120 @@
 # SocketsHpp vcpkg Port
 
-This directory contains the vcpkg port overlay for SocketsHpp, enabling easy installation and consumption of the library through the vcpkg package manager.
+This directory is a vcpkg port for SocketsHpp. It is not in the official vcpkg
+registry; use it as an **overlay port**.
 
-## Port Structure
+## Files
 
-```
-ports/socketshpp/
-├── vcpkg.json      # Port manifest with metadata and dependencies
-├── portfile.cmake  # Build instructions for vcpkg
-└── usage           # Post-installation usage instructions
-```
+| File | Purpose |
+|------|---------|
+| `vcpkg.json` | Port manifest: name `socketshpp`, version, dependencies, `jwt` feature, `supports` |
+| `portfile.cmake` | Downloads the sources from GitHub (`maxgolov/SocketsHpp` at the `REF` in the file), configures with tests and examples off, installs headers and the CMake package |
+| `usage` | Text vcpkg prints after installation |
 
-## Files Overview
+## Dependencies and features
 
-### vcpkg.json
-Defines the port metadata:
-- **Name**: `socketshpp`
-- **Version**: `1.0.0`
-- **Description**: Lean header-only C++17 networking library
-- **Dependencies**:
-  - `nlohmann-json` (JSON parsing)
-  - `cpp-jwt` (JWT authentication)
-  - `bshoshany-thread-pool` (optional multi-threading)
-  - `vcpkg-cmake` (build system)
-  - `vcpkg-cmake-config` (CMake package config)
+| Dependency | Kind |
+|------------|------|
+| `nlohmann-json` | required |
+| `bshoshany-thread-pool` (>= 5.0.0) | required: `http_server.h` always includes `BS_thread_pool.hpp` (v5 API) |
+| `vcpkg-cmake`, `vcpkg-cmake-config` | host tools used by the portfile |
+| `jwt-cpp` | only with the `jwt` feature |
 
-### portfile.cmake
-Implements the installation process:
-1. Downloads source from GitHub (`maxgolov/SocketsHpp`)
-2. Installs headers to `include/SocketsHpp/`
-3. Removes unnecessary library directories
-4. Configures CMake package detection
-5. Installs usage documentation
+The `jwt` feature makes the exported `SocketsHpp::SocketsHpp` target link jwt-cpp and
+define `SOCKETSHPP_HAS_JWT_CPP`, enabling JWT (HS256) validation in the MCP server.
 
-### usage
-Post-installation instructions shown to users:
-- CMake `find_package()` usage
-- Linking instructions
-- Dependency information
+Because the thread pool comes from the `bshoshany-thread-pool` port, the portfile
+configures SocketsHpp with `-DSOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL=OFF`.
 
-## Using the Port Overlay
+## Platform support
 
-### Method 1: Local Development (Overlay Ports)
+The library is header-only and has no architecture-specific code. The port supports
+every triplet except UWP (`"supports": "!uwp"`), including x64 and ARM64 on Windows,
+Linux and macOS.
 
-Install SocketsHpp from the local repository:
+## Using the overlay port
 
-**Windows (PowerShell):**
-```powershell
-vcpkg install socketshpp --overlay-ports=./ports
-```
+### Manifest mode
 
-**Linux/macOS (Bash):**
-```bash
-vcpkg install socketshpp --overlay-ports=./ports
-```
+Your project's `vcpkg.json`:
 
-### Method 2: Manifest Mode (Recommended)
-
-Add to your project's `vcpkg.json`:
 ```json
 {
   "name": "my-project",
   "version": "1.0.0",
-  "dependencies": ["socketshpp"],
-  "vcpkg-configuration": {
-    "overlay-ports": ["path/to/SocketsHpp/ports"]
-  }
+  "dependencies": [ "socketshpp" ]
 }
 ```
 
-Then build with CMake:
+For JWT support use `{ "name": "socketshpp", "features": [ "jwt" ] }` as the
+dependency instead.
+
+Point vcpkg at the overlay, either on the CMake command line:
+
 ```bash
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake
+cmake -S . -B build \
+  -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+  -DVCPKG_OVERLAY_PORTS=/path/to/SocketsHpp/ports
 cmake --build build
 ```
 
-### Method 3: Git URL Registry
+or in a `vcpkg-configuration.json` next to your `vcpkg.json`:
 
-Add a registry to your `vcpkg-configuration.json`:
 ```json
 {
-  "registries": [
-    {
-      "kind": "git",
-      "repository": "https://github.com/maxgolov/SocketsHpp",
-      "baseline": "main",
-      "packages": ["socketshpp"]
-    }
-  ]
+  "overlay-ports": [ "/path/to/SocketsHpp/ports" ]
 }
 ```
 
-## CMake Integration
+### Classic mode
 
-After installing via vcpkg, use in your CMakeLists.txt:
+```bash
+vcpkg install socketshpp --overlay-ports=/path/to/SocketsHpp/ports
+vcpkg install "socketshpp[jwt]" --overlay-ports=/path/to/SocketsHpp/ports
+```
+
+`--overlay-ports` is a vcpkg command-line option; with CMake use
+`VCPKG_OVERLAY_PORTS` as shown above.
+
+### CMake
 
 ```cmake
 find_package(SocketsHpp CONFIG REQUIRED)
 target_link_libraries(your-target PRIVATE SocketsHpp::SocketsHpp)
 ```
 
-## What Are Overlay Ports?
+The target provides the include directories, C++17, threads and `ws2_32` on Windows,
+and attaches `nlohmann_json::nlohmann_json` when it is found. Nothing else needs to be
+linked.
 
-Overlay ports are **local port definitions** that override vcpkg's official registry without requiring forks or pull requests. Key points:
-
-- **No forking required**: Overlay ports live in your project, not in microsoft/vcpkg
-- **Take priority**: When a package name matches both an overlay and official registry, the overlay wins
-- **Temporary or permanent**: Use for local modifications, private libraries, or testing before submitting upstream
-- **Not versioned**: Overlay ports don't participate in vcpkg's versioning system
-
-### When to Use Overlay Ports
-
-✅ **Use overlay ports for:**
-- Private/proprietary libraries not suitable for public registry
-- Temporary modifications while waiting for upstream fixes
-- Testing custom patches before submitting to vcpkg
-- Internal company libraries
-- Rapid prototyping of package changes
-
-❌ **Don't use overlay ports for:**
-- Public libraries that should be in the official registry (submit a PR instead)
-- Sharing packages across teams (use a custom Git registry instead)
-- Long-term version tracking (use a custom Git registry)
-
-## Platform Support
-
-The port currently supports:
-- ✅ Windows (x64, ARM64)
-- ✅ Linux (x64, ARM64)
-- ✅ macOS (x64, ARM64)
-- ❌ UWP (Universal Windows Platform) - explicitly excluded
-- ❌ ARM 32-bit - explicitly excluded
-
-Platform restrictions are defined in `vcpkg.json`:
-```json
-"supports": "!(uwp | arm)"
-```
-
-## Triplet Considerations
-
-### Windows Triplets
-- `x64-windows` - Dynamic linking (DLL)
-- `x64-windows-static` - Static linking
-- `x64-windows-static-md` - Static linking with dynamic MSVC runtime
-
-**Recommended**: `x64-windows-static-md` for most Windows projects
-
-### Linux Triplets
-- `x64-linux` - Default dynamic linking
-- `x64-linux-static` - Static linking
-- `arm64-linux` - ARM64 support
-
-### macOS Triplets
-- `x64-osx` - Intel Macs
-- `arm64-osx` - Apple Silicon (M1/M2/M3)
-
-## Build Features
-
-The port does NOT expose build features (e.g., threading, compression) because:
-- SocketsHpp is header-only - features are controlled at compile-time
-- Dependencies (thread-pool, cpp-jwt, nlohmann-json) are always available
-- Users can opt-in to features by including specific headers
+A complete consumer project is in
+[examples/11-vcpkg-consumption](../../examples/11-vcpkg-consumption/).
 
 ## Troubleshooting
 
-### Port not found
-**Error**: `error: package 'socketshpp' not found`
-**Solution**: Ensure you're using `--overlay-ports=./ports` or have configured the registry correctly
+| Symptom | Fix |
+|---------|-----|
+| `error: package 'socketshpp' not found` / no port named `socketshpp` | The overlay is not configured: pass `-DVCPKG_OVERLAY_PORTS=...` (manifest) or `--overlay-ports=...` (classic), using an absolute path to the `ports` directory. |
+| `Could not find a package configuration file provided by "SocketsHpp"` | Configure with the vcpkg toolchain file. |
+| Download or hash mismatch while building the port | The port downloads the `REF` from `portfile.cmake`; its `SHA512` must match that archive (vcpkg prints the actual hash). |
 
-### Dependency conflicts
-**Error**: Version conflicts with nlohmann-json or other packages
-**Solution**: Use vcpkg's version constraints in your `vcpkg.json`:
-```json
-{
-  "dependencies": [
-    {
-      "name": "socketshpp",
-      "version>=": "1.0.0"
-    }
-  ]
-}
-```
+## Maintainer notes
 
-### CMake can't find package
-**Error**: `Could not find a package configuration file provided by "SocketsHpp"`
-**Solution**: Ensure you're using the vcpkg toolchain file:
-```bash
-cmake -DCMAKE_TOOLCHAIN_FILE=[vcpkg]/scripts/buildsystems/vcpkg.cmake
-```
+To release a new version:
 
-### Header-only library linking errors
-**Error**: Linker errors about missing symbols
-**Solution**: SocketsHpp is header-only. Link platform libraries:
-```cmake
-# Windows
-target_link_libraries(your-target PRIVATE ws2_32)
+1. Update `version` in `vcpkg.json` (and in the top-level `CMakeLists.txt` project
+   version).
+2. Point `REF` in `portfile.cmake` at the release tag or commit and update `SHA512`
+   (vcpkg reports the expected value on the first install attempt).
+3. Install through the overlay on Windows, Linux and macOS and build
+   `examples/11-vcpkg-consumption`.
 
-# Linux
-target_link_libraries(your-target PRIVATE pthread)
-```
+To submit the port to the official registry, copy it to `ports/socketshpp/` in a
+fork of [microsoft/vcpkg](https://github.com/microsoft/vcpkg), run
+`vcpkg x-add-version socketshpp`, and open a pull request.
 
-## Testing
+## References
 
-The port includes an example demonstrating consumption:
-```bash
-cd examples/11-vcpkg-consumption
-./setup-windows.ps1  # Windows
-./setup-linux.sh     # Linux/macOS
-```
-
-This example:
-1. Installs SocketsHpp via overlay ports
-2. Builds a simple HTTP server
-3. Runs the server on http://localhost:9000
-4. Demonstrates `find_package()` integration
-
-## License
-
-The vcpkg port follows SocketsHpp's licensing (Apache-2.0).
-
-## Contributing
-
-To improve the port:
-1. Test on your platform/configuration
-2. Report issues via GitHub Issues
-3. Submit PRs with fixes/improvements
-4. Update documentation as needed
-
-## Resources
-
-- [vcpkg Documentation](https://vcpkg.io/en/docs/README.html)
-- [Creating Ports](https://vcpkg.io/en/docs/examples/packaging-github-repos.html)
-- [Manifest Mode](https://vcpkg.io/en/docs/users/manifests.html)
-- [Versioning](https://vcpkg.io/en/docs/users/versioning.html)
-- [Overlay Ports](https://vcpkg.io/en/docs/specifications/ports-overlay.html)
-
-## Maintainer Notes
-
-### Updating Dependencies
-
-When SocketsHpp updates its dependencies:
-1. Update `vcpkg.json` dependencies array
-2. Test on all supported platforms
-3. Update this README if new features are added
-
-### Release Checklist
-
-Before creating a new release:
-- [ ] Update version in `vcpkg.json`
-- [ ] Update `REF` in `portfile.cmake` to new tag/commit
-- [ ] Test installation on Windows, Linux, macOS
-- [ ] Verify examples still build
-- [ ] Update `SHA512` hash (vcpkg will calculate on first install)
-- [ ] Document breaking changes in release notes
-- [ ] Create GitHub release
-
-### Submitting to Official vcpkg Registry (Optional)
-
-If SocketsHpp becomes widely used, we may submit it to the official vcpkg registry:
-
-1. Fork [microsoft/vcpkg](https://github.com/microsoft/vcpkg)
-2. Copy port files to `ports/socketshpp/`
-3. Run `./vcpkg x-add-version socketshpp` to update version database
-4. Submit PR with title `[socketshpp] new port`
-5. Pass vcpkg CI checks and code review
-
-**Note**: This is NOT required for users to consume SocketsHpp - overlay ports work perfectly for local/private use!
-
-### CI/CD Integration
-
-Consider adding to your CI:
-```yaml
-# GitHub Actions example
-- name: Install via vcpkg
-  run: |
-    vcpkg install socketshpp --overlay-ports=./ports
-    
-- name: Build example
-  run: |
-    cd examples/11-vcpkg-consumption
-    cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
-    cmake --build build
-```
-
-## Future Enhancements
-
-Potential improvements:
-- [ ] Add to official vcpkg registry
-- [ ] Support more platforms (FreeBSD, Android NDK)
-- [ ] Add build features for optional components
-- [ ] Create additional examples for specific use cases
-- [ ] Automated testing via vcpkg CI
+- [Overlay ports](https://learn.microsoft.com/vcpkg/concepts/overlay-ports)
+- [Manifest mode](https://learn.microsoft.com/vcpkg/concepts/manifest-mode)
+- [Packaging a GitHub repository](https://learn.microsoft.com/vcpkg/get_started/get-started-packaging)

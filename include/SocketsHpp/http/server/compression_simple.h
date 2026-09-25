@@ -3,8 +3,13 @@
 #pragma once
 
 #include <SocketsHpp/http/server/compression.h>
-#include <vector>
+#include <cstdint>
+#include <algorithm>
 #include <cstring>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 
 namespace SOCKETSHPP_NS::http::server::compression {
 
@@ -23,6 +28,8 @@ class SimpleRLE
 public:
     /**
      * @brief Compress using Run-Length Encoding.
+     * @param input Data to compress
+     * @return RLE pairs (up to twice the input size); empty for empty input
      */
     static std::vector<uint8_t> compress(const std::vector<uint8_t>& input, int /*level*/)
     {
@@ -59,9 +66,21 @@ public:
     }
 
     /**
-     * @brief Decompress RLE data.
+     * @brief Decompress RLE data without an output size limit.
+     * @throws std::runtime_error if @p input is empty or has odd length
      */
     static std::vector<uint8_t> decompress(const std::vector<uint8_t>& input)
+    {
+        return decompress(input, (std::numeric_limits<size_t>::max)());
+    }
+
+    /**
+     * @brief Decompress RLE data, refusing to produce more than maxOutputSize bytes.
+     * @throws std::runtime_error if @p input is empty or has odd length (so the
+     *         empty output of compress() for empty input does not round-trip)
+     * @throws std::length_error if the output would exceed maxOutputSize
+     */
+    static std::vector<uint8_t> decompress(const std::vector<uint8_t>& input, size_t maxOutputSize)
     {
         if (input.empty() || input.size() % 2 != 0)
         {
@@ -69,12 +88,17 @@ public:
         }
 
         std::vector<uint8_t> output;
-        output.reserve(input.size() * 2); // Estimate
+        output.reserve((std::min)(input.size() * 2, maxOutputSize)); // Estimate
 
         for (size_t i = 0; i + 1 < input.size(); i += 2)
         {
             uint8_t count = input[i];
             uint8_t value = input[i + 1];
+
+            if (count > maxOutputSize - output.size())
+            {
+                throw std::length_error("RLE output exceeds size limit");
+            }
 
             for (uint8_t j = 0; j < count; j++)
             {
@@ -92,11 +116,13 @@ public:
 class IdentityCompression
 {
 public:
+    /// @brief Return @p input unchanged (the level is ignored).
     static std::vector<uint8_t> compress(const std::vector<uint8_t>& input, int /*level*/)
     {
         return input; // No compression
     }
 
+    /// @brief Return @p input unchanged.
     static std::vector<uint8_t> decompress(const std::vector<uint8_t>& input)
     {
         return input; // No decompression
@@ -104,7 +130,10 @@ public:
 };
 
 /**
- * @brief Register simple compression strategies for testing.
+ * @brief Register simple compression strategies for testing: "rle" (SimpleRLE,
+ *        with a bounded decompressor) and "identity" (IdentityCompression) in
+ *        CompressionRegistry::instance(), replacing existing entries of those names.
+ * @note Not thread-safe (see CompressionRegistry).
  */
 inline void registerSimpleCompression()
 {
@@ -120,6 +149,9 @@ inline void registerSimpleCompression()
             return SimpleRLE::decompress(input);
         }
     );
+    rleStrategy->decompressBounded = [](const std::vector<uint8_t>& input, size_t maxOutputSize) {
+        return SimpleRLE::decompress(input, maxOutputSize);
+    };
     CompressionRegistry::instance().registerStrategy(rleStrategy);
 
     // Identity (no compression) - useful for testing

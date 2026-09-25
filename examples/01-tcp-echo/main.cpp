@@ -29,7 +29,12 @@ int main()
 
         // Connect to server at localhost:40000
         std::cout << "Connecting to 127.0.0.1:40000..." << std::endl;
-        client.connect(SocketAddr{"127.0.0.1:40000"});
+        if (!client.connect(SocketAddr{"127.0.0.1:40000"}))
+        {
+            std::cerr << "Connection failed - is the echo server running?" << std::endl;
+            client.close();
+            return 1;
+        }
         std::cout << "Connected!" << std::endl;
 
         // Create sample data (1MB buffer with repeated pattern)

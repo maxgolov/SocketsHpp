@@ -10,15 +10,13 @@
       "platform": "!arm64"
     },
     "nlohmann-json",
-    "cpp-jwt",
     "bshoshany-thread-pool"
   ],
   "features": {
-    "mcp": {
-      "description": "Model Context Protocol support",
+    "jwt": {
+      "description": "JWT bearer-token validation in the MCP server (jwt-cpp)",
       "dependencies": [
-        "nlohmann-json",
-        "cpp-jwt"
+        "jwt-cpp"
       ]
     }
   }

@@ -1,78 +1,66 @@
 # Authenticated API Server
 
-This example demonstrates the authentication framework with multiple strategies working together.
+Protects routes with Bearer tokens and API keys. The checks are written directly in
+the route handlers (a `checkAuth()` helper looks the credential up in two in-memory
+maps); the example does not use the library's `authentication.h` strategies.
 
 ## Features
 
-- Bearer token authentication (OAuth 2.0 style)
-- API key authentication (custom headers)
-- HTTP Basic authentication
-- Multi-strategy support (tries all strategies)
-- Authentication middleware
-- Protected and public endpoints
+- Public page at `/` (which, as a prefix route, also answers any unknown path)
+- `GET /api/user` and `GET /api/service`, each accepting **either** a valid
+  `Authorization: Bearer <token>` **or** a valid `X-API-Key: <key>` header
+- 401 with a JSON error body otherwise (`/api/user` also sends
+  `WWW-Authenticate: Bearer`)
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake --build build --target authenticated-api
 ```
 
 ## Running
 
 ```bash
-./authenticated-api
+./build/examples/07-authentication/authenticated-api
 ```
 
-The server will listen on `http://localhost:8080`.
+The server listens on port 8080 on all IPv4 interfaces.
 
 ## Testing
 
-### Public endpoint (no auth)
 ```bash
-curl http://localhost:8080/public
+# Public page
+curl http://localhost:8080/
+
+# Bearer token
+curl -H "Authorization: Bearer secret_token_123" http://localhost:8080/api/user
+# {"user": "user1", "endpoint": "/api/user"}
+
+# API key
+curl -H "X-API-Key: api_key_abc" http://localhost:8080/api/service
+# {"service": "service1", "endpoint": "/api/service"}
+
+# No credentials: 401
+curl -i http://localhost:8080/api/user
 ```
 
-### Bearer token authentication
-```bash
-curl -H "Authorization: Bearer secret_token_123" \
-     http://localhost:8080/api/user
-```
+## Valid credentials
 
-### API key authentication
-```bash
-curl -H "X-API-Key: api_key_abc" \
-     http://localhost:8080/api/user
-```
+| Kind | Value | Identity |
+|------|-------|----------|
+| Bearer token | `secret_token_123` | `user1` |
+| Bearer token | `admin_token_456` | `admin` |
+| API key | `api_key_abc` | `service1` |
+| API key | `api_key_xyz` | `service2` |
 
-### HTTP Basic authentication
-```bash
-curl -u alice:password123 \
-     http://localhost:8080/api/user
-```
+There is no Basic authentication and no admin-only route in this example.
 
-### Admin endpoint (requires admin token)
-```bash
-curl -H "Authorization: Bearer admin_token_456" \
-     http://localhost:8080/api/admin
-```
+## Using the library's authentication helpers
 
-### Unauthorized request (should fail with 401)
-```bash
-curl http://localhost:8080/api/user
-```
-
-## Valid Credentials
-
-**Bearer Tokens:**
-- `secret_token_123` → user1
-- `admin_token_456` → admin
-
-**API Keys:**
-- `api_key_abc` → service1
-- `api_key_xyz` → service2
-
-**Basic Auth:**
-- alice:password123
-- bob:securepass
+`SocketsHpp/http/server/authentication.h` provides `BearerTokenAuth`, `ApiKeyAuth`,
+`BasicAuth` and `AuthenticationMiddleware`, which tries strategies in order and fills
+in the 401 response (JSON body and `WWW-Authenticate` challenges). The
+[main README](../../README.md#authentication) shows how to call it from a route.

@@ -18,6 +18,9 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <chrono>
+#include <ctime>
+#include <thread>
 
 using namespace SOCKETSHPP_NS::http::server;
 using namespace SOCKETSHPP_NS::utils;
@@ -31,6 +34,7 @@ int main()
     try
     {
         HttpServer server("0.0.0.0", 8080);
+        server.enableThreadPool(4);  // SSE stream callbacks may block between events
         std::cout << "MCP Server starting on http://localhost:8080" << std::endl;
 
         // Configure CORS for web-based MCP clients (note: CorsConfig not in current API, manual headers)
@@ -88,9 +92,10 @@ int main()
                     }
                 }
             })";
-            res.send_chunk(init.format());
-
-            // Send welcome tool list
+            // Stream the messages with send_chunk_stream(): the callback is called
+            // repeatedly and each returned chunk is sent immediately ("" ends the stream).
+            // It runs on the thread pool, so the pauses between pings don't block
+            // other clients.
             SSEEvent tools;
             tools.event = "message";
             tools.id = "2";
@@ -112,20 +117,31 @@ int main()
                     ]
                 }
             })";
-            res.send_chunk(tools.format());
 
-            // Keep connection alive with periodic pings
-            for (int i = 0; i < 5; i++) {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                
-                SSEEvent ping;
-                ping.event = "ping";
-                ping.data = std::to_string(std::time(nullptr));
-                res.send_chunk(ping.format());
-            }
-
-            std::cout << "MCP session ended: " << session_id << std::endl;
-            return 0;
+            int step = 0;
+            res.send_chunk_stream(
+                [step, init, tools]() mutable -> std::string {
+                    switch (step++)
+                    {
+                    case 0:
+                        return init.format();   // initialization message
+                    case 1:
+                        return tools.format();  // welcome tool list
+                    default:
+                        if (step > 7)
+                        {
+                            return "";  // end of stream after 5 pings
+                        }
+                        // Keep the connection alive with periodic pings
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        SSEEvent ping;
+                        ping.event = "ping";
+                        ping.data = std::to_string(std::time(nullptr));
+                        return ping.format();
+                    }
+                },
+                [session_id]() { std::cout << "MCP session ended: " << session_id << std::endl; });
+            return 200;
         });
 
         // DELETE handler for session cleanup

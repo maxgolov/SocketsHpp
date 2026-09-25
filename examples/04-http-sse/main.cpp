@@ -23,6 +23,9 @@ int main()
     try
     {
         HttpServer server("0.0.0.0", 8080);
+        // Stream callbacks may block (they sleep between events); running them on a
+        // worker pool keeps the server responsive to other clients.
+        server.enableThreadPool(4);
         std::cout << "SSE Server starting on http://localhost:8080" << std::endl;
 
         // Serve a simple HTML page with SSE client
@@ -62,71 +65,80 @@ int main()
 </body>
 </html>
             )");
-            return 0;
+            return 200;
         });
 
-        // SSE endpoint - streams events to clients
-        server.route("/events", [](const HttpRequest& req, HttpResponse& res) -> int {
-            // Set SSE headers
+        // SSE endpoint - streams events to clients.
+        //
+        // Streaming works by handing the server a callback via send_chunk_stream():
+        // it is invoked repeatedly, each returned string is sent to the client right
+        // away, and returning an empty string ends the stream. (Writing events with
+        // send_chunk() in a loop would only buffer them into one response.)
+        server.route("/events", [](const HttpRequest&, HttpResponse& res) -> int {
             res.set_header("Content-Type", "text/event-stream");
-            res.set_header("Cache-Control", "no-cache");
-            res.set_header("Connection", "keep-alive");
-
             std::cout << "Client connected to SSE stream" << std::endl;
 
-            // Send events periodically
-            for (int i = 0; i < 10; i++)
-            {
-                // Standard event
-                SSEEvent event;
-                event.data = "Event #" + std::to_string(i + 1) + 
-                           " at " + std::to_string(std::time(nullptr));
-                event.id = std::to_string(i + 1);
-                
-                res.send_chunk(event.format());
-                std::cout << "Sent event #" << (i + 1) << std::endl;
-
-                // Every 3rd event, send a custom event
-                if ((i + 1) % 3 == 0)
-                {
-                    SSEEvent custom;
-                    custom.event = "custom";
-                    custom.data = "This is a custom event type!";
-                    custom.id = std::to_string(i + 1) + "-custom";
-                    res.send_chunk(custom.format());
-                }
-
-                // Wait 1 second between events
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-
-            // Send completion message
-            SSEEvent done;
-            done.data = "Stream complete";
-            done.event = "done";
-            res.send_chunk(done.format());
-
-            std::cout << "SSE stream completed" << std::endl;
-            return 0;
+            int sent = 0;
+            res.send_chunk_stream(
+                [sent]() mutable -> std::string {
+                    if (sent == 10)
+                    {
+                        SSEEvent done = SSEEvent::custom("done", "Stream complete");
+                        ++sent;
+                        return done.format();
+                    }
+                    if (sent > 10)
+                    {
+                        return "";  // end of stream
+                    }
+                    if (sent > 0)
+                    {
+                        // Runs on a thread-pool worker, so waiting here does not
+                        // block other clients.
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
+                    ++sent;
+                    std::string chunk = SSEEvent::message("Event #" + std::to_string(sent) + " at " +
+                                                              std::to_string(std::time(nullptr)),
+                                                          std::to_string(sent))
+                                            .format();
+                    // Every 3rd event, also send a custom event type
+                    if (sent % 3 == 0)
+                    {
+                        chunk += SSEEvent::custom("custom", "This is a custom event type!",
+                                                  std::to_string(sent) + "-custom")
+                                     .format();
+                    }
+                    std::cout << "Sent event #" << sent << std::endl;
+                    return chunk;
+                },
+                []() { std::cout << "SSE stream completed" << std::endl; });
+            return 200;
         });
 
         // JSON SSE endpoint - demonstrates structured data
-        server.route("/json-events", [](const HttpRequest& req, HttpResponse& res) -> int {
+        server.route("/json-events", [](const HttpRequest&, HttpResponse& res) -> int {
             res.set_header("Content-Type", "text/event-stream");
-            res.set_header("Cache-Control", "no-cache");
 
-            for (int i = 0; i < 5; i++)
-            {
+            int count = 0;
+            res.send_chunk_stream([count]() mutable -> std::string {
+                if (count == 5)
+                {
+                    return "";  // end of stream
+                }
+                if (count > 0)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
                 SSEEvent event;
-                event.data = R"({"type":"update","count":)" + std::to_string(i) + 
-                           R"(,"timestamp":)" + std::to_string(std::time(nullptr)) + "}";
-                event.id = std::to_string(i);
+                event.data = R"({"type":"update","count":)" + std::to_string(count) +
+                             R"(,"timestamp":)" + std::to_string(std::time(nullptr)) + "}";
+                event.id = std::to_string(count);
                 event.event = "json-update";
-                
-                res.send_chunk(event.format());
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
-            return 0;
+                ++count;
+                return event.format();
+            });
+            return 200;
         });
 
         std::cout << "Server running!" << std::endl;

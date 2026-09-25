@@ -490,6 +490,71 @@ TEST(AuthenticationMiddlewareTest, OptionalAuth)
     EXPECT_NE(res.code, 401); // No 401 response
 }
 
+// --- Const request overload and 401 status --------------------------------------
+
+namespace
+{
+    std::shared_ptr<BearerTokenAuth<MockRequest>> tokenStrategy()
+    {
+        return std::make_shared<BearerTokenAuth<MockRequest>>([](const std::string& token) -> AuthResult {
+            return token == "valid-token" ? AuthResult::success("user123") : AuthResult::failure("Invalid token");
+        });
+    }
+}  // namespace
+
+TEST(AuthenticationMiddlewareTest, FailureSetsStatus401)
+{
+    AuthenticationMiddleware<MockRequest, MockResponse> middleware;
+    middleware.addStrategy(tokenStrategy());
+    MockRequest req;
+    req.headers["Authorization"] = "Bearer nope";
+    MockResponse res;
+    EXPECT_FALSE(middleware.authenticate(req, res));
+    EXPECT_EQ(res.code, 401);
+    EXPECT_FALSE(res.headers["WWW-Authenticate"].empty());
+}
+
+TEST(AuthenticationMiddlewareTest, ConstRequestOverloadReportsResult)
+{
+    AuthenticationMiddleware<MockRequest, MockResponse> middleware;
+    middleware.addStrategy(tokenStrategy());
+    bool callbackCalled = false;
+    middleware.setAuthenticatedCallback([&](MockRequest&, const AuthResult&) { callbackCalled = true; });
+
+    MockRequest mutableReq;
+    mutableReq.headers["Authorization"] = "Bearer valid-token";
+    const MockRequest& req = mutableReq;  // as received by an HttpServer handler
+    MockResponse res;
+    AuthResult result;
+    EXPECT_TRUE(middleware.authenticate(req, res, &result));
+    EXPECT_TRUE(result.authenticated);
+    EXPECT_EQ(result.userId, "user123");
+    EXPECT_EQ(res.code, 200);
+    EXPECT_FALSE(callbackCalled) << "the const overload does not invoke the callback";
+}
+
+TEST(AuthenticationMiddlewareTest, NoStrategiesButRequiredRejectsWith401)
+{
+    AuthenticationMiddleware<MockRequest, MockResponse> middleware;
+    MockRequest req;
+    MockResponse res;
+    EXPECT_FALSE(middleware.authenticate(req, res));
+    EXPECT_EQ(res.code, 401);
+}
+
+TEST(AuthenticationMiddlewareTest, OptionalAuthPassesUnauthenticatedRequests)
+{
+    AuthenticationMiddleware<MockRequest, MockResponse> middleware;
+    middleware.addStrategy(tokenStrategy());
+    middleware.setRequireAuth(false);
+    MockRequest req;
+    MockResponse res;
+    AuthResult result;
+    EXPECT_TRUE(middleware.authenticate(static_cast<const MockRequest&>(req), res, &result));
+    EXPECT_FALSE(result.authenticated);
+    EXPECT_EQ(res.code, 200);
+}
+
 int main(int argc, char** argv)
 {
     testing::InitGoogleTest(&argc, argv);

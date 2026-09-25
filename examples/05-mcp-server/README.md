@@ -1,97 +1,78 @@
-# Model Context Protocol (MCP) Server Example
+# MCP-Style SSE Transport Example
 
-A simplified MCP server implementation using HTTP+SSE transport.
+A hand-written, **simplified** imitation of an MCP HTTP+SSE transport, built directly
+on `HttpServer` routes. It does not use the library's MCP implementation and does not
+process JSON-RPC requests: the SSE stream plays back canned messages.
+
+For a working MCP server (JSON-RPC dispatch, sessions, Streamable HTTP, auth, ...) use
+`SocketsHpp::mcp::server::MCPServer`; see
+[docs/MCP_IMPLEMENTATION.md](../../docs/MCP_IMPLEMENTATION.md) and the MCP example in
+the [main README](../../README.md#mcp-server).
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake --build build --target mcp-server
 ```
 
 ## Running
 
 ```bash
-./mcp-server
+./build/examples/05-mcp-server/mcp-server
 ```
 
-## Testing
+The server listens on port 8080 on all IPv4 interfaces.
 
-### SSE Stream
+## Routes
+
+| Route | Behaviour |
+|-------|-----------|
+| `GET /sse` | SSE stream: an `initialized`-style message (id 1), a `tools/list`-style message (id 2), then five `ping` events two seconds apart, then the stream ends. Each connection gets a session id `session-<unix time>` in a global map. |
+| `OPTIONS /sse` | CORS preflight answered by the handler itself (204 with `Access-Control-Allow-*` headers) |
+| `DELETE /session` | Removes the fixed id `demo-session` from the map and returns 204 (the session id is not read from the request); `OPTIONS` also gets 204, other methods 405 |
+| `GET /info` | Static JSON metadata |
+| `POST /base64` | Returns the request body and its Base64 encoding as JSON |
+| `/` (any other path) | 404 |
+
 ```bash
 curl -N http://localhost:8080/sse
-```
-
-Output:
-```
-id: 1
-event: message
-data: {"jsonrpc": "2.0", "method": "initialized", ...}
-
-id: 2
-event: message
-data: {"jsonrpc": "2.0", "method": "tools/list", ...}
-
-event: ping
-data: 1704110400
-...
-```
-
-### Session Management
-```bash
-# Delete session
 curl -X DELETE http://localhost:8080/session
-
-# Server metadata
 curl http://localhost:8080/info
-```
-
-### Base64 Encoding
-```bash
 curl -X POST http://localhost:8080/base64 -d "Hello, MCP!"
+# {"original":"Hello, MCP!","encoded":"SGVsbG8sIE1DUCE="}
 ```
 
 ## What it demonstrates
 
-### MCP Features
-- ✅ HTTP+SSE transport layer
-- ✅ CORS configuration for web clients
-- ✅ Session management
-- ✅ DELETE method for cleanup
-- ✅ OPTIONS for CORS preflight
-- ✅ Base64 encoding utility
-- ✅ SSE event formatting
-- ⚠️ Simplified JSON-RPC (demo only)
+- SSE streaming with `send_chunk_stream()` and `SSEEvent` (multi-line `data` is split
+  into several `data:` lines)
+- `enableThreadPool(4)`, so the pauses between pings do not block other requests
+- Setting CORS headers by hand in handlers (the server also has built-in CORS support:
+  `enableCors()`, `setCorsOrigin()`, `setCorsHeaders()`)
+- Branching on `req.method` inside one route
+- `SocketsHpp::utils::base64::encode()`
 
-### SocketsHpp Features
-- `HttpServer::CorsConfig` for CORS setup
-- `SSEEvent` for Server-Sent Events
-- Method-based routing (GET, POST, DELETE, OPTIONS)
-- `base64::encode()` from utils
-- Session state management
-- Real-time message streaming
+## Expected output (curl -N /sse)
 
-## Protocol Notes
+```
+id: 1
+event: message
+data: {
+data:                 "jsonrpc": "2.0",
+data:                 "method": "initialized",
+...
 
-This example shows the **transport layer** of MCP. A production server would add:
+id: 2
+event: message
+data: {
+data:                 "jsonrpc": "2.0",
+data:                 "method": "tools/list",
+...
 
-1. **JSON-RPC 2.0 parsing** - Full request/response handling
-2. **Method dispatch** - tools/list, tools/call, prompts/list, etc.
-3. **Error handling** - JSON-RPC error codes
-4. **Authentication** - Bearer tokens or API keys
-5. **Session persistence** - Database or Redis
-6. **Connection management** - Reconnection, event replay
-7. **Rate limiting** - Request throttling
-
-## MCP Specification
-
-See https://spec.modelcontextprotocol.io/ for:
-- Full JSON-RPC message format
-- Tool/prompt/resource schemas
-- Error codes and handling
-- Security recommendations
-
-## Implementation Status
-
-See `docs/FEATURES.md` for detailed MCP feature coverage.
+event: ping
+data: 1790323647
+...
+```

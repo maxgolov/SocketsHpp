@@ -4,15 +4,38 @@
 #include <gtest/gtest.h>
 #include "sockets.hpp"
 
+#include <cstring>
+#include <string>
+#include <vector>
+
 using namespace SOCKETSHPP_NS::net::common;
 
-namespace testing
+namespace
 {
+    /// Returns true if the host is able to create sockets of the given family.
+    /// IPv6 is frequently disabled in containers and CI sandboxes.
+    bool familySupported(int af)
+    {
+        try
+        {
+            ScopedSocket probe(af, SOCK_STREAM, 0);
+            return !probe.get().invalid();
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+
+#define SKIP_IF_NO_IPV6()                                                   \
+    do                                                                      \
+    {                                                                       \
+        if (!familySupported(AF_INET6))                                     \
+            GTEST_SKIP() << "IPv6 sockets are not supported on this host"; \
+    } while (0)
+
     class SocketBasicTest : public ::testing::Test
     {
-    protected:
-        void SetUp() override {}
-        void TearDown() override {}
     };
 
     // Socket parameter tests
@@ -22,259 +45,350 @@ namespace testing
         EXPECT_EQ(params.af, AF_INET);
         EXPECT_EQ(params.type, SOCK_STREAM);
         EXPECT_EQ(params.proto, 0);
+        EXPECT_STREQ(params.scheme(), "tcp");
     }
 
     TEST_F(SocketBasicTest, SocketParams_UDP_IPv4)
     {
         SocketParams params{AF_INET, SOCK_DGRAM, 0};
-        EXPECT_EQ(params.af, AF_INET);
         EXPECT_EQ(params.type, SOCK_DGRAM);
-        EXPECT_EQ(params.proto, 0);
+        EXPECT_STREQ(params.scheme(), "udp");
     }
 
-    TEST_F(SocketBasicTest, SocketParams_TCP_IPv6)
+    TEST_F(SocketBasicTest, SocketParams_IPv6Schemes)
     {
-        SocketParams params{AF_INET6, SOCK_STREAM, 0};
-        EXPECT_EQ(params.af, AF_INET6);
-        EXPECT_EQ(params.type, SOCK_STREAM);
-        EXPECT_EQ(params.proto, 0);
+        SocketParams tcp6{AF_INET6, SOCK_STREAM, 0};
+        SocketParams udp6{AF_INET6, SOCK_DGRAM, 0};
+        EXPECT_STREQ(tcp6.scheme(), "tcp");
+        EXPECT_STREQ(udp6.scheme(), "udp");
     }
 
-    TEST_F(SocketBasicTest, SocketParams_UDP_IPv6)
+    TEST_F(SocketBasicTest, SocketParams_UnknownScheme)
     {
-        SocketParams params{AF_INET6, SOCK_DGRAM, 0};
-        EXPECT_EQ(params.af, AF_INET6);
-        EXPECT_EQ(params.type, SOCK_DGRAM);
-        EXPECT_EQ(params.proto, 0);
+        SocketParams raw{AF_INET, SOCK_RAW, 0};
+        EXPECT_STREQ(raw.scheme(), "unknown");
     }
 
 #ifdef HAVE_UNIX_DOMAIN
     TEST_F(SocketBasicTest, SocketParams_UnixDomain)
     {
         SocketParams params{AF_UNIX, SOCK_STREAM, 0};
-        EXPECT_EQ(params.af, AF_UNIX);
-        EXPECT_EQ(params.type, SOCK_STREAM);
-        EXPECT_EQ(params.proto, 0);
+        EXPECT_STREQ(params.scheme(), "unix");
     }
 #endif
 
-    // Socket creation tests
+    // Socket creation and lifecycle
     TEST_F(SocketBasicTest, CreateSocket_TCP)
     {
-        SocketParams params{AF_INET, SOCK_STREAM, 0};
-        Socket sock(params);
-        // Just verify creation doesn't crash
-        EXPECT_TRUE(true);
+        Socket sock(SocketParams{AF_INET, SOCK_STREAM, 0});
+        EXPECT_FALSE(sock.invalid());
+        sock.close();
+        EXPECT_TRUE(sock.invalid());
     }
 
     TEST_F(SocketBasicTest, CreateSocket_UDP)
     {
-        SocketParams params{AF_INET, SOCK_DGRAM, 0};
-        Socket sock(params);
-        // Just verify creation doesn't crash
-        EXPECT_TRUE(true);
-    }
-
-    // Socket address validation tests
-    TEST_F(SocketBasicTest, ValidateAddress_IPv4_Loopback)
-    {
-        SocketAddr addr("127.0.0.1:8080");
-        EXPECT_EQ(addr.toString(), "127.0.0.1:8080");
-    }
-
-    TEST_F(SocketBasicTest, ValidateAddress_IPv6_Loopback)
-    {
-        SocketAddr addr("[::1]:8080");
-        EXPECT_EQ(addr.toString(), "[::1]:8080");
-    }
-
-    // Socket state tests
-    TEST_F(SocketBasicTest, Socket_InitialState)
-    {
-        SocketParams params{AF_INET, SOCK_STREAM, 0};
-        Socket sock(params);
-        // Socket should be created but not connected
-        EXPECT_TRUE(true);
-    }
-
-    TEST_F(SocketBasicTest, Socket_CloseSocket)
-    {
-        SocketParams params{AF_INET, SOCK_STREAM, 0};
-        Socket sock(params);
+        Socket sock(SocketParams{AF_INET, SOCK_DGRAM, 0});
+        EXPECT_FALSE(sock.invalid());
         sock.close();
-        // Should close without error
-        EXPECT_TRUE(true);
+        EXPECT_TRUE(sock.invalid());
     }
 
-    TEST_F(SocketBasicTest, Socket_DoubleClose)
+    TEST_F(SocketBasicTest, CreateSocket_ExplicitProtocols)
     {
-        SocketParams params{AF_INET, SOCK_STREAM, 0};
-        Socket sock(params);
+        Socket tcp(SocketParams{AF_INET, SOCK_STREAM, IPPROTO_TCP});
+        Socket udp(SocketParams{AF_INET, SOCK_DGRAM, IPPROTO_UDP});
+        EXPECT_FALSE(tcp.invalid());
+        EXPECT_FALSE(udp.invalid());
+        tcp.close();
+        udp.close();
+    }
+
+    TEST_F(SocketBasicTest, CreateSocket_IPv6)
+    {
+        SKIP_IF_NO_IPV6();
+        Socket sock(SocketParams{AF_INET6, SOCK_STREAM, 0});
+        EXPECT_FALSE(sock.invalid());
         sock.close();
-        sock.close();  // Second close should be safe
-        EXPECT_TRUE(true);
     }
 
-    // Socket type combinations
-    TEST_F(SocketBasicTest, MultipleSocketTypes)
+    TEST_F(SocketBasicTest, CreateSocket_InvalidFamilyThrows)
     {
-        // Create different socket types
-        {
-            SocketParams params{AF_INET, SOCK_STREAM, 0};
-            Socket tcp_sock(params);
-        }
-        {
-            SocketParams params{AF_INET, SOCK_DGRAM, 0};
-            Socket udp_sock(params);
-        }
-        {
-            SocketParams params{AF_INET6, SOCK_STREAM, 0};
-            Socket tcp6_sock(params);
-        }
-        EXPECT_TRUE(true);
+        EXPECT_THROW(Socket(-1, SOCK_STREAM, 0), std::runtime_error);
     }
 
-    // Address family tests
-    TEST_F(SocketBasicTest, AddressFamily_IPv4)
+    TEST_F(SocketBasicTest, DefaultSocketIsInvalid)
     {
-        SocketParams params{AF_INET, SOCK_STREAM, 0};
-        SocketAddr addr("0.0.0.0:0");
-        Socket sock(params);
-        EXPECT_TRUE(true);
+        Socket sock;
+        EXPECT_TRUE(sock.invalid());
     }
 
-    TEST_F(SocketBasicTest, AddressFamily_IPv6)
+    TEST_F(SocketBasicTest, DoubleCloseIsSafe)
     {
-        SocketParams params{AF_INET6, SOCK_STREAM, 0};
-        SocketAddr addr("[::]:0");
-        Socket sock(params);
-        EXPECT_TRUE(true);
-    }
-
-    // Port number validation
-    TEST_F(SocketBasicTest, PortNumbers_StandardPorts)
-    {
-        std::vector<int> ports = {80, 443, 8080, 3000, 5000};
-        for (int port : ports)
-        {
-            std::string addr_str = "127.0.0.1:" + std::to_string(port);
-            SocketAddr addr(addr_str.c_str());
-            EXPECT_EQ(addr.toString(), addr_str);
-        }
-    }
-
-    TEST_F(SocketBasicTest, PortNumbers_EphemeralRange)
-    {
-        // Test ephemeral port range (typically 49152-65535)
-        std::vector<int> ports = {49152, 55000, 60000, 65535};
-        for (int port : ports)
-        {
-            std::string addr_str = "127.0.0.1:" + std::to_string(port);
-            SocketAddr addr(addr_str.c_str());
-            EXPECT_EQ(addr.toString(), addr_str);
-        }
-    }
-
-    // Socket lifecycle tests
-    TEST_F(SocketBasicTest, SocketLifecycle_CreateAndDestroy)
-    {
-        {
-            SocketParams params{AF_INET, SOCK_STREAM, 0};
-            Socket sock(params);
-            // Socket created in scope
-        }
-        // Socket should be destroyed properly
-        EXPECT_TRUE(true);
-    }
-
-    TEST_F(SocketBasicTest, SocketLifecycle_MultipleSequential)
-    {
-        for (int i = 0; i < 10; ++i)
-        {
-            SocketParams params{AF_INET, SOCK_STREAM, 0};
-            Socket sock(params);
-            sock.close();
-        }
-        EXPECT_TRUE(true);
-    }
-
-    // Protocol tests
-    TEST_F(SocketBasicTest, Protocol_TCP)
-    {
-        SocketParams params{AF_INET, SOCK_STREAM, IPPROTO_TCP};
-        Socket sock(params);
-        EXPECT_TRUE(true);
-    }
-
-    TEST_F(SocketBasicTest, Protocol_UDP)
-    {
-        SocketParams params{AF_INET, SOCK_DGRAM, IPPROTO_UDP};
-        Socket sock(params);
-        EXPECT_TRUE(true);
-    }
-
-    // Error handling tests
-    TEST_F(SocketBasicTest, ErrorHandling_InvalidSocketClose)
-    {
-        SocketParams params{AF_INET, SOCK_STREAM, 0};
-        Socket sock(params);
+        Socket sock(SocketParams{AF_INET, SOCK_STREAM, 0});
         sock.close();
-        // Closing again should not throw
         EXPECT_NO_THROW(sock.close());
+        EXPECT_TRUE(sock.invalid());
     }
 
-    // Special addresses
-    TEST_F(SocketBasicTest, SpecialAddresses_Loopback)
+    TEST_F(SocketBasicTest, MoveTransfersHandle)
     {
-        SocketAddr ipv4("127.0.0.1:1234");
-        EXPECT_EQ(ipv4.toString(), "127.0.0.1:1234");
+        Socket a(SocketParams{AF_INET, SOCK_STREAM, 0});
+        auto handle = a.m_sock;
+        Socket b(std::move(a));
+        EXPECT_TRUE(a.invalid());
+        EXPECT_EQ(b.m_sock, handle);
 
-        SocketAddr ipv6("[::1]:1234");
-        EXPECT_EQ(ipv6.toString(), "[::1]:1234");
+        Socket c;
+        c = std::move(b);
+        EXPECT_TRUE(b.invalid());
+        EXPECT_EQ(c.m_sock, handle);
+        c.close();
     }
 
-    TEST_F(SocketBasicTest, SpecialAddresses_Any)
+    TEST_F(SocketBasicTest, ManySequentialSocketsDoNotLeak)
     {
-        SocketAddr ipv4("0.0.0.0:1234");
-        EXPECT_EQ(ipv4.toString(), "0.0.0.0:1234");
-
-        SocketAddr ipv6("[::]:1234");
-        EXPECT_EQ(ipv6.toString(), "[::]:1234");
-    }
-
-    TEST_F(SocketBasicTest, SpecialAddresses_Broadcast)
-    {
-        SocketAddr broadcast("255.255.255.255:9999");
-        EXPECT_EQ(broadcast.toString(), "255.255.255.255:9999");
-    }
-
-    // Resource cleanup tests
-    TEST_F(SocketBasicTest, ResourceCleanup_ExplicitClose)
-    {
-        SocketParams params{AF_INET, SOCK_STREAM, 0};
-        Socket sock(params);
-        sock.close();
-        // Verify we can create another socket after closing
-        Socket sock2(params);
-        EXPECT_TRUE(true);
-    }
-
-    TEST_F(SocketBasicTest, ResourceCleanup_ImplicitDestructor)
-    {
-        SocketParams params{AF_INET, SOCK_STREAM, 0};
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < 256; ++i)
         {
-            Socket sock(params);
-            // Let destructor handle cleanup
+            ScopedSocket sock(AF_INET, SOCK_STREAM, 0);
+            ASSERT_FALSE(sock.get().invalid());
         }
-        EXPECT_TRUE(true);
     }
 
-}  // namespace testing
+    // ScopedSocket RAII semantics
+    TEST_F(SocketBasicTest, ScopedSocket_ReleaseTransfersOwnership)
+    {
+        Socket released;
+        {
+            ScopedSocket scoped(AF_INET, SOCK_STREAM, 0);
+            released = scoped.release();
+        }
+        // The socket must still be usable after the ScopedSocket is gone.
+        ASSERT_FALSE(released.invalid());
+        EXPECT_TRUE(released.setReuseAddr());
+        released.close();
+    }
 
+    TEST_F(SocketBasicTest, ScopedSocket_MoveAssignment)
+    {
+        ScopedSocket a(AF_INET, SOCK_STREAM, 0);
+        ScopedSocket b(AF_INET, SOCK_STREAM, 0);
+        auto handle = a.get().m_sock;
+        b = std::move(a);
+        EXPECT_EQ(b.get().m_sock, handle);
+    }
 
-int main(int argc, char **argv)
-{
-    testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+    // Socket options
+    TEST_F(SocketBasicTest, SocketOptions)
+    {
+        ScopedSocket sock(AF_INET, SOCK_STREAM, 0);
+        EXPECT_TRUE(sock.get().setReuseAddr());
+        EXPECT_TRUE(sock.get().setNoDelay());
+        EXPECT_NO_THROW(sock.get().setNonBlocking());
+    }
+
+    // Bind / listen / connect / accept round-trip over loopback
+    TEST_F(SocketBasicTest, TcpLoopbackRoundTrip)
+    {
+        ScopedSocket listener(AF_INET, SOCK_STREAM, 0);
+        ASSERT_TRUE(listener.get().setReuseAddr());
+        ASSERT_EQ(listener.get().bind(SocketAddr("127.0.0.1:0")), 0);
+        ASSERT_TRUE(listener.get().listen(1));
+
+        SocketAddr bound;
+        ASSERT_TRUE(listener.get().getsockname(bound));
+        ASSERT_GT(bound.port(), 0);
+
+        ScopedSocket client(AF_INET, SOCK_STREAM, 0);
+        ASSERT_TRUE(client.get().connect(bound));
+
+        Socket accepted;
+        SocketAddr peer;
+        ASSERT_TRUE(listener.get().accept(accepted, peer));
+        ScopedSocket server(std::move(accepted));
+        EXPECT_EQ(peer.toString().rfind("127.0.0.1:", 0), 0u);
+
+        const std::string msg = "ping";
+        ASSERT_EQ(client.get().send(msg.data(), msg.size()), static_cast<int>(msg.size()));
+
+        char buf[16] = {};
+        int n = server.get().recv(buf, sizeof(buf));
+        ASSERT_EQ(n, static_cast<int>(msg.size()));
+        EXPECT_EQ(std::string(buf, n), msg);
+
+        // Graceful shutdown is observed by the peer as EOF.
+        EXPECT_TRUE(client.get().shutdown(Socket::ShutdownSend));
+        EXPECT_EQ(server.get().recv(buf, sizeof(buf)), 0);
+    }
+
+    TEST_F(SocketBasicTest, UdpLoopbackRoundTrip)
+    {
+        ScopedSocket receiver(AF_INET, SOCK_DGRAM, 0);
+        ASSERT_EQ(receiver.get().bind(SocketAddr("127.0.0.1:0")), 0);
+        SocketAddr bound;
+        ASSERT_TRUE(receiver.get().getsockname(bound));
+
+        ScopedSocket sender(AF_INET, SOCK_DGRAM, 0);
+        const std::string msg = "datagram";
+        ASSERT_EQ(sender.get().sendto(msg.data(), msg.size(), 0, bound), static_cast<int>(msg.size()));
+
+        char buf[32] = {};
+        SocketAddr from;
+        int n = receiver.get().recvfrom(buf, sizeof(buf), 0, from);
+        ASSERT_EQ(n, static_cast<int>(msg.size()));
+        EXPECT_EQ(std::string(buf, n), msg);
+        EXPECT_EQ(from.toString().rfind("127.0.0.1:", 0), 0u);
+    }
+
+    TEST_F(SocketBasicTest, TcpLoopbackRoundTrip_IPv6)
+    {
+        SKIP_IF_NO_IPV6();
+        ScopedSocket listener(AF_INET6, SOCK_STREAM, 0);
+        if (listener.get().bind(SocketAddr("[::1]:0")) != 0)
+            GTEST_SKIP() << "IPv6 loopback is not configured on this host";
+        ASSERT_TRUE(listener.get().listen(1));
+
+        SocketAddr bound;
+        ASSERT_TRUE(listener.get().getsockname(bound));
+        ASSERT_GT(bound.port(), 0);
+
+        ScopedSocket client(AF_INET6, SOCK_STREAM, 0);
+        ASSERT_TRUE(client.get().connect(bound));
+
+        Socket accepted;
+        SocketAddr peer;
+        ASSERT_TRUE(listener.get().accept(accepted, peer));
+        ScopedSocket server(std::move(accepted));
+        EXPECT_EQ(peer.toString().rfind("[::1]:", 0), 0u);
+    }
+
+    // recvfrom() into a default-constructed SocketAddr must not truncate an
+    // IPv6 peer address (the in/out length used to be sizeof(sockaddr)).
+    TEST_F(SocketBasicTest, UdpLoopbackRoundTrip_IPv6)
+    {
+        SKIP_IF_NO_IPV6();
+        ScopedSocket receiver(AF_INET6, SOCK_DGRAM, 0);
+        if (receiver.get().bind(SocketAddr("[::1]:0")) != 0)
+            GTEST_SKIP() << "IPv6 loopback is not configured on this host";
+        SocketAddr bound;
+        ASSERT_TRUE(receiver.get().getsockname(bound));
+        ASSERT_GT(bound.port(), 0);
+
+        ScopedSocket sender(AF_INET6, SOCK_DGRAM, 0);
+        ASSERT_EQ(sender.get().bind(SocketAddr("[::1]:0")), 0);
+        SocketAddr senderAddr;
+        ASSERT_TRUE(sender.get().getsockname(senderAddr));
+
+        const std::string msg = "datagram6";
+        ASSERT_EQ(sender.get().sendto(msg.data(), msg.size(), 0, bound), static_cast<int>(msg.size()));
+
+        char buf[32] = {};
+        SocketAddr from;
+        int n = receiver.get().recvfrom(buf, sizeof(buf), 0, from);
+        ASSERT_EQ(n, static_cast<int>(msg.size()));
+        EXPECT_EQ(std::string(buf, n), msg);
+        EXPECT_EQ(from.toString(), senderAddr.toString());
+    }
+
+    namespace
+    {
+        struct TcpPair
+        {
+            ScopedSocket client{AF_INET, SOCK_STREAM, 0};
+            ScopedSocket server{Socket()};
+
+            bool open()
+            {
+                ScopedSocket listener(AF_INET, SOCK_STREAM, 0);
+                if (listener.get().bind(SocketAddr("127.0.0.1:0")) != 0 || !listener.get().listen(1))
+                    return false;
+                SocketAddr bound;
+                if (!listener.get().getsockname(bound) || !client.get().connect(bound))
+                    return false;
+                Socket accepted;
+                SocketAddr peer;
+                if (!listener.get().accept(accepted, peer))
+                    return false;
+                server = ScopedSocket(std::move(accepted));
+                return true;
+            }
+        };
+    }  // namespace
+
+    TEST_F(SocketBasicTest, WriteAllReportsWouldBlock)
+    {
+        TcpPair pair;
+        ASSERT_TRUE(pair.open());
+        pair.server.get().setNonBlocking();
+
+        // Much larger than any socket buffer; the peer never reads.
+        std::string big(32 * 1024 * 1024, 'x');
+        int err = -1;
+        size_t sent = pair.server.get().writeall(big, &err);
+        EXPECT_LT(sent, big.size());
+        EXPECT_NE(err, 0);
+        EXPECT_TRUE(Socket::isWouldBlock(err)) << "err=" << err;
+    }
+
+    TEST_F(SocketBasicTest, WriteAllReportsHardErrorAfterPeerReset)
+    {
+        TcpPair pair;
+        ASSERT_TRUE(pair.open());
+
+        // Abortive close: SO_LINGER {on, 0} makes close() send RST.
+        struct linger lg;
+        lg.l_onoff = 1;
+        lg.l_linger = 0;
+        ASSERT_EQ(::setsockopt(pair.client.get().m_sock, SOL_SOCKET, SO_LINGER,
+                      reinterpret_cast<const char*>(&lg), sizeof(lg)),
+            0);
+        pair.client.close();
+
+        // Blocking recv returns once the RST has been processed.
+        char c;
+        EXPECT_LT(pair.server.get().recv(&c, 1), 0);
+
+        std::string data(1024, 'y');
+        int err = 0;
+        size_t sent = 0;
+        // The first send after a reset may still be accepted on some stacks;
+        // a subsequent one must fail with a hard error.
+        for (int i = 0; i < 3 && err == 0; i++)
+        {
+            sent = pair.server.get().writeall(data, &err);
+        }
+        EXPECT_LT(sent, data.size());
+        EXPECT_NE(err, 0);
+        EXPECT_FALSE(Socket::isWouldBlock(err)) << "err=" << err;
+    }
+
+    TEST_F(SocketBasicTest, SendOnInvalidArgsReturnsZero)
+    {
+        ScopedSocket sock(AF_INET, SOCK_STREAM, 0);
+        EXPECT_EQ(sock.get().send(nullptr, 10), 0);
+        char c = 'x';
+        EXPECT_EQ(sock.get().send(&c, 0), 0);
+    }
+
+    // Addresses
+    TEST_F(SocketBasicTest, SpecialAddresses)
+    {
+        EXPECT_EQ(SocketAddr("127.0.0.1:1234").toString(), "127.0.0.1:1234");
+        EXPECT_EQ(SocketAddr("[::1]:1234").toString(), "[::1]:1234");
+        EXPECT_EQ(SocketAddr("0.0.0.0:1234").toString(), "0.0.0.0:1234");
+        EXPECT_EQ(SocketAddr("[::]:1234").toString(), "[::]:1234");
+        EXPECT_EQ(SocketAddr("255.255.255.255:9999").toString(), "255.255.255.255:9999");
+    }
+
+    TEST_F(SocketBasicTest, PortNumbers)
+    {
+        for (int port : {1, 80, 443, 8080, 49152, 65535})
+        {
+            std::string addr_str = "127.0.0.1:" + std::to_string(port);
+            SocketAddr addr(addr_str.c_str());
+            EXPECT_EQ(addr.toString(), addr_str);
+            EXPECT_EQ(addr.port(), port);
+        }
+    }
+
+}  // namespace

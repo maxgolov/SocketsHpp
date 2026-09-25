@@ -55,7 +55,7 @@ build/
 - **Functional tests**: TCP/UDP echo, HTTP server lifecycle, streaming (SSE, chunked), HTTP methods
 
 ### Dependencies
-- **vcpkg.json**: gtest, nlohmann-json, cpp-jwt, bshoshany-thread-pool
+- **vcpkg.json**: gtest, nlohmann-json, bshoshany-thread-pool (jwt-cpp via the optional `jwt` feature)
 - **Git submodule**: simple-uri-parser
 - **NO MANUAL INSTALLATIONS** - all dependencies managed via vcpkg or submodules
 

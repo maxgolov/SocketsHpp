@@ -1,17 +1,38 @@
 # Sockets.HPP
 
-**Modern cross-platform C++17 header-only networking library** with enterprise-grade HTTP server capabilities, real-time streaming, and Model Context Protocol (MCP) support.
+**Cross-platform, header-only C++17 networking library**: sockets, a reactor-based
+HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protocol
+(MCP) server and client.
 
 ## Features
 
-- **Pure Header-Only**: Zero compilation required, just `#include <sockets.hpp>`
-- **Cross-Platform**: Windows, Linux, macOS, iOS, Android, embedded systems
-- **C++17 Standard**: Modern C++ with minimal dependencies
-- **Enterprise HTTP**: Production-ready server with middleware, authentication, compression, and proxy awareness
-- **Optional Multi-Threading**: BS::thread_pool integration for concurrent request processing
-- **Real-Time Streaming**: Server-Sent Events (SSE) for live data streaming
-- **MCP Support**: Full Model Context Protocol server and client implementation
-- **Comprehensive Testing**: 231 unit and integration tests on Windows, 183 on Linux/ARM64 (100% passing)
+- **Header-only**: nothing to compile or link beyond the system socket library;
+  `#include <sockets.hpp>` (or individual headers under `SocketsHpp/`).
+- **Sockets**: thin RAII-friendly wrappers over BSD sockets / WinSock (TCP, UDP,
+  IPv4/IPv6, Unix domain sockets), a generic `SocketServer` and a small
+  `net::tcp::TcpServer`.
+- **Event reactor**: epoll on Linux, kqueue on macOS, `WSAEventSelect` /
+  `WSAWaitForMultipleEvents` on Windows.
+- **HTTP/1.1 server** (`HttpServer`): prefix routing, keep-alive, pipelining,
+  chunked request bodies, `Expect: 100-continue`, HEAD, CORS, request size limits,
+  strict request parsing (ambiguous `Content-Length` / `Transfer-Encoding` framing is
+  rejected), optional worker thread pool, chunked streaming responses and SSE.
+- **Static files** (`HttpFileServer`): serves a document root with path-traversal
+  protection and MIME types.
+- **HTTP client** (`HttpClient`): plain `http://` only (no TLS), redirects,
+  timeouts, chunked/streamed responses, cancellation. **SSE client** (`SSEClient`)
+  with WHATWG parsing, `Last-Event-ID` and auto-reconnect.
+- **Server helpers**: authentication strategies (Bearer, API key, Basic),
+  a pluggable compression registry (you bring the codec), and reverse-proxy
+  helpers (`X-Forwarded-*`, RFC 7239 `Forwarded`) with trusted-proxy configuration.
+- **MCP**: JSON-RPC 2.0 layer, `MCPServer` (HTTP+SSE 2024-11-05, Streamable HTTP
+  2025-03-26, or JSON-RPC over your own STDIO loop) and `MCPClient` (HTTP transports).
+- **Tested**: 500+ GoogleTest cases in CI on Ubuntu (GCC, Clang, ASan/UBSan),
+  macOS (Clang), Windows (MSVC) and MinGW-w64 (under Wine).
+
+What it is not: there is no TLS (put a reverse proxy such as nginx in front for
+HTTPS, or use it for plain-HTTP/loopback services), no HTTP/2, no WebSocket, and no
+client connection pooling (every request opens a new connection).
 
 ## Origins
 
@@ -19,589 +40,679 @@ Built upon Apache License 2.0 code from:
 - [Microsoft 1DS C/C++ Telemetry](https://github.com/microsoft/cpp_client_telemetry/blob/main/tests/common/HttpServer.hpp)
 - [OpenTelemetry C++ SDK](https://github.com/open-telemetry/opentelemetry-cpp/tree/main/ext/include/opentelemetry/ext/http)
 
-Extensively refactored and enhanced for modern application development. See [LICENSE](./LICENSE) for details.
-
-## Quick Start
-
-### Prerequisites
-
-1. **C++17 Compiler**: MSVC 2019+, GCC 8+, or Clang 7+
-2. **vcpkg** (for building tests): [Install vcpkg](https://vcpkg.io/en/getting-started.html)
-
-### Building
-
-**All Platforms (Windows):**
-```cmd
-build-all.cmd
-```
-Builds and tests for Windows x64, Linux x64 (WSL), and Linux ARM64 (QEMU).
-
-**Windows x64 Only:**
-```cmd
-build.cmd
-```
-or
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\Build-Windows.ps1
-```
-
-**Linux x64 (Native or WSL):**
-```bash
-./scripts/build-linux.sh
-```
-
-**Linux ARM64 (Cross-Compilation):**
-```bash
-./scripts/build-arm64.sh
-```
-
-**Legacy Build (Deprecated):**
-```bash
-./build.sh  # Creates out/ directory with Ninja build
-```
-
-**Custom CMake:**
-```bash
-# Windows
-cmake -B build/windows-x64 -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build/windows-x64 --config Release
-
-# Linux
-cmake -B build/linux-x64 -S . -DCMAKE_BUILD_TYPE=Release -G Ninja
-cmake --build build/linux-x64
-```
-
-### Integration into Existing Projects
-
-SocketsHpp is a header-only library that can be integrated into your C++ project using several methods:
-
-#### Option 1: vcpkg Package Manager (Recommended for vcpkg Users)
-
-Best for projects already using vcpkg. Provides full dependency management and binary caching.
-
-SocketsHpp includes a ready-to-use vcpkg port in `./ports/socketshpp/`. See [Example 11: vcpkg Consumption](./examples/11-vcpkg-consumption/) for a complete working example.
-
-**Quick Install:**
-```bash
-# From the SocketsHpp repository root
-vcpkg install socketshpp --overlay-ports=./ports
-```
-
-**Use in your project's `vcpkg.json`:**
-```json
-{
-  "name": "my-project",
-  "version": "1.0.0",
-  "dependencies": ["socketshpp"],
-  "vcpkg-configuration": {
-    "overlay-ports": ["path/to/SocketsHpp/ports"]
-  }
-}
-```
-
-**CMakeLists.txt integration:**
-```cmake
-# Find the package
-find_package(SocketsHpp CONFIG REQUIRED)
-
-# Link to your target
-add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
-
-# Platform-specific libraries (automatic on most systems)
-if(WIN32)
-    target_link_libraries(myapp PRIVATE ws2_32)
-else()
-    target_link_libraries(myapp PRIVATE pthread)
-endif()
-```
-
-#### Option 2: Git Submodules (Recommended for Version Control)
-
-Best for reproducible builds with tight version control integration.
-
-```bash
-# Add SocketsHpp as submodule
-git submodule add https://github.com/maxgolov/SocketsHpp.git external/SocketsHpp
-
-# Add dependencies
-git submodule add https://github.com/nlohmann/json.git external/nlohmann-json
-git submodule add https://github.com/bshoshany/thread-pool.git external/thread-pool
-
-# Initialize submodules when cloning
-git clone --recursive https://github.com/youruser/yourproject.git
-```
-
-**CMakeLists.txt integration:**
-```cmake
-# Add dependencies
-add_subdirectory(external/nlohmann-json)
-add_subdirectory(external/thread-pool)
-
-# Create interface library for SocketsHpp
-add_library(socketshpp INTERFACE)
-target_include_directories(socketshpp INTERFACE
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/SocketsHpp/include)
-target_compile_features(socketshpp INTERFACE cxx_std_17)
-target_link_libraries(socketshpp INTERFACE 
-    nlohmann_json::nlohmann_json
-    bshoshany-thread-pool::bshoshany-thread-pool)
-
-# Use in your project
-add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE socketshpp)
-```
-
-#### Option 3: CMake FetchContent (Recommended for CMake-Native Projects)
-
-Best for projects wanting zero external dependencies beyond CMake.
-
-```cmake
-include(FetchContent)
-
-# Fetch SocketsHpp
-FetchContent_Declare(socketshpp
-    GIT_REPOSITORY https://github.com/maxgolov/SocketsHpp.git
-    GIT_TAG main
-)
-
-# Fetch dependencies
-FetchContent_Declare(nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.11.3
-)
-
-FetchContent_Declare(thread_pool
-    GIT_REPOSITORY https://github.com/bshoshany/thread-pool.git
-    GIT_TAG v4.1.0
-)
-
-FetchContent_MakeAvailable(nlohmann_json thread_pool)
-
-# Manually handle SocketsHpp (header-only)
-FetchContent_GetProperties(socketshpp)
-if(NOT socketshpp_POPULATED)
-    FetchContent_Populate(socketshpp)
-    
-    add_library(socketshpp INTERFACE)
-    target_include_directories(socketshpp INTERFACE
-        ${socketshpp_SOURCE_DIR}/include)
-    target_compile_features(socketshpp INTERFACE cxx_std_17)
-    target_link_libraries(socketshpp INTERFACE 
-        nlohmann_json::nlohmann_json)
-endif()
-
-# Use in your project
-add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE socketshpp)
-```
-
-#### Option 4: Manual Installation (Simple Projects)
-
-Best for minimal projects or when modifying library source.
-
-```bash
-# Clone repository
-git clone https://github.com/maxgolov/SocketsHpp.git
-
-# Copy headers to your project
-cp -r SocketsHpp/include/SocketsHpp /path/to/your/project/external/include/
-cp -r SocketsHpp/include/sockets.hpp /path/to/your/project/external/include/
-```
-
-**CMakeLists.txt:**
-```cmake
-add_executable(myapp main.cpp)
-target_include_directories(myapp PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/include)
-target_compile_features(myapp PRIVATE cxx_std_17)
-```
-
-**Note:** You'll need to manually install dependencies (nlohmann-json, thread-pool) as well.
-
-#### Basic Usage
-
-Simply include the main header in your project:
-
-```cpp
-#include <sockets.hpp>
-```
-
-No linking required - it's header-only!
-
-## Core Components
-
-### Network Foundations
-
-| Component | Description |
-|-----------|-------------|
-| `net/common/socket_tools.h` | Low-level socket abstraction (BSD/WinSock) |
-| `net/common/socket_server.h` | TCP, UDP, Unix Domain socket servers |
-
-### HTTP Layer
-
-| Component | Description |
-|-----------|-------------|
-| `http/common/url_parser.h` | URL parsing (`http://host:port`) |
-| `http/common/http_constants.h` | HTTP status codes and headers |
-| `http/common/json_rpc.h` | JSON-RPC 2.0 implementation |
-| `http/server/http_server.h` | Full-featured HTTP server |
-| `http/server/http_file_server.h` | Static file serving with MIME types |
-| `http/client/http_client.h` | HTTP client with connection pooling |
-| `http/client/sse_client.h` | Server-Sent Events client |
-
-### Enterprise Features
-
-| Component | Description |
-|-----------|-------------|
-| `http/server/proxy_aware.h` | Reverse proxy support (X-Forwarded-*, RFC 7239) |
-| `http/server/authentication.h` | Multi-strategy auth (Bearer, API Key, Basic) |
-| `http/server/compression.h` | Content negotiation and compression |
-| `http/server/compression_windows.h` | Windows Compression API (MSZIP, XPRESS, LZMS) |
-
-### Model Context Protocol (MCP)
-
-| Component | Description |
-|-----------|-------------|
-| `mcp/server/mcp_server.h` | MCP server with tool/resource/prompt support |
-| `mcp/client/mcp_client.h` | MCP client for AI integrations |
-| `mcp/common/mcp_config.h` | Configuration and discovery |
-
-### Utilities
-
-| Component | Description |
-|-----------|-------------|
-| `utils/base64.h` | Base64 encoding/decoding |
-| `config.h` | Namespace configuration |
-| `macros.h` | Debug and logging macros |
-
-## Usage Examples
-
-### Basic TCP Client
-
-```cpp
-#include <sockets.hpp>
-
-SocketParams params{ AF_INET, SOCK_STREAM, 0 };
-SocketAddr destination("127.0.0.1:8080");
-Socket client(params);
-client.connect(destination);
-client.send("GET / HTTP/1.1\r\n\r\n", 18);
-client.close();
-```
-
-### Basic UDP Client
-
-```cpp
-#include <sockets.hpp>
-
-SocketParams params{ AF_INET, SOCK_DGRAM, 0 };
-SocketAddr destination("127.0.0.1:8080");
-Socket client(params);
-client.connect(destination);
-client.send("Hello, UDP!", 11);
-client.close();
-```
-
-### HTTP Server with Routing
-
-```cpp
-#include <sockets.hpp>
-
-HttpServer server("0.0.0.0", 8080);
-
-server.addHandler("/api/hello", [](const auto& req, auto& res) {
-    res.headers["Content-Type"] = "application/json";
-    res.body = R"({"message": "Hello, World!"})";
-});
-
-server.addHandler("/api/echo", [](const auto& req, auto& res) {
-    res.body = req.body;
-});
-
-server.start();
-server.waitExit();
-```
-
-### HTTP Server with Authentication
-
-```cpp
-#include <sockets.hpp>
-#include <SocketsHpp/http/server/authentication.h>
-
-using namespace SocketsHpp;
-
-HttpServer server("0.0.0.0", 8080);
-
-// Create authentication middleware with Bearer token
-auto bearerAuth = std::make_shared<BearerTokenAuth<HttpRequest>>(
-    [](const std::string& token) {
-        if (token == "secret-token-123") {
-            return AuthResult::success("user-id-42");
-        }
-        return AuthResult::failure();
-    }
-);
-
-AuthenticationMiddleware<HttpRequest, HttpResponse> authMiddleware;
-authMiddleware.addStrategy(bearerAuth);
-
-server.addHandler("/api/protected", [&authMiddleware](const auto& req, auto& res) {
-    auto authResult = authMiddleware.authenticate(req, res);
-    if (!authResult.success) {
-        res.code = 401;
-        return;
-    }
-    res.body = "Protected data for user: " + authResult.userId;
-});
-
-server.start();
-```
-
-### HTTP Server with Compression
-
-```cpp
-#include <sockets.hpp>
-#include <SocketsHpp/http/server/compression.h>
-#include <SocketsHpp/http/server/compression_windows.h>
-
-using namespace SocketsHpp;
-
-HttpServer server("0.0.0.0", 8080);
-
-// Register Windows compression algorithms
-registerWindowsCompression();
-
-// Create compression middleware
-CompressionMiddleware<HttpRequest, HttpResponse> compressor;
-
-server.addHandler("/api/data", [&compressor](const auto& req, auto& res) {
-    res.headers["Content-Type"] = "application/json";
-    res.body = generateLargeJsonData(); // Your data function
-    
-    // Compress response based on Accept-Encoding
-    compressor.compressResponse(req, res);
-});
-
-server.start();
-```
-
-### HTTP Server with Multi-Threading (Optional)
-
-```cpp
-#include <sockets.hpp>
-
-HttpServer server("0.0.0.0", 8080);
-
-// Enable thread pool for concurrent request processing (optional)
-server.enableThreadPool(4);  // 4 worker threads (0 = hardware_concurrency)
-
-server.addHandler("/api/compute", [](const auto& req, auto& res) {
-    // CPU-intensive work offloaded to worker threads
-    // Reactor thread remains responsive for I/O
-    auto result = performExpensiveComputation();
-    res.body = result;
-});
-
-server.start();
-server.waitExit();
-
-// Thread pool is automatically stopped on server shutdown
-// Can also disable manually: server.disableThreadPool();
-```
-
-### Server-Sent Events (SSE) Streaming
-
-```cpp
-#include <sockets.hpp>
-
-HttpServer server("0.0.0.0", 8080);
-
-server.addHandler("/events", [](const auto& req, auto& res) {
-    res.headers["Content-Type"] = "text/event-stream";
-    res.headers["Cache-Control"] = "no-cache";
-    res.headers["Connection"] = "keep-alive";
-    
-    // Stream events to client
-    for (int i = 0; i < 10; i++) {
-        std::string event = "data: Event " + std::to_string(i) + "\n\n";
-        res.streamCallback(event);
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-});
-
-server.start();
-```
-
-### Proxy-Aware Server (Behind Load Balancer)
-
-```cpp
-#include <sockets.hpp>
-#include <SocketsHpp/http/server/proxy_aware.h>
-
-using namespace SocketsHpp;
-
-HttpServer server("0.0.0.0", 8080);
-
-// Trust specific proxy IPs
-TrustProxyConfig proxyConfig;
-proxyConfig.mode = TrustMode::TrustSpecific;
-proxyConfig.trustedProxies = {"10.0.0.1", "172.16.0.1"};
-
-server.addHandler("/api/info", [&proxyConfig](const auto& req, auto& res) {
-    // Get real client IP and protocol from X-Forwarded-* headers
-    std::string clientIP = ProxyAwareHelpers::getClientIP(req, proxyConfig);
-    std::string protocol = ProxyAwareHelpers::getProtocol(req, proxyConfig);
-    bool isSecure = ProxyAwareHelpers::isSecure(req, proxyConfig);
-    
-    res.body = "Client IP: " + clientIP + 
-               ", Protocol: " + protocol +
-               ", Secure: " + (isSecure ? "yes" : "no");
-});
-
-server.start();
-```
-
-### Model Context Protocol (MCP) Server
-
-```cpp
-#include <sockets.hpp>
-#include <SocketsHpp/mcp/server/mcp_server.h>
-
-using namespace SocketsHpp;
-
-MCPServer server("127.0.0.1", 3000);
-
-// Register a tool
-server.registerTool({
-    .name = "calculate",
-    .description = "Perform mathematical calculations",
-    .inputSchema = R"({
-        "type": "object",
-        "properties": {
-            "expression": {"type": "string"}
-        }
-    })"
-}, [](const nlohmann::json& args) -> nlohmann::json {
-    std::string expr = args["expression"];
-    // Evaluate expression...
-    return {{"result", 42}};
-});
-
-// Register a resource
-server.registerResource({
-    .uri = "file:///data/users.json",
-    .name = "User Database",
-    .description = "List of all users"
-}, []() -> std::string {
-    return R"([{"id": 1, "name": "Alice"}])";
-});
-
-server.start();
-```
-
-## Examples
-
-Comprehensive examples with full documentation:
-
-- **[01-tcp-echo](examples/01-tcp-echo/)** - TCP echo server
-- **[02-udp-echo](examples/02-udp-echo/)** - UDP echo server  
-- **[03-http-server](examples/03-http-server/)** - HTTP server with routing
-- **[04-http-sse](examples/04-http-sse/)** - Server-Sent Events streaming
-- **[05-mcp-server](examples/05-mcp-server/)** - Model Context Protocol server
-- **[06-proxy-aware](examples/06-proxy-aware/)** - Reverse proxy awareness
-- **[07-authentication](examples/07-authentication/)** - Multi-strategy authentication
-- **[08-compression](examples/08-compression/)** - Content compression
-- **[09-full-featured](examples/09-full-featured/)** - Combined enterprise features
-
-Each example includes a README.md and CMakeLists.txt for standalone building.
-
-## Testing
-
-The project includes 231 comprehensive tests on Windows, 183 on Linux/ARM64:
-
-```bash
-# Build and run all platforms (Windows)
-build-all.cmd
-
-# Windows x64 only
-powershell -ExecutionPolicy Bypass -File scripts\Build-Windows.ps1
-
-# Linux x64 (WSL or native)
-./scripts/build-linux.sh
-
-# Linux ARM64 (cross-compilation with QEMU)
-./scripts/build-arm64.sh
-
-# Run tests manually after build
-cd build/windows-x64  # or build/linux-x64, build/linux-arm64
-ctest --output-on-failure
-```
-
-Test coverage is exercised by the GitHub Actions matrix on Ubuntu GCC/Clang,
-macOS Clang, and Windows MSVC. Run `ctest --test-dir build --output-on-failure`
-locally to see the current discovered test count and results.
-
-## Documentation
-
-- **[FEATURES.md](docs/FEATURES.md)** - Complete feature overview
-- **[MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md)** - MCP architecture details
-- **[BUILD_SUMMARY.md](docs/BUILD_SUMMARY.md)** - Build system documentation
-- **[ARM64.md](docs/ARM64.md)** - ARM64 platform support
+Extensively refactored and extended since. See [LICENSE](./LICENSE).
 
 ## Dependencies
 
-### Runtime (Header-Only Mode)
-- C++17 standard library
-- System socket library (POSIX sockets or WinSock)
-- **[BS::thread_pool](https://github.com/bshoshany/thread-pool)** (optional) - Multi-threading support
+| Dependency | Needed by | Notes |
+|------------|-----------|-------|
+| C++17 compiler | everything | MSVC 2019+, GCC 8+, Clang 7+ |
+| System sockets + threads | everything | `ws2_32` on Windows, pthreads elsewhere (the CMake target adds both) |
+| [BS::thread_pool](https://github.com/bshoshany/thread-pool) 5.x | `http_server.h` (and everything that includes it) | Bundled as `external/BS_thread_pool.hpp`; always required, even if you never call `enableThreadPool()` |
+| [nlohmann/json](https://github.com/nlohmann/json) | MCP headers, `json_rpc.h`, and the umbrella `sockets.hpp` | Git submodule `external/nlohmann-json`, or any installed copy |
+| [jwt-cpp](https://github.com/Thalhammer/jwt-cpp) | optional | Enables JWT (HS256) validation in `MCPServer` (`SOCKETSHPP_HAS_JWT_CPP`) |
+| [GoogleTest](https://github.com/google/googletest) | tests only | Only when `SOCKETSHPP_BUILD_TESTS=ON` |
 
-### Build & Testing
-- **[vcpkg](https://vcpkg.io/)** - Package manager
-- **[nlohmann/json](https://github.com/nlohmann/json)** - JSON parsing (MCP/JSON-RPC)
-- **[cpp-jwt](https://github.com/arun11299/cpp-jwt)** - JWT authentication
-- **[Google Test](https://github.com/google/googletest)** - Testing framework
+`sockets.hpp` includes the MCP headers, so it needs nlohmann/json. Code that only
+needs sockets or HTTP can include the specific headers (for example
+`SocketsHpp/http/server/http_server.h`) and skip nlohmann/json.
 
-All test dependencies are automatically managed by vcpkg.
+## Quick start (CMake)
 
-## Platform Support
+All integration paths end with the same interface target, `SocketsHpp::SocketsHpp`,
+which carries the include directories, C++17, threads and (on Windows) `ws2_32`.
 
-| Platform | Status | Notes |
-|----------|--------|-------|
-| Windows x64 | ✅ Fully Supported | MSVC 2019+, includes Windows Compression API |
-| Windows ARM64 | ✅ Fully Supported | Native ARM64 builds |
-| Linux x64 | ✅ Fully Supported | GCC 8+, Clang 7+ |
-| Linux ARM64 | ✅ Fully Supported | Raspberry Pi, embedded systems |
-| macOS x64/ARM64 | ✅ Fully Supported | Apple Silicon and Intel |
-| iOS/Android | ✅ Supported | Embedded use cases |
+### add_subdirectory
 
-## Design Philosophy
+```cmake
+add_subdirectory(external/SocketsHpp)
 
-- **Header-Only**: Zero compilation, instant integration
-- **Minimal Dependencies**: Only C++17 stdlib and system sockets for core functionality
-- **Optional Multi-Threading**: BS::thread_pool integration available but not required
-- **Platform Agnostic**: Abstracts BSD sockets and WinSock differences
-- **Modern C++**: Uses C++17 features, no legacy baggage
-- **Minimalist & Practical**: ~75% HTTP/1.1 compliance, optimized for <10K concurrent connections
-- **Production-Ready**: Enterprise features with comprehensive testing
-- **Developer-Friendly**: Clear APIs, extensive examples, detailed documentation
+add_executable(myapp main.cpp)
+target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
+```
+
+The target carries nlohmann/json (needed by `sockets.hpp` and the MCP headers): an
+existing `nlohmann_json::nlohmann_json` target or package is used if present,
+otherwise the bundled `external/nlohmann-json` submodule.
+
+### FetchContent
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+FetchContent_Declare(SocketsHpp
+    GIT_REPOSITORY https://github.com/maxgolov/SocketsHpp.git
+    GIT_TAG main)   # pin a commit or tag in real projects
+FetchContent_MakeAvailable(json SocketsHpp)   # json first, so SocketsHpp uses it
+
+add_executable(myapp main.cpp)
+target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
+```
+
+### Install + find_package
+
+```bash
+cmake -S . -B build
+cmake --install build --prefix /opt/socketshpp
+```
+
+```cmake
+find_package(SocketsHpp 1.0 CONFIG REQUIRED)   # CMAKE_PREFIX_PATH=/opt/socketshpp
+target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
+```
+
+The install contains the headers, `BS_thread_pool.hpp` (unless
+`SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL=OFF`) and the CMake package. The package
+config attaches `nlohmann_json::nlohmann_json` automatically when
+`find_package(nlohmann_json)` succeeds, and `jwt-cpp` when the library was installed
+with it.
+
+### vcpkg (overlay port)
+
+A port lives in [`ports/socketshpp`](ports/socketshpp/README.md). It is not in the
+vcpkg registry, so use it as an overlay port in manifest mode:
+
+```json
+{
+  "name": "myapp",
+  "version": "1.0.0",
+  "dependencies": [ "socketshpp" ]
+}
+```
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+  -DVCPKG_OVERLAY_PORTS=/path/to/SocketsHpp/ports
+```
+
+Then `find_package(SocketsHpp CONFIG REQUIRED)` as above. The port depends on
+`nlohmann-json` and `bshoshany-thread-pool` (>= 5.0.0); the optional `jwt` feature
+adds `jwt-cpp`. See [example 11](examples/11-vcpkg-consumption/).
+
+### Without CMake
+
+Add `include/` and `external/` (for `BS_thread_pool.hpp`) plus the nlohmann/json
+include directory to the include path, compile as C++17 and link threads
+(and `ws2_32` on Windows):
+
+```bash
+g++ -std=c++17 -Iinclude -Iexternal -Iexternal/nlohmann-json/single_include main.cpp -pthread
+```
+
+## Building this repository
+
+```bash
+git clone --recursive https://github.com/maxgolov/SocketsHpp.git
+cd SocketsHpp
+cmake -S . -B build -DSOCKETSHPP_BUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+Tests need GoogleTest (`find_package(GTest CONFIG)`): for example
+`apt install libgtest-dev`, `brew install googletest`, or the vcpkg toolchain
+(`-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake`, which also
+provides nlohmann-json and the thread pool from `vcpkg.json`). On multi-config
+generators (Visual Studio) add `--config Debug` to the build and `-C Debug` to ctest.
+
+### CMake options
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `SOCKETSHPP_BUILD_TESTS` | `OFF` | Build the unit/functional tests and header checks (needs GoogleTest) |
+| `BUILD_EXAMPLES` | `OFF` | Build `examples/01`-`10` |
+| `SOCKETSHPP_WARNINGS_AS_ERRORS` | `OFF` | `-Werror` / `/WX` |
+| `SOCKETSHPP_INSTALL` | `ON` for top-level builds | Generate install rules and the CMake package |
+| `SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL` | `ON` | Install `external/BS_thread_pool.hpp` with the headers |
+| `ENABLE_ASAN` | `OFF` | AddressSanitizer (GCC/Clang) |
+| `ENABLE_UBSAN` | `OFF` | UndefinedBehaviorSanitizer (GCC/Clang) |
+
+### Cross-compiling
+
+- **MinGW-w64** (Windows binaries from Linux):
+  `cmake -S . -B build-mingw -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64-x86_64.cmake`.
+  Tests can run under Wine with `-DCMAKE_CROSSCOMPILING_EMULATOR=$(command -v wine64)`
+  (GoogleTest must be built with the same toolchain).
+- **Linux ARM64** with QEMU: see [docs/ARM64.md](docs/ARM64.md).
+
+The helper scripts (`build.cmd`, `build-all.cmd`, `scripts/*.sh`, `scripts/*.ps1`,
+see [scripts/README.md](scripts/README.md)) are convenience wrappers; the plain CMake
+commands above are what CI runs.
+
+## Usage
+
+The examples below use these namespaces (all under `SocketsHpp`, also available as
+the `SOCKETSHPP_NS` macro): `net::utils` (sockets), `http::server`, `http::client`,
+`mcp`, `mcp::server`, `mcp::client`.
+
+### TCP and UDP clients
+
+```cpp
+#include <SocketsHpp/net/common/socket_tools.h>
+#include <string>
+
+using namespace SocketsHpp::net::utils;
+
+int main()
+{
+    // TCP: connect and send
+    Socket tcp(SocketParams{AF_INET, SOCK_STREAM, 0});
+    if (!tcp.connect(SocketAddr("127.0.0.1:8080")))
+        return 1;
+    const std::string request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    tcp.send(request.data(), request.size());
+    char buffer[4096];
+    int received = tcp.recv(buffer, sizeof(buffer));
+    (void)received;
+    tcp.close();
+
+    // UDP: connect() just sets the default destination for send()
+    Socket udp(SocketParams{AF_INET, SOCK_DGRAM, 0});
+    udp.connect(SocketAddr("127.0.0.1:9000"));
+    udp.send("hello", 5);
+    udp.close();
+}
+```
+
+`SocketAddr` accepts `"host:port"`, `"[v6]:port"` or `(address, port)`.
+For a simple TCP server, `net::tcp::TcpServer` (in `SocketsHpp/net/tcp/tcp.h`)
+binds to `127.0.0.1` by default and replies with whatever the `onMessage` handler returns:
+
+```cpp
+#include <SocketsHpp/net/tcp/tcp.h>
+
+int main()
+{
+    SocketsHpp::net::tcp::TcpServer server(0);  // port 0 = ephemeral, on 127.0.0.1
+    server.onMessage([](const std::string& msg, auto&) { return "echo: " + msg; });
+    server.Start();
+    int port = server.port();
+    (void)port;
+    server.Stop();
+}
+```
+
+### HTTP server
+
+```cpp
+#include <SocketsHpp/http/server/http_server.h>
+#include <chrono>
+#include <thread>
+
+using namespace SocketsHpp::http::server;
+
+int main()
+{
+    // "my-service" is only used for the Server response header. This constructor
+    // listens on port 8080 on all IPv4 interfaces.
+    HttpServer server("my-service", 8080);
+
+    server.route("/hello", [](const HttpRequest& req, HttpResponse& res) -> int {
+        std::string name = "world";
+        try
+        {
+            auto query = req.parse_query();  // /hello?name=... (URL-decoded)
+            if (query.count("name"))
+                name = query["name"];
+        }
+        catch (const std::invalid_argument&)  // malformed or oversized query string
+        {
+            return 400;
+        }
+        res.set_content("Hello, " + name + "!\n");
+        return 200;
+    });
+
+    server.route("/api/echo", [](const HttpRequest& req, HttpResponse& res) -> int {
+        if (req.method != "POST")
+            return 405;
+        res.set_content(req.content, req.get_header_value("Content-Type"));
+        return 200;
+    });
+
+    server.start();  // non-blocking: the reactor runs on its own thread
+    std::this_thread::sleep_for(std::chrono::minutes(5));
+    server.stop();   // also done by the destructor
+}
+```
+
+Handlers are `int(const HttpRequest&, HttpResponse&)`. `HttpRequest` has `method`,
+`uri` (including the query string), `protocol`, `headers`, `content` (the body) and
+`client` (`"ip:port"` of the peer), plus `get_header_value()`, `has_header()`,
+`parse_query()` and `accepts()`. `HttpResponse` has `set_status()`, `set_header()`,
+`set_content(body, contentType)` and `send_chunk_stream()`.
+
+If a handler throws, the server answers 500 Internal Server Error and keeps running;
+if a stream callback throws, the stream is aborted (the connection closes without the
+end-of-stream marker). Catch exceptions yourself when you want a more specific status -
+for example `parse_query()` throws `std::invalid_argument` for malformed or oversized
+query strings, which is better answered with 400.
+
+**Listening address.** To bind a specific address (for example loopback only), or to
+use an ephemeral port, start from the default constructor:
+
+```cpp
+HttpServer server;
+server.setServerName("my-service");
+int port = server.addListeningPort("127.0.0.1", 0);  // returns the bound port
+// server.getListeningPort() returns the first bound port as well
+```
+
+`addListeningPort(port)` listens on all IPv4 interfaces; `addListeningPort(host, port)`
+accepts `"127.0.0.1"`, `"::1"`, `"[::1]"` or `"localhost"`. A server can listen on
+several ports (`getListeningPorts()`).
+
+**Routing rules.**
+
+- Routes are URI **prefixes**: `/api` also matches `/api/users` and `/apix`. Candidates
+  are tried longest prefix first, then in registration order, so a `/` catch-all never
+  shadows `/events`.
+- A handler takes the request when it returns a non-zero status, calls
+  `set_status()`, or produces a body or a stream (status then defaults to 200).
+  Returning `0` without touching the response declines, and the next candidate runs.
+  Returning `-1` closes the connection without a response.
+- If no handler takes the request: `OPTIONS` gets 204 when CORS is enabled
+  (`enableCors()`, `setCorsOrigin()`, `setCorsHeaders()`) and 405 otherwise; `DELETE`
+  with an `Mcp-Session-Id` header terminates that session of the server's built-in
+  session manager; everything else gets 404.
+- `HEAD` is dispatched as `GET` and the body is dropped.
+- `route()` owns the callback. `addHandler(path, HttpRequestCallback&)` and
+  `server[path] = callback` store a reference, so that object must outlive the server.
+
+Other knobs: `setRequestLimits(maxHeaderBytes, maxBodyBytes)` (defaults 8 KB / 2 MB;
+oversized requests get 431 / 413), `setKeepalive(false)`, and
+`createSession()` / `validateSession()` / `terminateSession()` / `setSessionTimeout()`.
+
+### Streaming and Server-Sent Events
+
+`send_chunk_stream(callback, onEnd)` sends a chunked response: the server calls
+`callback` repeatedly, sends each returned string immediately, and ends the stream when
+it returns an empty string. (`send_chunk()` only appends to a buffered body.)
+
+```cpp
+server.route("/events", [](const HttpRequest&, HttpResponse& res) -> int {
+    res.set_header("Content-Type", "text/event-stream");
+    int n = 0;
+    res.send_chunk_stream(
+        [n]() mutable -> std::string {
+            if (n == 5)
+                return "";  // end of stream
+            if (n > 0)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            ++n;
+            return SSEEvent::message("tick " + std::to_string(n), std::to_string(n)).format();
+        },
+        [] { /* stream finished */ });
+    return 200;
+});
+```
+
+For `text/event-stream` responses the server adds `Cache-Control: no-cache` and
+`X-Accel-Buffering: no`. `SSEEvent` (`message()`, `custom(event, data, id)`, or set
+`event`/`data`/`id`/`retry`) formats one event and splits multi-line data.
+
+### Thread pool
+
+By default all handlers and stream callbacks run on the single reactor thread, so a
+slow handler (or a stream callback that sleeps, as above) stalls every connection.
+
+```cpp
+server.enableThreadPool(8);  // before start(); 0 = std::thread::hardware_concurrency()
+```
+
+With the pool enabled, request handlers and every stream-callback invocation run on
+pool workers while the reactor keeps serving I/O. Handlers for different connections
+then run concurrently and must be thread-safe; requests on one connection are still
+processed in order. `disableThreadPool()` / `isThreadPoolEnabled()` are available. The
+pool is `BS::thread_pool` from the bundled header, which `http_server.h` always includes.
+
+### HTTP client
+
+```cpp
+#include <SocketsHpp/http/client/http_client.h>
+#include <iostream>
+
+using namespace SocketsHpp::http::client;
+
+int main()
+{
+    HttpClient client;
+    client.setConnectTimeout(5000);  // ms
+    client.setReadTimeout(10000);    // ms
+
+    HttpClientResponse resp;
+    if (client.get("http://127.0.0.1:8080/hello?name=you", resp))
+        std::cout << resp.code << ' ' << resp.getHeader("content-type") << '\n' << resp.body;
+
+    HttpClientRequest req;
+    req.method = "PUT";
+    req.uri = "http://127.0.0.1:8080/api/items/1";
+    req.setContentType("application/json");
+    req.body = R"({"name":"widget"})";
+    HttpClientResponse putResp;
+    bool ok = client.send(req, putResp);  // false on connection/protocol errors
+    return ok ? 0 : 1;
+}
+```
+
+- Only `http://` URLs work: `https://` is rejected (the call returns false) instead of
+  being sent in cleartext.
+- Redirects (301/302/303/307/308) are followed up to 10 hops (`setMaxRedirects()`,
+  `setFollowRedirects(false)`). 303, and 301/302 for methods other than GET/HEAD, switch
+  to GET without a body; `Authorization`, `Cookie` and `Proxy-Authorization` are dropped
+  when a redirect leaves the original host and port.
+- `getHeader()` / `hasHeader()` match names case-insensitively; repeated response
+  headers are joined with `", "`.
+- Set `resp.chunkCallback` / `resp.onComplete` to receive the body incrementally;
+  `setMaxResponseBodySize()` caps buffered bodies (1 GiB default); `cancel()` aborts an
+  in-flight request from another thread.
+
+### SSE client
+
+```cpp
+#include <SocketsHpp/http/client/sse_client.h>
+#include <iostream>
+#include <thread>
+
+using namespace SocketsHpp::http::client;
+
+int main()
+{
+    SSEClient sse;
+    sse.setRequestHeader("Authorization", "Bearer my-token");  // sent on every (re)connect
+    sse.setAutoReconnect(true, 3000);                          // ms; server "retry:" overrides
+
+    std::thread reader([&sse] {
+        // Blocks until the stream ends (or close() is called when auto-reconnect is on)
+        sse.connect("http://127.0.0.1:8080/events",
+            [](const SSEEvent& e) { std::cout << "id " << e.id << ": " << e.data << '\n'; },
+            [](const std::string& error) { std::cerr << error << '\n'; });
+    });
+
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    sse.close();  // thread-safe; unblocks connect()
+    reader.join();
+}
+```
+
+The client tracks the last event id and sends it as `Last-Event-ID` when it reconnects.
+Unlike `HttpClient`, it has no read timeout by default.
+
+### Authentication
+
+`SocketsHpp/http/server/authentication.h` provides `BearerTokenAuth`, `ApiKeyAuth` and
+`BasicAuth` strategies and an `AuthenticationMiddleware` that tries them in order.
+There is no global middleware hook: call it from the routes you want to protect.
+
+```cpp
+#include <SocketsHpp/http/server/authentication.h>
+#include <SocketsHpp/http/server/http_server.h>
+#include <memory>
+
+using namespace SocketsHpp::http::server;
+
+void addProtectedRoute(HttpServer& server)
+{
+    auto bearer = std::make_shared<BearerTokenAuth<HttpRequest>>([](const std::string& token) {
+        return token == "secret-token" ? AuthResult::success("alice")
+                                       : AuthResult::failure("invalid token");
+    });
+    auto apiKey = std::make_shared<ApiKeyAuth<HttpRequest>>("X-API-Key", [](const std::string& key) {
+        return key == "key-123" ? AuthResult::success("service") : AuthResult::failure("bad key");
+    });
+
+    auto auth = std::make_shared<AuthenticationMiddleware<HttpRequest, HttpResponse>>();
+    auth->addStrategy(bearer);
+    auth->addStrategy(apiKey);
+
+    server.route("/api/private", [auth, bearer](const HttpRequest& req, HttpResponse& res) -> int {
+        HttpRequest request = req;  // authenticate() takes a mutable request
+        if (!auth->authenticate(request, res))
+            return 401;  // body and WWW-Authenticate challenges are already set
+
+        // A strategy can also be called directly to get the AuthResult (user id, claims)
+        AuthResult who = bearer->authenticate(req);
+        res.set_content(who ? "hello " + who.userId + "\n" : "hello API client\n");
+        return 200;
+    });
+}
+```
+
+### Compression
+
+`SocketsHpp/http/server/compression.h` has a codec registry and an
+`Accept-Encoding`-aware `CompressionMiddleware`, but **no codec of its own**: register
+one (for example gzip via zlib) at startup, then compress per route:
+
+```cpp
+#include <SocketsHpp/http/server/compression.h>
+#include <SocketsHpp/http/server/http_server.h>
+#include <memory>
+
+using namespace SocketsHpp::http::server;
+
+std::vector<uint8_t> gzipCompress(const std::vector<uint8_t>& in, int level);  // your codec
+std::vector<uint8_t> gzipDecompress(const std::vector<uint8_t>& in);
+
+void addCompressedRoute(HttpServer& server)
+{
+    CompressionRegistry::instance().registerStrategy(
+        std::make_shared<CompressionStrategy>("gzip", gzipCompress, gzipDecompress));
+
+    auto compression = std::make_shared<CompressionMiddleware>();  // level 6, >= 1 KB, text/JSON types
+    server.route("/data", [compression](const HttpRequest& req, HttpResponse& res) -> int {
+        std::string body(4096, 'x');
+        std::string encoding;
+        if (compression->compressResponse(req.get_header_value("Accept-Encoding"),
+                                          "text/plain", body, encoding))
+            res.set_header("Content-Encoding", encoding);
+        res.set_header("Vary", "Accept-Encoding");
+        res.set_content(body, "text/plain");
+        return 200;
+    });
+}
+```
+
+Register codecs before `start()` (the registry is not synchronized). For tests,
+`compression::registerSimpleCompression()` (`compression_simple.h`) adds `rle` and
+`identity`; on Windows, `compression::registerWindowsCompression()`
+(`compression_windows.h`, link `cabinet`) adds `mszip`, `xpress` and `lzms`, which
+are not standard HTTP content-codings and are only useful between your own peers.
+
+### Behind a reverse proxy
+
+```cpp
+#include <SocketsHpp/http/server/http_server.h>
+#include <SocketsHpp/http/server/proxy_aware.h>
+
+using namespace SocketsHpp::http::server;
+
+void addWhoAmI(HttpServer& server)
+{
+    TrustProxyConfig trust;
+    trust.addTrustedProxy("127.0.0.1");  // switches the mode to TrustSpecific
+    // or: trust.setMode(TrustProxyConfig::TrustMode::TrustAll);  (never on a public port)
+
+    server.route("/whoami", [trust](const HttpRequest& req, HttpResponse& res) -> int {
+        std::string ip = ProxyAwareHelpers::getClientIP(req.headers, req.client, trust);
+        std::string proto = ProxyAwareHelpers::getProtocol(req.headers, req.client, trust);
+        std::string host = ProxyAwareHelpers::getHost(req.headers, req.client, trust);
+        res.set_content(proto + "://" + host + " from " + ip + "\n");
+        return 200;
+    });
+}
+```
+
+Forwarded headers (`X-Forwarded-For/Proto/Host`, `X-Real-IP`, RFC 7239 `Forwarded`)
+are honoured only when the direct peer (`req.client`) is trusted; otherwise the
+helpers report the direct connection.
+
+### MCP server
+
+```cpp
+#include <SocketsHpp/mcp/server/mcp_server.h>
+#include <chrono>
+#include <thread>
+
+using namespace SocketsHpp::mcp;
+using SocketsHpp::http::common::JsonRpcError;
+using json = nlohmann::json;
+
+int main()
+{
+    ServerConfig config;
+    config.transport = TransportType::HTTP_STREAMABLE;  // MCP 2025-03-26
+    config.host = "127.0.0.1";                          // loopback unless allowNonLoopback
+    config.port = 8080;                                 // 0 = ephemeral, see server.port()
+    config.endpoint = "/mcp";
+    config.serverName = "demo-server";
+
+    server::MCPServer server(config);
+
+    server.registerMethod("initialize", [](const json&) -> json {
+        // protocolVersion is filled in by the server's version negotiation
+        return {{"capabilities", {{"tools", json::object()}}},
+                {"serverInfo", {{"name", "demo-server"}, {"version", "1.0.0"}}}};
+    });
+
+    server.registerMethod("tools/list", [](const json&) -> json {
+        json echo = {{"name", "echo"},
+                     {"description", "Echo the text back"},
+                     {"inputSchema", {{"type", "object"},
+                                      {"properties", {{"text", {{"type", "string"}}}}}}}};
+        return {{"tools", json::array({echo})}};
+    });
+
+    server.registerMethod("tools/call", [](const json& params) -> json {
+        if (params.value("name", "") != "echo")
+            throw JsonRpcError::invalidParams("unknown tool");
+        std::string text = params.value("arguments", json::object()).value("text", "");
+        return {{"content", json::array({{{"type", "text"}, {"text", text}}})}};
+    });
+
+    server.listen();  // non-blocking
+    std::this_thread::sleep_for(std::chrono::minutes(5));
+    server.stop();
+}
+```
+
+`ping`, `notifications/initialized`, `notifications/cancelled` and `logging/setLevel`
+are built in. `registerCancellable()` gives a handler a cancel token,
+`push_event()` / `push_log()` / `push_progress()` send server-initiated messages on a
+session's SSE stream, `processMessage()` handles one JSON-RPC message (or batch) for
+a STDIO transport you drive yourself, and `GET /health` returns the server info. See
+[docs/MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md) for transports, sessions,
+resumability, authentication (including JWT via jwt-cpp), rate limiting and CORS.
+
+### MCP client
+
+```cpp
+#include <SocketsHpp/mcp/client/mcp_client.h>
+#include <iostream>
+
+using namespace SocketsHpp::mcp;
+using json = nlohmann::json;
+
+int main()
+{
+    ClientConfig config;
+    config.transport = TransportType::HTTP_STREAMABLE;  // or HTTP (2024-11-05); STDIO is not supported
+    config.http.url = "http://127.0.0.1:8080/mcp";      // http:// only
+    config.http.headers["Authorization"] = "Bearer my-token";
+
+    client::MCPClient client;
+    client.onNotification("notifications/message", [](const json& params) {
+        std::cout << "log: " << params.dump() << '\n';
+    });
+    if (!client.connect(config))
+        return 1;
+
+    try
+    {
+        json info = client.initialize({{"name", "demo-client"}, {"version", "1.0.0"}});
+        json tools = client.listTools();
+        json result = client.callTool("echo", {{"text", "hi"}});
+        std::cout << result.dump(2) << '\n';
+    }
+    catch (const SocketsHpp::http::common::JsonRpcError& e)  // JSON-RPC error response
+    {
+        std::cerr << e.code << ' ' << e.message << '\n';
+    }
+    catch (const std::exception& e)  // HTTP/transport failure
+    {
+        std::cerr << e.what() << '\n';
+    }
+    client.disconnect();  // sends DELETE to end the session
+}
+```
+
+## Platform notes
+
+| Platform | Reactor | Notes |
+|----------|---------|-------|
+| Linux (x64, ARM64) | epoll | GCC and Clang in CI; ARM64 via cross-compilation + QEMU ([docs/ARM64.md](docs/ARM64.md)) |
+| macOS | kqueue | AppleClang in CI |
+| Windows (x64; ARM64 not in CI) | `WSAEventSelect` + `WSAWaitForMultipleEvents` | MSVC x64 in CI; MinGW-w64 via `cmake/toolchains/mingw-w64-x86_64.cmake` (tests under Wine) |
+
+- On Windows a reactor waits on at most 64 event handles (`WSA_MAXIMUM_WAIT_EVENTS`),
+  so one server handles roughly 64 sockets at a time (listening sockets included).
+  WinSock is initialized automatically.
+- Unix domain sockets are available on POSIX systems and on Windows when the SDK
+  provides `<afunix.h>` (Windows 10 SDK 17063 or later).
+- Logging is compiled out by default. Define `HAVE_CONSOLE_LOG` to print to stdout,
+  or define `LOG_DEBUG` / `LOG_TRACE` / `LOG_INFO` / `LOG_WARN` / `LOG_ERROR` yourself
+  before including the headers.
+
+## Header-only guarantee
+
+Every header is self-contained and every function is `inline`, so the headers can be
+included from any number of translation units. The test build enforces this with two
+targets (built when `SOCKETSHPP_BUILD_TESTS=ON`):
+
+- `header_self_contained_check` compiles every public header on its own, twice
+  (include guards);
+- `header_only_link_check` links two translation units that each include every public
+  header (catches non-inline definitions) and runs as a ctest.
+
+## Examples
+
+See [examples/README.md](examples/README.md). Build them with
+`-DBUILD_EXAMPLES=ON`; binaries land in `build/examples/<name>/`.
+
+| Example | Shows |
+|---------|-------|
+| [01-tcp-echo](examples/01-tcp-echo/) | TCP client sending 1 MB |
+| [02-udp-echo](examples/02-udp-echo/) | UDP client sending a datagram |
+| [03-http-server](examples/03-http-server/) | Routes, query parameters, JSON/HTML responses |
+| [04-http-sse](examples/04-http-sse/) | SSE streaming with `send_chunk_stream` and the thread pool |
+| [05-mcp-server](examples/05-mcp-server/) | Hand-rolled MCP-style SSE transport on `HttpServer` (not `MCPServer`) |
+| [06-proxy-aware](examples/06-proxy-aware/) | `TrustProxyConfig` and `ProxyAwareHelpers` |
+| [07-authentication](examples/07-authentication/) | Bearer token / API key checks in handlers |
+| [08-compression](examples/08-compression/) | Large HTML response (compression is not wired in) |
+| [09-full-featured](examples/09-full-featured/) | Proxy awareness + authentication |
+| [10-typescript-interop](examples/10-typescript-interop/) | JSON-RPC interop with TypeScript client/server |
+| [11-vcpkg-consumption](examples/11-vcpkg-consumption/) | Consuming the vcpkg overlay port with `find_package` |
+
+## Documentation
+
+- [docs/FEATURES.md](docs/FEATURES.md) - what is and is not implemented
+- [docs/INTEGRATION.md](docs/INTEGRATION.md) - adding SocketsHpp to a project
+- [docs/MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md) - MCP server/client guide
+- [docs/ARM64.md](docs/ARM64.md) - ARM64 cross-compilation and QEMU testing
+- [test/README.md](test/README.md) - test suites and how to run them
+- [include/SocketsHpp/utils/README.md](include/SocketsHpp/utils/README.md) - Base64 utility
+- [ports/socketshpp/README.md](ports/socketshpp/README.md) - vcpkg port
 
 ## Contributing
 
-Contributions welcome! Please ensure:
-- All tests pass (`ctest -C Debug`)
-- Code follows existing style
-- New features include tests and examples
-- Documentation is updated
+Contributions are welcome. Please make sure the tests pass
+(`-DSOCKETSHPP_BUILD_TESTS=ON`, then `ctest`), follow the existing style, and add
+tests and documentation for new features.
 
 ## License
 
-Apache License 2.0 - See [LICENSE](./LICENSE) for details.
+Apache License 2.0 - see [LICENSE](./LICENSE).
 
-Based on code from Microsoft 1DS C/C++ Telemetry and OpenTelemetry C++ SDK projects.
-
-## Acknowledgments
-
-- Microsoft 1DS Team - Original HTTP server implementation
-- OpenTelemetry Contributors - Socket abstractions
-- vcpkg Team - Excellent package management
+Based on code from the Microsoft 1DS C/C++ Telemetry and OpenTelemetry C++ SDK projects.

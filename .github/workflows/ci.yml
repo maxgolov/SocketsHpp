@@ -21,10 +21,17 @@ jobs:
             compiler: gcc
             cc: gcc
             cxx: g++
+            package_check: true
           - os: ubuntu-latest
-            compiler: clang
+            compiler: gcc-sanitizers
+            cc: gcc
+            cxx: g++
+            cmake_extra: -DENABLE_ASAN=ON -DENABLE_UBSAN=ON
+          - os: ubuntu-latest
+            compiler: clang-jwt
             cc: clang
             cxx: clang++
+            jwt: true
           - os: macos-latest
             compiler: clang
             cc: clang
@@ -44,6 +51,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes cmake ninja-build libgtest-dev
 
+      # Optional dependency: builds the MCP server's JWT validation path and its tests.
+      - name: Checkout jwt-cpp
+        if: matrix.jwt
+        uses: actions/checkout@v4
+        with:
+          repository: Thalhammer/jwt-cpp
+          ref: v0.7.1
+          path: jwt-cpp
+
+      - name: Install jwt-cpp
+        if: matrix.jwt
+        run: |
+          sudo apt-get install --yes libssl-dev
+          cmake -S jwt-cpp -B jwt-cpp/build -DJWT_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$PWD/deps"
+          cmake --install jwt-cpp/build
+
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         run: brew install cmake ninja googletest
@@ -62,7 +85,10 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
           -DSOCKETSHPP_BUILD_TESTS=ON
+          -DSOCKETSHPP_WARNINGS_AS_ERRORS=ON
           -DBUILD_EXAMPLES=ON
+          -DCMAKE_PREFIX_PATH="$PWD/deps"
+          ${{ matrix.cmake_extra }}
 
       - name: Configure macOS
         if: runner.os == 'macOS'
@@ -88,4 +114,76 @@ jobs:
         run: cmake --build build --config Debug --parallel
 
       - name: Test
-        run: ctest --test-dir build --build-config Debug --output-on-failure
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --build-config Debug --output-on-failure --timeout 120
+
+      # Install the package and build a separate consumer against it with
+      # find_package(SocketsHpp) - guards the exported CMake config / vcpkg port.
+      - name: Package consumer check
+        if: matrix.package_check
+        run: |
+          cmake --install build --prefix "$PWD/install"
+          cmake -S test/package -B build-package -G Ninja -DCMAKE_PREFIX_PATH="$PWD/install"
+          cmake --build build-package
+          ctest --test-dir build-package --output-on-failure
+
+  mingw:
+    name: ubuntu-latest / mingw-w64 (tests under Wine)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain and Wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake ninja-build googletest \
+            g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix wine64
+
+      - name: Build GoogleTest for MinGW
+        run: |
+          cmake -S /usr/src/googletest -B gtest-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchains/mingw-w64-x86_64.cmake" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/mingw-deps"
+          cmake --build gtest-build
+          cmake --install gtest-build
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64-x86_64.cmake
+          -DCMAKE_BUILD_TYPE=Debug
+          -DSOCKETSHPP_BUILD_TESTS=ON
+          -DSOCKETSHPP_WARNINGS_AS_ERRORS=ON
+          -DBUILD_EXAMPLES=ON
+          -DCMAKE_PREFIX_PATH="$PWD/mingw-deps"
+          -DCMAKE_FIND_ROOT_PATH="$PWD/mingw-deps"
+          -DCMAKE_CROSSCOMPILING_EMULATOR="$(command -v wine64 || echo /usr/lib/wine/wine64)"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          WINEDEBUG: -all
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+  docs:
+    name: ubuntu-latest / API documentation (Doxygen)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes doxygen
+
+      # Fails if any public or protected API is undocumented or a doc comment is
+      # malformed (WARN_AS_ERROR = FAIL_ON_WARNINGS in docs/Doxyfile).
+      - name: Check API documentation
+        run: doxygen docs/Doxyfile

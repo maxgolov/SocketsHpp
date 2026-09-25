@@ -3,8 +3,12 @@
 #pragma once
 
 #include <SocketsHpp/config.h>
+#include <cctype>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -30,23 +34,49 @@ namespace http
             const std::vector<uint8_t>& input)>;
 
         /**
+         * @brief Size-bounded decompression callback type.
+         * Takes compressed data and the maximum number of bytes the output may
+         * have; must throw (e.g. std::length_error) instead of producing more.
+         * Preferred over DecompressionCallback: it stops a "decompression bomb"
+         * before the memory is allocated rather than after.
+         */
+        using BoundedDecompressionCallback = std::function<std::vector<uint8_t>(
+            const std::vector<uint8_t>& input, size_t maxOutputSize)>;
+
+        /// @brief Lower-case an encoding token (content-codings are case-insensitive).
+        inline std::string normalizeEncodingName(std::string name)
+        {
+            for (char& c : name)
+            {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            return name;
+        }
+
+        /**
          * @brief Compression strategy with user-provided implementation.
          * 
          * This allows pluggable compression where users bring their own
          * compression libraries (zlib, brotli, zstd, etc.).
+         * @note The callbacks may be invoked concurrently and must be thread-safe.
          */
         class CompressionStrategy
         {
         public:
-            std::string name;  // "gzip", "deflate", "br", "zstd", etc.
-            CompressionCallback compress;
-            DecompressionCallback decompress;
+            std::string name;  ///< Content-coding token, lower case: "gzip", "deflate", "br", "zstd", etc.
+            CompressionCallback compress;      ///< Compressor; if empty, compressData() returns the input.
+            DecompressionCallback decompress;  ///< Decompressor; if empty, decompressData() returns the input.
+            BoundedDecompressionCallback decompressBounded;  ///< Optional size-bounded decompressor, preferred when set.
 
+            /// @brief Create a strategy; @p strategyName is lower-cased.
+            /// @param strategyName Content-coding token (e.g. "gzip").
+            /// @param compressFunc Compressor (may be empty).
+            /// @param decompressFunc Decompressor (may be empty).
             CompressionStrategy(
                 std::string strategyName,
                 CompressionCallback compressFunc,
                 DecompressionCallback decompressFunc)
-                : name(std::move(strategyName))
+                : name(normalizeEncodingName(std::move(strategyName)))
                 , compress(std::move(compressFunc))
                 , decompress(std::move(decompressFunc))
             {
@@ -55,8 +85,9 @@ namespace http
             /**
              * @brief Compress data with the given level.
              * @param input Input data
-             * @param level Compression level (1-9, where 9 is maximum)
-             * @return Compressed data
+             * @param level Compression level (1-9, where 9 is maximum); passed to the
+             *        callback, which may ignore it
+             * @return Compressed data, or @p input unchanged if no compressor is set
              */
             std::vector<uint8_t> compressData(const std::vector<uint8_t>& input, int level) const
             {
@@ -70,7 +101,9 @@ namespace http
             /**
              * @brief Decompress data.
              * @param input Compressed data
-             * @return Decompressed data
+             * @return Decompressed data, or @p input unchanged if no decompressor is set
+             * @warning Unbounded: prefer the overload taking maxOutputSize for
+             *          untrusted input.
              */
             std::vector<uint8_t> decompressData(const std::vector<uint8_t>& input) const
             {
@@ -80,13 +113,43 @@ namespace http
                 }
                 return input; // No decompression
             }
+
+            /**
+             * @brief Decompress data, refusing output larger than @p maxOutputSize.
+             * @param input Compressed data
+             * @param maxOutputSize Maximum decompressed size in bytes
+             * @return Decompressed data
+             * @throws std::length_error if the output would exceed the limit; anything
+             *         the callback throws is propagated
+             * @note Uses decompressBounded when available; otherwise the whole
+             *       output is produced first and then checked.
+             */
+            std::vector<uint8_t> decompressData(const std::vector<uint8_t>& input, size_t maxOutputSize) const
+            {
+                std::vector<uint8_t> output;
+                if (decompressBounded)
+                {
+                    output = decompressBounded(input, maxOutputSize);
+                }
+                else
+                {
+                    output = decompressData(input);
+                }
+                if (output.size() > maxOutputSize)
+                {
+                    throw std::length_error("Decompressed data exceeds size limit");
+                }
+                return output;
+            }
         };
 
         /**
-         * @brief Global registry for compression strategies.
+         * @brief Global registry for compression strategies, keyed by lower-case name.
          * 
-         * Users register their compression implementations at startup,
-         * then the HTTP server uses them based on Accept-Encoding headers.
+         * Users register their compression implementations at startup;
+         * CompressionMiddleware looks them up by Accept-Encoding / Content-Encoding
+         * token. HttpServer itself does not compress or decompress anything.
+         * @note Not synchronized: register strategies before any concurrent use.
          */
         class CompressionRegistry
         {
@@ -106,35 +169,37 @@ namespace http
             }
 
             /**
-             * @brief Register a compression strategy.
-             * @param strategy Compression strategy to register
+             * @brief Register a compression strategy, replacing any with the same name.
+             * @param strategy Compression strategy to register (must not be null); its
+             *        name is lower-cased
              */
             void registerStrategy(std::shared_ptr<CompressionStrategy> strategy)
             {
+                strategy->name = normalizeEncodingName(strategy->name);
                 m_strategies[strategy->name] = std::move(strategy);
             }
 
             /**
              * @brief Get a compression strategy by name.
-             * @param name Compression algorithm name (e.g., "gzip", "br")
+             * @param name Compression algorithm name (e.g., "gzip", "br"); case-insensitive
              * @return Strategy pointer or nullptr if not found
              */
             std::shared_ptr<CompressionStrategy> get(const std::string& name) const
             {
-                auto it = m_strategies.find(name);
+                auto it = m_strategies.find(normalizeEncodingName(name));
                 return (it != m_strategies.end()) ? it->second : nullptr;
             }
 
             /**
-             * @brief Check if a compression algorithm is supported.
+             * @brief Check if a compression algorithm is registered (case-insensitive).
              */
             bool isSupported(const std::string& name) const
             {
-                return m_strategies.find(name) != m_strategies.end();
+                return m_strategies.find(normalizeEncodingName(name)) != m_strategies.end();
             }
 
             /**
-             * @brief Get list of all supported compression algorithms.
+             * @brief Get the names of all registered strategies (unspecified order).
              */
             std::vector<std::string> supportedEncodings() const
             {
@@ -161,14 +226,16 @@ namespace http
          */
         struct EncodingPreference
         {
-            std::string encoding;
-            float quality;
+            std::string encoding;  ///< Lower-case content-coding token (may be "*").
+            float quality;         ///< q-value; 1.0 when absent.
 
+            /// @brief Construct from a token and q-value.
             EncodingPreference(std::string enc, float q)
                 : encoding(std::move(enc)), quality(q)
             {
             }
 
+            /// @brief Orders by descending quality, so sorting puts the most preferred first.
             bool operator<(const EncodingPreference& other) const
             {
                 return quality > other.quality; // Higher quality first
@@ -183,7 +250,10 @@ namespace http
          *   "gzip;q=1.0, br;q=0.8, *;q=0.1"
          * 
          * @param header Accept-Encoding header value
-         * @return List of encoding preferences sorted by quality
+         * @return Encoding preferences sorted by descending quality (the order of
+         *         equal-quality entries is unspecified). Tokens are lower-cased;
+         *         entries with q=0 are dropped; a missing or unparsable q counts as
+         *         1.0; "*" is kept as a literal token and not expanded.
          */
         inline std::vector<EncodingPreference> parseAcceptEncoding(const std::string& header)
         {
@@ -221,7 +291,7 @@ namespace http
                         // Trim whitespace
                         qualityPart.erase(0, qualityPart.find_first_not_of(" \t"));
                         
-                        if (qualityPart.size() >= 2 && qualityPart[0] == 'q' && qualityPart[1] == '=')
+                        if (qualityPart.size() >= 2 && (qualityPart[0] == 'q' || qualityPart[0] == 'Q') && qualityPart[1] == '=')
                         {
                             try
                             {
@@ -244,7 +314,7 @@ namespace http
 
                     if (!encoding.empty() && quality > 0.0f)
                     {
-                        preferences.emplace_back(encoding, quality);
+                        preferences.emplace_back(normalizeEncodingName(encoding), quality);
                     }
                 }
 
@@ -258,25 +328,38 @@ namespace http
         }
 
         /**
-         * @brief Compression middleware for HTTP responses.
+         * @brief Compression helper for HTTP message bodies.
          * 
-         * Automatically compresses responses based on:
+         * compressResponse() compresses a response body based on:
          * - Client's Accept-Encoding header
          * - Response size threshold
          * - Content type (avoid compressing images, etc.)
+         *
+         * decompressRequest() decodes a request body with a size limit. Neither is
+         * invoked by HttpServer automatically: call them from your handlers and set
+         * Content-Encoding (and Vary) yourself. Strategies come from
+         * CompressionRegistry.
+         * @note Configure before use; compressResponse()/decompressRequest() only
+         *       read the settings.
          */
         class CompressionMiddleware
         {
         private:
             int m_compressionLevel;
             size_t m_minSizeToCompress;
+            size_t m_maxDecompressedSize;
             std::vector<std::string> m_compressibleTypes;
             std::vector<std::string> m_excludedTypes;
 
         public:
+            /// @brief Defaults: level 6, minimum size 1024 bytes, decompression limit
+            ///        config::MAX_HTTP_BODY_SIZE, common text/JSON/XML/JavaScript types
+            ///        compressible, and already-compressed image/video/audio/archive types
+            ///        excluded.
             CompressionMiddleware()
                 : m_compressionLevel(6)
                 , m_minSizeToCompress(1024)
+                , m_maxDecompressedSize(config::MAX_HTTP_BODY_SIZE)
             {
                 // Default compressible types
                 m_compressibleTypes = {
@@ -306,7 +389,7 @@ namespace http
             }
 
             /**
-             * @brief Set compression level (1-9).
+             * @brief Set compression level; values outside 1-9 are clamped.
              */
             void setLevel(int level)
             {
@@ -314,7 +397,7 @@ namespace http
             }
 
             /**
-             * @brief Set minimum size to compress.
+             * @brief Set minimum body size (bytes) to compress (default 1024).
              * Small responses don't benefit from compression.
              */
             void setMinSize(size_t size)
@@ -323,7 +406,23 @@ namespace http
             }
 
             /**
-             * @brief Add a compressible content type.
+             * @brief Set the maximum size of a decompressed request body.
+             * Defaults to config::MAX_HTTP_BODY_SIZE; guards against decompression bombs.
+             */
+            void setMaxDecompressedSize(size_t size)
+            {
+                m_maxDecompressedSize = size;
+            }
+
+            /// @brief Get the maximum size of a decompressed request body.
+            size_t getMaxDecompressedSize() const
+            {
+                return m_maxDecompressedSize;
+            }
+
+            /**
+             * @brief Add a compressible content type (matched as a substring of the
+             *        Content-Type value).
              */
             void addCompressibleType(const std::string& contentType)
             {
@@ -331,7 +430,8 @@ namespace http
             }
 
             /**
-             * @brief Add an excluded content type.
+             * @brief Add an excluded content type (substring match, e.g. "video/");
+             *        exclusions take precedence over compressible types.
              */
             void addExcludedType(const std::string& contentType)
             {
@@ -339,7 +439,11 @@ namespace http
             }
 
             /**
-             * @brief Check if a content type should be compressed.
+             * @brief Check if a body should be compressed.
+             * @param contentType Content-Type value (case-sensitive substring matching)
+             * @param size Body size in bytes
+             * @return true if @p size is at least the minimum size, @p contentType
+             *         contains no excluded type, and it contains a compressible type.
              */
             bool shouldCompress(const std::string& contentType, size_t size) const
             {
@@ -373,6 +477,10 @@ namespace http
             /**
              * @brief Compress response if applicable.
              * 
+             * Tries the client's accepted encodings in preference order and uses the
+             * first registered strategy that succeeds and produces a smaller body.
+             * Compressor exceptions are swallowed (the next encoding is tried).
+             * Headers are not modified: set Content-Encoding to @p outEncoding.
              * @param acceptEncoding Accept-Encoding header value
              * @param contentType Response Content-Type
              * @param body Response body (modified in place if compressed)
@@ -442,6 +550,12 @@ namespace http
 
             /**
              * @brief Decompress request body.
+             * @param contentEncoding Content-Encoding header value; a single coding
+             *        (lists such as "gzip, br" are not supported)
+             * @param body Request body, replaced by the decoded data on success
+             * @return true if the body was decompressed; false if it is not
+             *         compressed, the encoding is unknown, decoding failed, or the
+             *         output would exceed getMaxDecompressedSize() (body unchanged).
              */
             bool decompressRequest(
                 const std::string& contentEncoding,
@@ -463,7 +577,7 @@ namespace http
                 try
                 {
                     std::vector<uint8_t> input(body.begin(), body.end());
-                    auto decompressed = strategy->decompressData(input);
+                    auto decompressed = strategy->decompressData(input, m_maxDecompressedSize);
                     body.assign(decompressed.begin(), decompressed.end());
                     return true;
                 }

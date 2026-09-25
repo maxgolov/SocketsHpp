@@ -73,22 +73,10 @@ if (-not (Test-Path $SocketsHppPort)) {
 Write-Host "Found SocketsHpp port at: $SocketsHppPort" -ForegroundColor Green
 Write-Host ""
 
-# Step 3: Install SocketsHpp via vcpkg overlay
-Write-Host "[3/5] Installing SocketsHpp via vcpkg..." -ForegroundColor Yellow
-Write-Host "Command: vcpkg install socketshpp --overlay-ports=$OverlayPortsDir" -ForegroundColor Gray
-
-try {
-    & vcpkg install socketshpp "--overlay-ports=$OverlayPortsDir"
-    if ($LASTEXITCODE -ne 0) {
-        throw "vcpkg install failed with exit code $LASTEXITCODE"
-    }
-    Write-Host "SocketsHpp installed successfully!" -ForegroundColor Green
-}
-catch {
-    Write-Host "ERROR: Failed to install SocketsHpp" -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    exit 1
-}
+# Step 3: Dependencies are installed by vcpkg in manifest mode during the CMake
+# configure step (vcpkg.json declares the in-repo overlay port), so there is no
+# separate "vcpkg install" (vcpkg rejects package arguments in manifest mode).
+Write-Host "[3/5] SocketsHpp will be installed from the overlay port during configure" -ForegroundColor Yellow
 Write-Host ""
 
 # Step 4: Build the example
@@ -97,7 +85,7 @@ if ($SkipBuild) {
     Write-Host ""
     Write-Host "Setup complete! To build manually:" -ForegroundColor Green
     Write-Host "  cd $ExampleDir" -ForegroundColor White
-    Write-Host "  cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VcpkgRoot/scripts/buildsystems/vcpkg.cmake" -ForegroundColor White
+    Write-Host "  cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VcpkgRoot/scripts/buildsystems/vcpkg.cmake -DVCPKG_OVERLAY_PORTS=$OverlayPortsDir" -ForegroundColor White
     Write-Host "  cmake --build build --config Release" -ForegroundColor White
     exit 0
 }
@@ -114,7 +102,7 @@ if ($CleanBuild -and (Test-Path $BuildDir)) {
 Write-Host "Configuring CMake..." -ForegroundColor Gray
 $ToolchainFile = Join-Path $VcpkgRoot "scripts/buildsystems/vcpkg.cmake"
 try {
-    & cmake -B $BuildDir -S $ExampleDir -DCMAKE_TOOLCHAIN_FILE=$ToolchainFile
+    & cmake -B $BuildDir -S $ExampleDir -DCMAKE_TOOLCHAIN_FILE=$ToolchainFile "-DVCPKG_OVERLAY_PORTS=$OverlayPortsDir"
     if ($LASTEXITCODE -ne 0) {
         throw "CMake configuration failed with exit code $LASTEXITCODE"
     }

@@ -4,7 +4,7 @@
   "description": "Header-only C++ sockets library with HTTP/1.1 and MCP support",
   "homepage": "https://github.com/maxgolov/SocketsHpp",
   "license": "Apache-2.0",
-  "supports": "!(uwp | arm)",
+  "supports": "!uwp",
   "dependencies": [
     {
       "name": "vcpkg-cmake",
@@ -15,7 +15,14 @@
       "host": true
     },
     "nlohmann-json",
-    "cpp-jwt",
     "bshoshany-thread-pool"
-  ]
+  ],
+  "features": {
+    "jwt": {
+      "description": "JWT bearer-token validation in the MCP server (jwt-cpp)",
+      "dependencies": [
+        "jwt-cpp"
+      ]
+    }
+  }
 }

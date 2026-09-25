@@ -14,6 +14,8 @@
  * to preserve original client information.
  */
 
+#include <thread>
+#include <chrono>
 #include <sockets.hpp>
 #include <SocketsHpp/http/server/http_server.h>
 #include <SocketsHpp/http/server/proxy_aware.h>
@@ -120,7 +122,13 @@ int main()
         std::cout << "  curl http://localhost:8080/\n";
         std::cout << "  curl -H \"X-Forwarded-For: 203.0.113.42\" http://localhost:8080/\n\n";
         
-        server.start();
+        server.start();  // non-blocking: the reactor runs on its own thread
+
+        // Keep the process alive while the server runs (Ctrl+C to stop)
+        while (true)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
     catch (const std::exception& e)
     {

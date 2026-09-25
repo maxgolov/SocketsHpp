@@ -1,6 +1,8 @@
 // Copyright Max Golovanov.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <thread>
+#include <chrono>
 #include <sockets.hpp>
 #include <SocketsHpp/http/server/http_server.h>
 #include <iostream>
@@ -43,7 +45,13 @@ int main()
         std::cout << "Test with:\n";
         std::cout << "  curl http://localhost:8080/\n\n";
         
-        server.start();
+        server.start();  // non-blocking: the reactor runs on its own thread
+
+        // Keep the process alive while the server runs (Ctrl+C to stop)
+        while (true)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
     catch (const std::exception& e)
     {
