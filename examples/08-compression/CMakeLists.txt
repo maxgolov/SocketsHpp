@@ -13,5 +13,5 @@ add_executable(compression-server main.cpp)
 
 # Platform-specific libraries
 if(WIN32)
-    target_link_libraries(compression-server ws2_32 Cabinet)
+    target_link_libraries(compression-server ws2_32 cabinet)
 endif()

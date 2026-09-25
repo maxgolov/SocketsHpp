@@ -27,6 +27,20 @@ namespace
 {
     static const int kMaxConnections = 16;
 
+    // AF_UNIX needs Windows 10 1803+ (and is not implemented by Wine).
+    bool UnixSocketsSupported()
+    {
+        try
+        {
+            ScopedSocket probe(AF_UNIX, SOCK_STREAM, 0);
+            return true;
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+
     struct EchoServerTest
     {
         SocketServer& server;
@@ -172,6 +186,8 @@ namespace
     TEST(SocketTests, BasicUnixDomainEchoTest)
     {
         SocketParams params{ AF_UNIX, SOCK_STREAM, 0 };
+        if (!UnixSocketsSupported())
+            GTEST_SKIP() << "AF_UNIX sockets are not supported on this host";
         // Unique name per test so parallel test runs don't collide.
         auto socket_name = GetUniqueSocketName("messenger");
         // cpp/io/c/remove
@@ -188,6 +204,8 @@ namespace
     TEST(SocketTests, ManyPacketsUnixDomainEchoTest)
     {
         SocketParams params{ AF_UNIX, SOCK_STREAM, 0 };
+        if (!UnixSocketsSupported())
+            GTEST_SKIP() << "AF_UNIX sockets are not supported on this host";
         // Unique name per test so parallel test runs don't collide.
         auto socket_name = GetUniqueSocketName("messenger");
         // cpp/io/c/remove

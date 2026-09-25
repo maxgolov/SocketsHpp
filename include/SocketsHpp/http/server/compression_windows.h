@@ -13,9 +13,17 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <compressapi.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "Cabinet.lib")
+#endif
 
 namespace SOCKETSHPP_NS::http::server::compression {
+
+namespace detail {
+/// The Windows SDK declares Compress()/Decompress() input as LPCVOID while
+/// MinGW declares PVOID; the API never writes through it, so drop const.
+inline void* win_input(const void* p) noexcept { return const_cast<void*>(p); }
+}  // namespace detail
 
 /**
  * @brief Windows Compression API implementation (MSZIP/LZMS).
@@ -59,7 +67,7 @@ public:
         SIZE_T compressedSize = 0;
         BOOL result = Compress(
             compressor,
-            input.data(),
+            detail::win_input(input.data()),
             input.size(),
             nullptr,
             0,
@@ -77,7 +85,7 @@ public:
         // Compress
         result = Compress(
             compressor,
-            input.data(),
+            detail::win_input(input.data()),
             input.size(),
             output.data(),
             output.size(),
@@ -119,7 +127,7 @@ public:
         SIZE_T decompressedSize = 0;
         BOOL result = Decompress(
             decompressor,
-            input.data(),
+            detail::win_input(input.data()),
             input.size(),
             nullptr,
             0,
@@ -145,7 +153,7 @@ public:
         // Decompress
         result = Decompress(
             decompressor,
-            input.data(),
+            detail::win_input(input.data()),
             input.size(),
             output.data(),
             output.size(),

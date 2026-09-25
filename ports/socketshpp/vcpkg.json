@@ -15,7 +15,17 @@
       "host": true
     },
     "nlohmann-json",
-    "cpp-jwt",
-    "bshoshany-thread-pool"
-  ]
+    {
+      "name": "bshoshany-thread-pool",
+      "version>=": "5.0.0"
+    }
+  ],
+  "features": {
+    "jwt": {
+      "description": "JWT bearer-token validation in the MCP server (jwt-cpp)",
+      "dependencies": [
+        "jwt-cpp"
+      ]
+    }
+  }
 }

@@ -13,5 +13,5 @@ add_executable(full-featured-server main.cpp)
 
 # Platform-specific libraries
 if(WIN32)
-    target_link_libraries(full-featured-server ws2_32 Cabinet)
+    target_link_libraries(full-featured-server ws2_32 cabinet)
 endif()

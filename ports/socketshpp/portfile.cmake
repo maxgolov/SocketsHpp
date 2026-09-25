@@ -11,6 +11,9 @@ vcpkg_cmake_configure(
     OPTIONS
         -DBUILD_TESTING=OFF
         -DBUILD_EXAMPLES=OFF
+        -DSOCKETSHPP_BUILD_TESTS=OFF
+        # BS_thread_pool.hpp comes from the bshoshany-thread-pool port
+        -DSOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL=OFF
 )
 
 vcpkg_cmake_install()
@@ -18,9 +21,6 @@ vcpkg_cmake_config_fixup(CONFIG_PATH lib/cmake/SocketsHpp)
 
 # Header-only library - remove empty lib directories
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug" "${CURRENT_PACKAGES_DIR}/lib")
-
-# Install header files
-file(INSTALL "${SOURCE_PATH}/include/" DESTINATION "${CURRENT_PACKAGES_DIR}/include")
 
 # Install license
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")

@@ -3,7 +3,10 @@ include(GoogleTest)
 
 # Try to find optional dependencies for MCP tests
 find_package(nlohmann_json CONFIG QUIET)
-find_package(cpp-jwt CONFIG QUIET)
+
+# Every test target gets the library's usage requirements (include paths,
+# threads, ws2_32 on Windows).
+link_libraries(SocketsHpp::SocketsHpp)
 
 add_definitions(-DSOCKET_SERVER_NS=SocketsHpp)
 
@@ -43,9 +46,9 @@ foreach(testname ${UNIT_TESTS})
     target_link_libraries(${testname} PRIVATE nlohmann_json::nlohmann_json)
   endif()
   
-  # Link Cabinet library for Windows compression tests
+  # Link cabinet library for Windows compression tests
   if(WIN32 AND testname STREQUAL "compression_test")
-    target_link_libraries(${testname} PRIVATE Cabinet)
+    target_link_libraries(${testname} PRIVATE cabinet)
   endif()
   
   target_include_directories(${testname} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -128,7 +131,7 @@ if(TARGET nlohmann_json::nlohmann_json)
   target_link_libraries(header_self_contained_check PRIVATE nlohmann_json::nlohmann_json)
 endif()
 if(WIN32)
-  target_link_libraries(header_self_contained_check PRIVATE Cabinet)
+  target_link_libraries(header_self_contained_check PRIVATE cabinet)
 endif()
 
 # HttpServer robustness tests (request smuggling, pipelining, backpressure,

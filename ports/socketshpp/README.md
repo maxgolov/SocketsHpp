@@ -20,7 +20,7 @@ Defines the port metadata:
 - **Description**: Lean header-only C++17 networking library
 - **Dependencies**:
   - `nlohmann-json` (JSON parsing)
-  - `cpp-jwt` (JWT authentication)
+  - `jwt-cpp` (optional, `jwt` feature: JWT validation in the MCP server)
   - `bshoshany-thread-pool` (optional multi-threading)
   - `vcpkg-cmake` (build system)
   - `vcpkg-cmake-config` (CMake package config)
@@ -157,10 +157,11 @@ Platform restrictions are defined in `vcpkg.json`:
 
 ## Build Features
 
-The port does NOT expose build features (e.g., threading, compression) because:
-- SocketsHpp is header-only - features are controlled at compile-time
-- Dependencies (thread-pool, cpp-jwt, nlohmann-json) are always available
-- Users can opt-in to features by including specific headers
+The port exposes one optional feature:
+- `jwt` - pulls in `jwt-cpp`; the exported `SocketsHpp::SocketsHpp` target then
+  defines `SOCKETSHPP_HAS_JWT_CPP` so the MCP server can validate JWT bearer tokens.
+
+Everything else is header-only and opt-in by including the relevant headers.
 
 ## Troubleshooting
 
@@ -191,7 +192,8 @@ cmake -DCMAKE_TOOLCHAIN_FILE=[vcpkg]/scripts/buildsystems/vcpkg.cmake
 
 ### Header-only library linking errors
 **Error**: Linker errors about missing symbols
-**Solution**: SocketsHpp is header-only. Link platform libraries:
+**Solution**: Link the `SocketsHpp::SocketsHpp` target, which carries the platform
+libraries (`ws2_32` on Windows, threads everywhere). Without the target, link them yourself:
 ```cmake
 # Windows
 target_link_libraries(your-target PRIVATE ws2_32)

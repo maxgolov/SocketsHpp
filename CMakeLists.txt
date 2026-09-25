@@ -96,6 +96,75 @@ if(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS)
     message(STATUS "Found BS thread pool: ${BSHOSHANY_THREAD_POOL_INCLUDE_DIRS}")
 endif()
 
+# ---------------------------------------------------------------------------
+# SocketsHpp::SocketsHpp - header-only interface target for consumers.
+# Works both in-tree (add_subdirectory) and installed (find_package).
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+find_package(Threads REQUIRED)
+add_library(SocketsHpp INTERFACE)
+add_library(SocketsHpp::SocketsHpp ALIAS SocketsHpp)
+target_compile_features(SocketsHpp INTERFACE cxx_std_17)
+target_include_directories(SocketsHpp INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+if(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS)
+    target_include_directories(SocketsHpp INTERFACE
+        $<BUILD_INTERFACE:${BSHOSHANY_THREAD_POOL_INCLUDE_DIRS}>)
+endif()
+target_link_libraries(SocketsHpp INTERFACE Threads::Threads)
+if(WIN32)
+    # MSVC also picks these up via #pragma comment(lib); MinGW needs them here.
+    target_link_libraries(SocketsHpp INTERFACE ws2_32)
+endif()
+
+# Optional JWT validation in the MCP server (jwt-cpp, https://github.com/Thalhammer/jwt-cpp)
+find_package(jwt-cpp CONFIG QUIET)
+if(TARGET jwt-cpp::jwt-cpp)
+    message(STATUS "Using jwt-cpp for MCP JWT validation")
+    target_link_libraries(SocketsHpp INTERFACE jwt-cpp::jwt-cpp)
+    target_compile_definitions(SocketsHpp INTERFACE SOCKETSHPP_HAS_JWT_CPP)
+    set(SOCKETSHPP_WITH_JWT_CPP ON)
+else()
+    set(SOCKETSHPP_WITH_JWT_CPP OFF)
+endif()
+
+# Install rules (headers + CMake package). Enabled by default for top-level builds.
+include(CMakePackageConfigHelpers)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(_socketshpp_is_top_level ON)
+else()
+    set(_socketshpp_is_top_level OFF)
+endif()
+option(SOCKETSHPP_INSTALL "Generate install rules for SocketsHpp" ${_socketshpp_is_top_level})
+# The bundled BS_thread_pool.hpp is installed alongside the headers unless the
+# consumer provides it (e.g. the vcpkg port depends on bshoshany-thread-pool).
+option(SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL "Install the bundled BS_thread_pool.hpp" ON)
+
+if(SOCKETSHPP_INSTALL)
+    install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    if(SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/BS_thread_pool.hpp")
+        install(FILES external/BS_thread_pool.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    endif()
+    install(TARGETS SocketsHpp EXPORT SocketsHppTargets)
+    set(SOCKETSHPP_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/SocketsHpp)
+    install(EXPORT SocketsHppTargets
+        NAMESPACE SocketsHpp::
+        DESTINATION ${SOCKETSHPP_CMAKE_DIR})
+    configure_package_config_file(
+        cmake/SocketsHppConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/SocketsHppConfig.cmake
+        INSTALL_DESTINATION ${SOCKETSHPP_CMAKE_DIR})
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/SocketsHppConfigVersion.cmake
+        COMPATIBILITY SameMajorVersion
+        ARCH_INDEPENDENT)
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/SocketsHppConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/SocketsHppConfigVersion.cmake
+        DESTINATION ${SOCKETSHPP_CMAKE_DIR})
+endif()
+
 if(SOCKETSHPP_BUILD_TESTS)
     find_package(GTest CONFIG REQUIRED)
     add_subdirectory(test)

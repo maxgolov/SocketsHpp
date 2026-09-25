@@ -559,7 +559,7 @@ locally to see the current discovered test count and results.
 ### Build & Testing
 - **[vcpkg](https://vcpkg.io/)** - Package manager
 - **[nlohmann/json](https://github.com/nlohmann/json)** - JSON parsing (MCP/JSON-RPC)
-- **[cpp-jwt](https://github.com/arun11299/cpp-jwt)** - JWT authentication
+- **[jwt-cpp](https://github.com/Thalhammer/jwt-cpp)** - Optional JWT validation for the MCP server (enabled automatically when found by CMake)
 - **[Google Test](https://github.com/google/googletest)** - Testing framework
 
 All test dependencies are automatically managed by vcpkg.

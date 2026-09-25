@@ -40,14 +40,6 @@
 #  define LOG_ERROR(...) ((void)0)
 #endif
 
-// Annex K macros
-#if !defined(_MSC_VER)
-#  ifndef strncpy_s
-#    define strncpy_s(dest, destsz, src, count) \
-      strncpy(dest, src, (destsz <= count) ? destsz : count)
-#  endif
-#endif
-
 // SAL macro
 #ifndef _Out_cap_
 #  define _Out_cap_(size)

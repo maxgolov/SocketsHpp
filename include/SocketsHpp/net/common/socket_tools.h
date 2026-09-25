@@ -37,9 +37,9 @@
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
-#  include <WS2tcpip.h>
-#  include <WinSock2.h>
-#  include <Windows.h>
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
 
 #  ifdef min
 // NOMINMAX may be a better choice. However, defining it globally
@@ -50,7 +50,9 @@
 #  endif
 
 // This code requires WinSock2 on Windows.
-#  pragma comment(lib, "ws2_32.lib")
+#  ifdef _MSC_VER
+#    pragma comment(lib, "ws2_32.lib")
+#  endif
 // Workaround for libcurl redefinition of afunix.h struct :
 // https://github.com/curl/curl/blob/7645324072c2f052fa662aded6f26821141ecda1/lib/config-win32.h#L721
 // Unfortunately libcurl defines a structure that should otherwise be normally defined by afunix.h .
@@ -91,13 +93,6 @@
 #  include <sys/socket.h>
 #  include <sys/un.h>
 
-#endif
-
-#if !defined(_MSC_VER) && !defined(__STDC_LIB_EXT1__)
-#  ifndef strncpy_s
-#    define strncpy_s(dest, destsz, src, count) \
-      strncpy(dest, src, (destsz <= count) ? destsz : count)
-#  endif
 #endif
 
 SOCKETSHPP_NS_BEGIN
@@ -1464,7 +1459,7 @@ namespace net
                     WSANETWORKEVENTS ne = {};
                     ::WSAEnumNetworkEvents(socket, hEvent, &ne);
                     LOG_TRACE(
-                        "Reactor: Handling socket 0x%x (index %d) with active flags 0x%x "
+                        "Reactor: Handling socket 0x%x (index %d) with active flags 0x%lx "
                         "(armed 0x%x)",
                         static_cast<int>(socket), static_cast<int>(index), ne.lNetworkEvents, flags);
 

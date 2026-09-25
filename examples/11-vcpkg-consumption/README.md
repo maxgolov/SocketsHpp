@@ -93,7 +93,7 @@ cmake --build build
 ## What This Example Demonstrates
 
 1. **Minimal vcpkg integration**: Shows the smallest possible setup
-2. **Automatic dependency management**: vcpkg handles nlohmann-json, cpp-jwt, and bshoshany-thread-pool
+2. **Automatic dependency management**: vcpkg handles nlohmann-json and bshoshany-thread-pool (plus jwt-cpp with the optional `jwt` feature)
 3. **CMake configuration**: Proper `find_package()` usage
 4. **Header-only consumption**: No linking required, just include headers
 
