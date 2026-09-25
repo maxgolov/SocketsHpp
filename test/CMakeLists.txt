@@ -24,11 +24,12 @@ set(UNIT_TESTS
   proxy_aware_test
   authentication_test
   compression_test
+  sse_parser_test
 )
 
 # MCP unit tests (require nlohmann-json)
 if(TARGET nlohmann_json::nlohmann_json)
-  list(APPEND UNIT_TESTS json_rpc_test sse_parser_test json_rpc_minimal_test mcp_config_test)
+  list(APPEND UNIT_TESTS json_rpc_test json_rpc_minimal_test mcp_config_test)
 endif()
 
 foreach(testname ${UNIT_TESTS})
@@ -36,7 +37,7 @@ foreach(testname ${UNIT_TESTS})
   target_link_libraries(${testname} ${GTEST_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
   
   # Link nlohmann-json for MCP tests
-  if(testname MATCHES "json_rpc_test|sse_parser_test|json_rpc_minimal_test|mcp_config_test")
+  if(testname MATCHES "json_rpc_test|json_rpc_minimal_test|mcp_config_test")
     target_link_libraries(${testname} PRIVATE nlohmann_json::nlohmann_json)
   endif()
   
@@ -84,4 +85,16 @@ if(NOT WIN32 AND TARGET nlohmann_json::nlohmann_json)
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   gtest_discover_tests(mcp_streamable_test TEST_PREFIX functional.)
+endif()
+
+# HttpClient / SSEClient functional tests. They drive the client against a scripted
+# raw POSIX-socket server (arpa/inet.h, sys/socket.h, unistd.h), so they are
+# POSIX-only and excluded from the Windows build.
+if(NOT WIN32)
+  add_executable(http_client_test "functional/http_client_test.cc")
+  target_link_libraries(http_client_test ${GTEST_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+  target_include_directories(http_client_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  gtest_discover_tests(http_client_test TEST_PREFIX functional.)
 endif()
