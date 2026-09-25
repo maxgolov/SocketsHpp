@@ -7,6 +7,7 @@
 // static file path containment.
 
 #include <gtest/gtest.h>
+#include <thread>
 
 #include <SocketsHpp/http/server/authentication.h>
 #include <SocketsHpp/http/server/compression.h>
@@ -411,6 +412,49 @@ TEST(FileServerDecodeTest, PercentDecoding)
     EXPECT_FALSE(TestFileServer::decodeUriPath("/a%zz", out));
     EXPECT_FALSE(TestFileServer::decodeUriPath("/a%2", out));
     EXPECT_FALSE(TestFileServer::decodeUriPath("/a%", out));
+}
+
+// --- SessionManager history retention and limits ---------------------------------
+
+TEST(SessionManagerHistoryTest, EventsExpireAfterHistoryDuration)
+{
+    SOCKETSHPP_NS::http::server::SessionManager sm;
+    sm.enableResumability(true, std::chrono::milliseconds(50), 100);
+    const std::string id = sm.createSession();
+    sm.addEvent(id, "1", "a");
+    sm.addEvent(id, "2", "b");
+    EXPECT_EQ(sm.getEventsSince(id, "").size(), 2u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    sm.addEvent(id, "3", "c");
+    auto events = sm.getEventsSince(id, "");
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0], "c");
+}
+
+TEST(SessionManagerHistoryTest, SizeLimitAppliesToExistingSessions)
+{
+    SOCKETSHPP_NS::http::server::SessionManager sm;
+    sm.enableResumability(true, std::chrono::milliseconds(60000), 100);
+    const std::string id = sm.createSession();  // created under the old limit
+    sm.enableResumability(true, std::chrono::milliseconds(60000), 2);
+    for (int i = 1; i <= 5; ++i)
+        sm.addEvent(id, std::to_string(i), "e" + std::to_string(i));
+    auto events = sm.getEventsSince(id, "");
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0], "e4");
+    EXPECT_EQ(events[1], "e5");
+    auto after4 = sm.getEventsSince(id, "4");
+    ASSERT_EQ(after4.size(), 1u);
+    EXPECT_EQ(after4[0], "e5");
+}
+
+TEST(SessionManagerHistoryTest, SessionLimitIsEnforced)
+{
+    SOCKETSHPP_NS::http::server::SessionManager sm;
+    sm.setMaxSessions(2);
+    sm.createSession();
+    sm.createSession();
+    EXPECT_THROW(sm.createSession(), std::runtime_error);
 }
 
 int main(int argc, char** argv)

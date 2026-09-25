@@ -962,6 +962,18 @@ TEST_F(StreamableHttpTest, LoggingSetLevelControlsPushLog)
     EXPECT_EQ(json::parse(bad.body)["error"]["code"], -32602);
 }
 
+TEST_F(StreamableHttpTest, LoggingSetLevelIsPerSession)
+{
+    std::string a = do_init();
+    std::string b = do_init();
+    auto r = http_post(port_,
+        R"({"jsonrpc":"2.0","id":5,"method":"logging/setLevel","params":{"level":"debug"}})", a);
+    EXPECT_EQ(json::parse(r.body)["result"], json::object());
+    EXPECT_TRUE(server_->push_log(a, "debug", "t", json("a sees debug")));
+    EXPECT_FALSE(server_->push_log(b, "debug", "t", json("b keeps the default level")));
+    EXPECT_TRUE(server_->push_log(b, "error", "t", json("b still sees errors")));
+}
+
 TEST_F(StreamableHttpTest, RegisterMethodWhileServing)
 {
     std::string session = do_init();

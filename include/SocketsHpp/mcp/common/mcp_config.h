@@ -195,7 +195,7 @@ namespace mcp
             ///        with Last-Event-ID replays the events after that id.
             bool enabled = false;
             /// @brief History retention in milliseconds (default 300000 = 5 min).
-            /// @note Currently stored but not enforced; only maxHistorySize bounds the history.
+            /// Older events are dropped and can no longer be replayed.
             int historyDurationMs = 300000;  // 5 minutes
             /// @brief Maximum events kept per session (default 1000); oldest are dropped first.
             size_t maxHistorySize = 1000;    // Max events to keep
@@ -318,8 +318,9 @@ namespace mcp
         /// MCP_RESPONSE_MODE (stream|batch), MCP_MAX_MESSAGE_SIZE,
         /// MCP_ENABLE_RESUMABILITY ("true"/"1"; anything else disables), MCP_CORS_ORIGIN,
         /// MCP_AUTH_TYPE (enables auth; "bearer" = BEARER, "api-key" = API_KEY with
-        /// header "x-api-key"; other values leave the type unchanged), MCP_AUTH_SECRET.
-        /// @throws std::invalid_argument / std::out_of_range for a non-numeric port or size.
+        /// header "x-api-key"), MCP_AUTH_SECRET.
+        /// @throws std::invalid_argument / std::out_of_range for a non-numeric port or
+        ///         size, or an unknown MCP_AUTH_TYPE.
         void parseEnv()
         {
             auto getEnv = [](const char* name) -> std::optional<std::string> {
@@ -373,6 +374,12 @@ namespace mcp
                 {
                     auth.type = AuthConfig::Type::API_KEY;
                     auth.headerName = "x-api-key";
+                }
+                else
+                {
+                    // Fail at startup rather than rejecting every request later.
+                    throw std::invalid_argument("MCP_AUTH_TYPE must be \"bearer\" or \"api-key\", got \"" +
+                                                *val + "\"");
                 }
             }
             if (auto val = getEnv("MCP_AUTH_SECRET"))

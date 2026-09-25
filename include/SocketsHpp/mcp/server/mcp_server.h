@@ -208,7 +208,9 @@ namespace mcp
                     int idx = logLevelIndex(level);
                     if (idx < 0)
                         throw JsonRpcError::invalidParams("Invalid log level: " + level);
-                    m_minLogLevel.store(idx);
+                    // Per client: the level applies to the session that sent the request.
+                    std::lock_guard<std::mutex> lock(m_logLevelsMutex);
+                    m_logLevels[currentSession()] = idx;
                     return json::object();
                 });
 
@@ -291,9 +293,9 @@ namespace mcp
             }
 
             /// @brief Push a notifications/message (log) message to a session's SSE stream.
-            /// Suppressed when level is below the minimum set by logging/setLevel
-            /// (default "warning"; the minimum is server-wide). Unknown level names are
-            /// never suppressed.
+            /// Suppressed when level is below the minimum that this session requested with
+            /// logging/setLevel (default "warning"). Unknown level names are never
+            /// suppressed.
             /// @param sessionId Session to push to
             /// @param level     One of: debug info notice warning error critical alert emergency
             /// @param logger    Logger name (e.g., "my-server")
@@ -307,7 +309,7 @@ namespace mcp
             {
                 // Suppress if below the requested log level
                 int cur = logLevelIndex(level);
-                if (cur >= 0 && cur < m_minLogLevel.load())
+                if (cur >= 0 && cur < minLogLevel(sessionId))
                     return false;
 
                 json event_body = {
@@ -634,8 +636,18 @@ namespace mcp
             std::map<std::string, json> m_clientCapabilities;
             mutable std::mutex m_clientCapsMutex;
 
-            // Current minimum log level index for notifications/message (set by logging/setLevel)
-            std::atomic<int> m_minLogLevel{3};  // "warning"
+            // Minimum log level index per session for notifications/message, set by
+            // logging/setLevel ("" = STDIO); sessions without an entry use "warning".
+            static constexpr int kDefaultLogLevel = 3;  // "warning"
+            std::map<std::string, int> m_logLevels;
+            mutable std::mutex m_logLevelsMutex;
+
+            int minLogLevel(const std::string& sessionId) const
+            {
+                std::lock_guard<std::mutex> lock(m_logLevelsMutex);
+                auto it = m_logLevels.find(sessionId);
+                return it == m_logLevels.end() ? kDefaultLogLevel : it->second;
+            }
 
             // ----------------------------------------------------------------
             // Small helpers
@@ -741,6 +753,10 @@ namespace mcp
             /// @brief Drop all per-session state kept by the MCP layer (SSE queue, caps).
             void dropSessionState(const std::string& sessionId)
             {
+                {
+                    std::lock_guard<std::mutex> lock(m_logLevelsMutex);
+                    m_logLevels.erase(sessionId);
+                }
                 {
                     std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
                     auto it = m_sseQueues.find(sessionId);

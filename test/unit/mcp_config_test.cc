@@ -5,6 +5,7 @@
 #include <SocketsHpp/mcp/common/mcp_config.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <stdexcept>
 
 using namespace SocketsHpp::mcp;
@@ -227,6 +228,41 @@ TEST(MCPConfigTest, ServerConfigProxyHeadersNotTrustedByDefault) {
     ServerConfig config;
     EXPECT_FALSE(config.trustProxyHeaders);
     EXPECT_EQ(config.maxRequestsPerMinute, 0);
+}
+
+namespace
+{
+    void setEnv(const char* name, const char* value)
+    {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+            ::setenv(name, value, 1);
+        else
+            ::unsetenv(name);
+#endif
+    }
+}  // namespace
+
+TEST(MCPConfigTest, ParseEnvAuthTypes)
+{
+    {
+        setEnv("MCP_AUTH_TYPE", "api-key");
+        ServerConfig cfg;
+        cfg.parseEnv();
+        EXPECT_TRUE(cfg.auth.enabled);
+        EXPECT_EQ(cfg.auth.type, ServerConfig::AuthConfig::Type::API_KEY);
+        EXPECT_EQ(cfg.auth.headerName, "x-api-key");
+    }
+    {
+        // An unknown type used to enable auth with no usable method (every request
+        // rejected); it is now a startup error.
+        setEnv("MCP_AUTH_TYPE", "basic");
+        ServerConfig cfg;
+        EXPECT_THROW(cfg.parseEnv(), std::invalid_argument);
+    }
+    setEnv("MCP_AUTH_TYPE", nullptr);
 }
 
 int main(int argc, char **argv) {

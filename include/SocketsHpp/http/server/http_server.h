@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <deque>
 #include <cctype>
 #include <cstring>
 #include <functional>
@@ -80,12 +82,29 @@ namespace http
         class SessionManager
         {
         private:
+            struct StoredEvent
+            {
+                std::string id;
+                std::string data;
+                std::chrono::steady_clock::time_point time;
+            };
+
             struct SessionData
             {
                 std::chrono::steady_clock::time_point lastAccess;
-                std::vector<std::pair<std::string, std::string>> eventHistory; // <eventId, eventData>
-                size_t maxHistorySize = config::DEFAULT_MAX_HISTORY_SIZE;
+                std::deque<StoredEvent> eventHistory;  // oldest first
             };
+
+            /// Drop events older than the history duration or beyond the size limit.
+            /// Caller holds m_mutex.
+            void pruneHistoryLocked(std::deque<StoredEvent>& history) const
+            {
+                const auto cutoff = std::chrono::steady_clock::now() - m_historyDuration;
+                while (!history.empty() && (history.size() > m_maxHistorySize || history.front().time < cutoff))
+                {
+                    history.pop_front();
+                }
+            }
 
             std::map<std::string, SessionData> m_sessions;
             std::mutex m_mutex;
@@ -99,9 +118,8 @@ namespace http
             /// @brief Turn event history recording (addEvent()/getEventsSince()) on or off.
             /// @param enabled When false, addEvent() is a no-op and getEventsSince()
             ///        returns nothing.
-            /// @param historyDuration Stored, but not currently used to expire events.
+            /// @param historyDuration How long events are kept (older ones are dropped).
             /// @param maxHistorySize Events kept per session (oldest dropped first).
-            ///        Applies only to sessions created after this call.
             void enableResumability(bool enabled, std::chrono::milliseconds historyDuration = std::chrono::milliseconds(300000), size_t maxHistorySize = 1000)
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -141,7 +159,6 @@ namespace http
 
                 SessionData data;
                 data.lastAccess = now;
-                data.maxHistorySize = m_maxHistorySize;
                 m_sessions[sessionId] = data;
                 return sessionId;
             }
@@ -212,7 +229,8 @@ namespace http
             
             /// @brief Append an event to a session's history for Last-Event-ID support.
             /// @note No-op if resumability is disabled or the session does not exist.
-            ///       The oldest events are dropped beyond the session's history limit.
+            ///       Events older than the history duration, and the oldest beyond the
+            ///       history size limit, are dropped.
             /// @param sessionId Session identifier
             /// @param eventId Event identifier
             /// @param eventData Event data (SSE formatted)
@@ -230,13 +248,8 @@ namespace http
                 }
                 
                 auto& history = it->second.eventHistory;
-                history.emplace_back(eventId, eventData);
-                
-                // Limit history size
-                if (history.size() > it->second.maxHistorySize)
-                {
-                    history.erase(history.begin(), history.begin() + (history.size() - it->second.maxHistorySize));
-                }
+                history.push_back({eventId, eventData, std::chrono::steady_clock::now()});
+                pruneHistoryLocked(history);
             }
             
             /// @brief Get the stored events recorded after a given event ID.
@@ -261,27 +274,28 @@ namespace http
                     return events;
                 }
                 
-                const auto& history = it->second.eventHistory;
-                
+                auto& history = it->second.eventHistory;
+                pruneHistoryLocked(history);
+
                 // If no lastEventId, return all recent events
                 if (lastEventId.empty())
                 {
                     for (const auto& event : history)
                     {
-                        events.push_back(event.second);
+                        events.push_back(event.data);
                     }
                     return events;
                 }
-                
+
                 // Find the position of lastEventId and return events after it
                 bool found = false;
                 for (const auto& event : history)
                 {
                     if (found)
                     {
-                        events.push_back(event.second);
+                        events.push_back(event.data);
                     }
-                    else if (event.first == lastEventId)
+                    else if (event.id == lastEventId)
                     {
                         found = true;
                     }
@@ -720,13 +734,14 @@ namespace http
                 return types;
             }
             
-            /// @brief Check whether the Accept header admits a media type.
+            /// @brief Check whether the Accept header admits a media type (RFC 9110 12.5.1).
+            ///
+            /// The Accept header is parsed into media ranges; the most specific range
+            /// matching @p mime_type (exact, then "type/*", then "*/*") decides, and the
+            /// type is acceptable if that range's quality value is above 0. Parameters
+            /// other than q are ignored; comparison is case-insensitive.
             /// @param mime_type The MIME type to check (e.g., "application/json")
-            /// @return true if there is no Accept header, or it contains "*/*",
-            ///         @p mime_type, or "type/*" for its type.
-            /// @note This is a substring search: quality values (including q=0) are
-            ///       ignored, and "application/json" also matches e.g.
-            ///       "application/json-seq".
+            /// @return true if there is no Accept header or the type is acceptable.
             bool accepts(const std::string& mime_type) const
             {
                 auto it = headers.find("Accept");
@@ -734,33 +749,64 @@ namespace http
                 {
                     return true;  // No Accept header = accept all
                 }
-                
-                std::string accept = it->second;
-                
-                // Check for */* (accept all)
-                if (accept.find("*/*") != std::string::npos)
+
+                auto lower = [](std::string v) {
+                    std::transform(v.begin(), v.end(), v.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    return v;
+                };
+                auto trim = [](const std::string& v) {
+                    const size_t b = v.find_first_not_of(" \t");
+                    if (b == std::string::npos)
+                        return std::string();
+                    return v.substr(b, v.find_last_not_of(" \t") - b + 1);
+                };
+
+                const std::string wanted = lower(trim(mime_type));
+                const std::string wantedType = wanted.substr(0, wanted.find('/'));
+
+                int bestSpecificity = -1;  // 2 = exact, 1 = type/*, 0 = */*
+                double bestQ = 0.0;
+                std::stringstream ranges(it->second);
+                std::string range;
+                while (std::getline(ranges, range, ','))
                 {
-                    return true;
-                }
-                
-                // Check for exact match
-                if (accept.find(mime_type) != std::string::npos)
-                {
-                    return true;
-                }
-                
-                // Check for wildcard match (e.g., "application/*")
-                size_t slash = mime_type.find('/');
-                if (slash != std::string::npos)
-                {
-                    std::string wildcard = mime_type.substr(0, slash + 1) + "*";
-                    if (accept.find(wildcard) != std::string::npos)
+                    std::stringstream parts(range);
+                    std::string media;
+                    std::getline(parts, media, ';');
+                    media = lower(trim(media));
+                    if (media.empty())
+                        continue;
+
+                    double q = 1.0;
+                    std::string param;
+                    while (std::getline(parts, param, ';'))
                     {
-                        return true;
+                        param = lower(trim(param));
+                        if (param.compare(0, 2, "q=") == 0)
+                        {
+                            char* endp = nullptr;
+                            const std::string value = param.substr(2);
+                            q = std::strtod(value.c_str(), &endp);
+                            if (endp == value.c_str())
+                                q = 1.0;  // unparsable: treat as default
+                        }
+                    }
+
+                    int specificity = -1;
+                    if (media == wanted)
+                        specificity = 2;
+                    else if (media == wantedType + "/*")
+                        specificity = 1;
+                    else if (media == "*/*")
+                        specificity = 0;
+                    if (specificity > bestSpecificity)
+                    {
+                        bestSpecificity = specificity;
+                        bestQ = q;
                     }
                 }
-                
-                return false;
+                return bestSpecificity >= 0 && bestQ > 0.0;
             }
         };
 
@@ -1067,7 +1113,7 @@ namespace http
             std::atomic<uint64_t> m_asyncSerial{0};  ///< Source of Connection::asyncToken values for thread-pool dispatches.
             /// @brief Request head size limit (setRequestLimits()).
             size_t m_maxRequestHeadersSize, m_maxRequestContentSize;  ///< Request body size limit (setRequestLimits()).
-            size_t m_maxSessions;  ///< Initialized to config::DEFAULT_MAX_SESSIONS but currently unused (not forwarded to m_sessionManager).
+            size_t m_maxSessions;  ///< Session limit forwarded to m_sessionManager (setMaxSessions()).
 
             SessionManager m_sessionManager;  ///< Sessions used by createSession() and the built-in DELETE handling.
             CorsConfig m_corsConfig;          ///< CORS settings.
@@ -1214,6 +1260,16 @@ namespace http
             void setSessionTimeout(std::chrono::seconds timeout)
             {
                 m_sessionManager.setSessionTimeout(timeout);
+            }
+
+            /// @brief Set the maximum number of live sessions (default
+            ///        config::DEFAULT_MAX_SESSIONS); createSession() throws beyond it.
+            /// @param maxSessions Session limit
+            /// @note Thread-safe.
+            void setMaxSessions(size_t maxSessions)
+            {
+                m_maxSessions = maxSessions;
+                m_sessionManager.setMaxSessions(maxSessions);
             }
 
             /// @brief Create a session (see SessionManager::createSession()).
