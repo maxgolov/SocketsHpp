@@ -1434,6 +1434,27 @@ TEST(McpCancellationTest, CancelIsScopedToSession)
     EXPECT_EQ(fromOwner["result"]["cancelled"], true) << fromOwner.dump();
 }
 
+// Legacy HTTP transport with ResponseMode::STREAM answers initialize as one SSE
+// event. It used to reply 404 because no status was set.
+TEST(McpLegacyHttpTest, StreamModeInitializeReturnsSseEvent)
+{
+    ServerConfig cfg;
+    cfg.transport    = TransportType::HTTP;
+    cfg.responseMode = ServerConfig::ResponseMode::STREAM;
+    CustomServer srv(cfg);
+
+    auto r = http_request(srv.port, "POST",
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})",
+        {{"Content-Type", "application/json"}, {"Accept", "application/json, text/event-stream"}});
+    EXPECT_EQ(r.status, 200);
+    EXPECT_NE(r.content_type.find("text/event-stream"), std::string::npos) << r.content_type;
+    const auto dataPos = r.body.find("data: ");
+    ASSERT_NE(dataPos, std::string::npos) << r.body;
+    auto msg = json::parse(r.body.substr(dataPos + 6, r.body.find('\n', dataPos) - dataPos - 6));
+    EXPECT_EQ(msg["id"], 1);
+    EXPECT_TRUE(msg.contains("result"));
+}
+
 // ── Binding behaviour ────────────────────────────────────────────────────────
 
 // A STDIO server must never open a network port, even if config.port is taken.
