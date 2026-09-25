@@ -69,6 +69,8 @@ if(NOT TARGET nlohmann_json::nlohmann_json)
         include_directories(external/nlohmann-json/single_include)
         add_library(nlohmann_json INTERFACE)
         add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+        target_include_directories(nlohmann_json INTERFACE
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external/nlohmann-json/single_include>)
     else()
         message(WARNING "nlohmann-json not found via vcpkg or submodule - MCP tests will be skipped")
     endif()

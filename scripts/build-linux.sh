@@ -112,6 +112,7 @@ CMAKE_ARGS=(
     -B build/linux-x64
     -S .
     -DCMAKE_BUILD_TYPE="$CONFIGURATION"
+    -DSOCKETSHPP_BUILD_TESTS=ON
 )
 
 # Enable examples if requested

@@ -17,6 +17,7 @@ CXX=aarch64-linux-gnu-g++ \
 cmake -B build/linux-arm64 -S . \
     -DCMAKE_TOOLCHAIN_FILE="$ARM64_ENV_DIR/arm64-toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=Debug \
+    -DSOCKETSHPP_BUILD_TESTS=ON \
     -DCMAKE_CROSSCOMPILING_EMULATOR="/usr/bin/qemu-aarch64-static;-L;/usr/aarch64-linux-gnu"
 
 cmake --build build/linux-arm64 -j$(nproc)

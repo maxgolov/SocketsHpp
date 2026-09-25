@@ -4,7 +4,7 @@
   "description": "Header-only C++ sockets library with HTTP/1.1 and MCP support",
   "homepage": "https://github.com/maxgolov/SocketsHpp",
   "license": "Apache-2.0",
-  "supports": "!(uwp | arm)",
+  "supports": "!uwp",
   "dependencies": [
     {
       "name": "vcpkg-cmake",
@@ -15,10 +15,7 @@
       "host": true
     },
     "nlohmann-json",
-    {
-      "name": "bshoshany-thread-pool",
-      "version>=": "5.0.0"
-    }
+    "bshoshany-thread-pool"
   ],
   "features": {
     "jwt": {
