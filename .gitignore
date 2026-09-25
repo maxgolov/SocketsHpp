@@ -45,6 +45,6 @@ build_test/
 # vcpkg installed packages
 vcpkg_installed/
 
-# Environment variables (keep .env.example for reference)
+# Environment variables
 .env
 .claude/worktrees/
