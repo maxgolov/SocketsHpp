@@ -106,8 +106,10 @@ namespace testing
 
     TEST_F(UrlParserTest, EmptyUrl)
     {
+        // An empty string has no host to connect to: parsing must fail
+        // (previously success_ was unconditionally true).
         UrlParser parser("");
-        EXPECT_TRUE(parser.success_);
+        EXPECT_FALSE(parser.success_);
         EXPECT_EQ(parser.url_, "");
     }
 
@@ -165,6 +167,149 @@ namespace testing
             UrlParser parser("https://example.com/path");
             EXPECT_EQ(parser.port_, 443);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Regression tests for authority parsing
+    // ---------------------------------------------------------------------
+
+    TEST_F(UrlParserTest, AtSignInQueryDoesNotChangeHost)
+    {
+        UrlParser parser("http://a.com/x?e=u@evil.com");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.host_, "a.com");
+        EXPECT_EQ(parser.port_, 80);
+        EXPECT_EQ(parser.path_, "/x");
+        EXPECT_EQ(parser.query_, "e=u@evil.com");
+    }
+
+    TEST_F(UrlParserTest, AtSignInPathDoesNotChangeHost)
+    {
+        UrlParser parser("https://good.example/@evil.com/x");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.host_, "good.example");
+        EXPECT_EQ(parser.port_, 443);
+        EXPECT_EQ(parser.path_, "/@evil.com/x");
+    }
+
+    TEST_F(UrlParserTest, UserInfoIsSkipped)
+    {
+        UrlParser parser("http://user:p@ss@host.example:8081/p");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.host_, "host.example");
+        EXPECT_EQ(parser.port_, 8081);
+        EXPECT_EQ(parser.path_, "/p");
+    }
+
+    TEST_F(UrlParserTest, ColonInPathIsNotAPort)
+    {
+        UrlParser parser("http://h/p:1");  // used to throw from std::stoi
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.host_, "h");
+        EXPECT_EQ(parser.port_, 80);
+        EXPECT_EQ(parser.path_, "/p:1");
+    }
+
+    TEST_F(UrlParserTest, SchemeInQueryIsNotAScheme)
+    {
+        UrlParser parser("example.com/redirect?to=http://evil.com");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.scheme_, "http");
+        EXPECT_EQ(parser.host_, "example.com");
+        EXPECT_EQ(parser.path_, "/redirect");
+        EXPECT_EQ(parser.query_, "to=http://evil.com");
+    }
+
+    TEST_F(UrlParserTest, NonHttpSchemeWithoutPortHasZeroPort)
+    {
+        UrlParser parser("ftp://files.example.com/doc");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.scheme_, "ftp");
+        EXPECT_EQ(parser.port_, 0);
+    }
+
+    TEST_F(UrlParserTest, SchemeIsCaseInsensitive)
+    {
+        UrlParser parser("HTTPS://Example.com/");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.scheme_, "https");
+        EXPECT_EQ(parser.port_, 443);
+    }
+
+    TEST_F(UrlParserTest, PortOutOfRangeFails)
+    {
+        UrlParser parser("http://example.com:65616/");  // used to wrap to 80
+        EXPECT_FALSE(parser.success_);
+    }
+
+    TEST_F(UrlParserTest, NonNumericPortFails)
+    {
+        EXPECT_FALSE(UrlParser("http://example.com:80abc/").success_);
+        EXPECT_FALSE(UrlParser("http://example.com:-1/").success_);
+        EXPECT_FALSE(UrlParser("http://example.com:+80/").success_);
+    }
+
+    TEST_F(UrlParserTest, EmptyPortUsesDefault)
+    {
+        UrlParser parser("http://example.com:/x");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.port_, 80);
+    }
+
+    TEST_F(UrlParserTest, MaxPort)
+    {
+        UrlParser parser("http://example.com:65535");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.port_, 65535);
+    }
+
+    TEST_F(UrlParserTest, EmptyHostFails)
+    {
+        EXPECT_FALSE(UrlParser("http:///path").success_);
+        EXPECT_FALSE(UrlParser("http://:8080/path").success_);
+        EXPECT_FALSE(UrlParser("http://user@/path").success_);
+    }
+
+    TEST_F(UrlParserTest, IPv6LiteralWithPort)
+    {
+        UrlParser parser("http://[::1]:8080/api?x=1");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.host_, "::1");
+        EXPECT_EQ(parser.port_, 8080);
+        EXPECT_EQ(parser.path_, "/api");
+        EXPECT_EQ(parser.query_, "x=1");
+    }
+
+    TEST_F(UrlParserTest, IPv6LiteralWithoutPort)
+    {
+        UrlParser parser("https://[2001:db8::7]/");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.host_, "2001:db8::7");
+        EXPECT_EQ(parser.port_, 443);
+        EXPECT_EQ(parser.path_, "/");
+    }
+
+    TEST_F(UrlParserTest, MalformedIPv6LiteralFails)
+    {
+        EXPECT_FALSE(UrlParser("http://[::1/").success_);
+        EXPECT_FALSE(UrlParser("http://[::1]x/").success_);
+        EXPECT_FALSE(UrlParser("http://[]:80/").success_);
+        EXPECT_FALSE(UrlParser("http://[evil.com]/").success_);
+    }
+
+    TEST_F(UrlParserTest, FragmentIsStripped)
+    {
+        UrlParser parser("http://example.com/p?q=1#frag@evil.com");
+        EXPECT_TRUE(parser.success_);
+        EXPECT_EQ(parser.host_, "example.com");
+        EXPECT_EQ(parser.path_, "/p");
+        EXPECT_EQ(parser.query_, "q=1");
+    }
+
+    TEST_F(UrlParserTest, InvalidSchemeFails)
+    {
+        EXPECT_FALSE(UrlParser("1http://example.com/").success_);
+        EXPECT_FALSE(UrlParser("://example.com/").success_);
     }
 
 }  // namespace testing

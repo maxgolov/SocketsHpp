@@ -3,8 +3,12 @@
 #pragma once
 
 #include <SocketsHpp/http/server/compression.h>
-#include <vector>
+#include <SocketsHpp/config.h>
+#include <cstdint>
+#include <limits>
+#include <memory>
 #include <stdexcept>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -95,7 +99,8 @@ public:
      */
     static std::vector<uint8_t> decompress(
         const std::vector<uint8_t>& input,
-        Algorithm algorithm = MSZIP)
+        Algorithm algorithm = MSZIP,
+        size_t maxOutputSize = SOCKETSHPP_NS::config::MAX_HTTP_BODY_SIZE)
     {
         if (input.empty())
         {
@@ -124,6 +129,14 @@ public:
         {
             CloseDecompressor(decompressor);
             throw std::runtime_error("Failed to query decompressed size");
+        }
+
+        // The size comes from the (untrusted) compressed stream: never allocate
+        // more than the caller allows.
+        if (decompressedSize > maxOutputSize)
+        {
+            CloseDecompressor(decompressor);
+            throw std::length_error("Windows decompression: output exceeds size limit");
         }
 
         // Allocate output buffer
@@ -167,6 +180,9 @@ inline void registerWindowsCompression()
             return WindowsCompression::decompress(input, WindowsCompression::MSZIP);
         }
     );
+    mszipStrategy->decompressBounded = [](const std::vector<uint8_t>& input, size_t maxOutputSize) {
+        return WindowsCompression::decompress(input, WindowsCompression::MSZIP, maxOutputSize);
+    };
     CompressionRegistry::instance().registerStrategy(mszipStrategy);
 
     // XPRESS
@@ -179,6 +195,9 @@ inline void registerWindowsCompression()
             return WindowsCompression::decompress(input, WindowsCompression::XPRESS);
         }
     );
+    xpressStrategy->decompressBounded = [](const std::vector<uint8_t>& input, size_t maxOutputSize) {
+        return WindowsCompression::decompress(input, WindowsCompression::XPRESS, maxOutputSize);
+    };
     CompressionRegistry::instance().registerStrategy(xpressStrategy);
 
     // LZMS
@@ -191,6 +210,9 @@ inline void registerWindowsCompression()
             return WindowsCompression::decompress(input, WindowsCompression::LZMS);
         }
     );
+    lzmsStrategy->decompressBounded = [](const std::vector<uint8_t>& input, size_t maxOutputSize) {
+        return WindowsCompression::decompress(input, WindowsCompression::LZMS, maxOutputSize);
+    };
     CompressionRegistry::instance().registerStrategy(lzmsStrategy);
 }
 

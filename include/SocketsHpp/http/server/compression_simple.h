@@ -3,8 +3,13 @@
 #pragma once
 
 #include <SocketsHpp/http/server/compression.h>
-#include <vector>
+#include <cstdint>
+#include <algorithm>
 #include <cstring>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 
 namespace SOCKETSHPP_NS::http::server::compression {
 
@@ -63,18 +68,32 @@ public:
      */
     static std::vector<uint8_t> decompress(const std::vector<uint8_t>& input)
     {
+        return decompress(input, (std::numeric_limits<size_t>::max)());
+    }
+
+    /**
+     * @brief Decompress RLE data, refusing to produce more than maxOutputSize bytes.
+     * @throws std::length_error if the output would exceed maxOutputSize
+     */
+    static std::vector<uint8_t> decompress(const std::vector<uint8_t>& input, size_t maxOutputSize)
+    {
         if (input.empty() || input.size() % 2 != 0)
         {
             throw std::runtime_error("Invalid RLE compressed data");
         }
 
         std::vector<uint8_t> output;
-        output.reserve(input.size() * 2); // Estimate
+        output.reserve((std::min)(input.size() * 2, maxOutputSize)); // Estimate
 
         for (size_t i = 0; i + 1 < input.size(); i += 2)
         {
             uint8_t count = input[i];
             uint8_t value = input[i + 1];
+
+            if (count > maxOutputSize - output.size())
+            {
+                throw std::length_error("RLE output exceeds size limit");
+            }
 
             for (uint8_t j = 0; j < count; j++)
             {
@@ -120,6 +139,9 @@ inline void registerSimpleCompression()
             return SimpleRLE::decompress(input);
         }
     );
+    rleStrategy->decompressBounded = [](const std::vector<uint8_t>& input, size_t maxOutputSize) {
+        return SimpleRLE::decompress(input, maxOutputSize);
+    };
     CompressionRegistry::instance().registerStrategy(rleStrategy);
 
     // Identity (no compression) - useful for testing

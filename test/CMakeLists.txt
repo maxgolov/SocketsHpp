@@ -26,6 +26,7 @@ set(UNIT_TESTS
   compression_test
   sse_parser_test
   thread_pool_server_test
+  http_server_hardening_test
 )
 
 # MCP unit tests (require nlohmann-json)
@@ -128,4 +129,14 @@ if(TARGET nlohmann_json::nlohmann_json)
 endif()
 if(WIN32)
   target_link_libraries(header_self_contained_check PRIVATE Cabinet)
+endif()
+
+# HttpServer robustness tests (request smuggling, pipelining, backpressure,
+# error responses). Drives the server over raw POSIX sockets, so it is
+# POSIX-only and excluded from the Windows build.
+if(NOT WIN32)
+  add_executable(http_server_robustness_test "functional/http_server_robustness_test.cc")
+  target_link_libraries(http_server_robustness_test ${GTEST_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+  target_include_directories(http_server_robustness_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  gtest_discover_tests(http_server_robustness_test TEST_PREFIX functional.)
 endif()

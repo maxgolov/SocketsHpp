@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cctype>
 
 SOCKETSHPP_NS_BEGIN
 namespace http
@@ -42,8 +43,39 @@ namespace http
                 : m_mode(TrustMode::TrustSpecific), m_trustedProxies(proxies) {}
 
             /**
+             * @brief Reduce an address to its bare IP / host part.
+             *
+             * Accepts "1.2.3.4", "1.2.3.4:5678", "::1", "[::1]", "[::1]:5678" and
+             * quoted forms ("\"[::1]:80\"") as used by the Forwarded header, and
+             * returns "1.2.3.4" / "::1". HttpRequest::client is "ip:port", so this
+             * is needed before comparing against a list of trusted proxy IPs.
+             */
+            static std::string stripPort(const std::string& address)
+            {
+                std::string a = address;
+                a.erase(0, a.find_first_not_of(" \t"));
+                a.erase(a.find_last_not_of(" \t") + 1);
+                if (a.size() >= 2 && a.front() == '"' && a.back() == '"')
+                {
+                    a = a.substr(1, a.size() - 2);
+                }
+                if (!a.empty() && a.front() == '[')
+                {
+                    auto close = a.find(']');
+                    return (close != std::string::npos) ? a.substr(1, close - 1) : a;
+                }
+                auto colon = a.find(':');
+                if (colon != std::string::npos && a.find(':', colon + 1) == std::string::npos)
+                {
+                    return a.substr(0, colon);  // IPv4 (or host name) with port
+                }
+                return a;  // No port, or a bare IPv6 address
+            }
+
+            /**
              * @brief Check if a given IP address is trusted.
-             * @param remoteAddr The IP address to check
+             * @param remoteAddr The IP address to check; a trailing port
+             *        ("ip:port" / "[v6]:port") is ignored.
              * @return true if the address should be trusted
              */
             bool isTrusted(const std::string& remoteAddr) const
@@ -55,8 +87,21 @@ namespace http
                 case TrustMode::TrustAll:
                     return true;
                 case TrustMode::TrustSpecific:
-                    return std::find(m_trustedProxies.begin(), m_trustedProxies.end(),
-                                   remoteAddr) != m_trustedProxies.end();
+                {
+                    const std::string ip = stripPort(remoteAddr);
+                    if (ip.empty())
+                    {
+                        return false;
+                    }
+                    for (const auto& proxy : m_trustedProxies)
+                    {
+                        if (stripPort(proxy) == ip)
+                        {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
                 }
                 return false;
             }
@@ -103,10 +148,9 @@ namespace http
                 }
 
                 // Check X-Forwarded-Proto (most common)
-                auto it = headers.find("X-Forwarded-Proto");
-                if (it != headers.end())
+                if (const std::string* value = findHeader(headers, "X-Forwarded-Proto"))
                 {
-                    const auto& proto = it->second;
+                    const auto proto = toLower(trim(*value));
                     if (proto == "https" || proto == "http")
                     {
                         return proto;
@@ -114,10 +158,9 @@ namespace http
                 }
 
                 // Check X-Forwarded-Protocol (alternative)
-                it = headers.find("X-Forwarded-Protocol");
-                if (it != headers.end())
+                if (const std::string* value = findHeader(headers, "X-Forwarded-Protocol"))
                 {
-                    const auto& proto = it->second;
+                    const auto proto = toLower(trim(*value));
                     if (proto == "https" || proto == "http")
                     {
                         return proto;
@@ -125,18 +168,16 @@ namespace http
                 }
 
                 // Check X-Forwarded-Ssl
-                it = headers.find("X-Forwarded-Ssl");
-                if (it != headers.end())
+                if (const std::string* value = findHeader(headers, "X-Forwarded-Ssl"))
                 {
-                    return (it->second == "on") ? "https" : "http";
+                    return (toLower(trim(*value)) == "on") ? "https" : "http";
                 }
 
                 // Check Forwarded header (RFC 7239)
-                it = headers.find("Forwarded");
-                if (it != headers.end())
+                if (const std::string* value = findHeader(headers, "Forwarded"))
                 {
-                    auto proto = extractForwardedParam(it->second, "proto");
-                    if (!proto.empty())
+                    auto proto = toLower(extractForwardedParam(*value, "proto"));
+                    if (proto == "https" || proto == "http")
                     {
                         return proto;
                     }
@@ -158,28 +199,23 @@ namespace http
                 const std::string& remoteAddr,
                 const TrustProxyConfig& trustConfig)
             {
+                const std::string directIP = TrustProxyConfig::stripPort(remoteAddr);
+
                 // Only trust forwarded headers from trusted proxies
                 if (!trustConfig.isTrusted(remoteAddr))
                 {
-                    return remoteAddr;
+                    return directIP;
                 }
 
-                // Check X-Forwarded-For (most common)
-                auto it = headers.find("X-Forwarded-For");
-                if (it != headers.end())
+                // X-Forwarded-For: client, proxy1, proxy2
+                // Each proxy appends the address it received the request from, so
+                // only the right-most entries (added by our own trusted proxies) are
+                // reliable; anything to their left may have been forged by the
+                // client. Walk right-to-left and return the first address that is
+                // not a trusted proxy.
+                if (const std::string* xff = findHeader(headers, "X-Forwarded-For"))
                 {
-                    // X-Forwarded-For: client, proxy1, proxy2
-                    // First IP is the original client
-                    auto xff = it->second;
-                    auto comma = xff.find(',');
-                    auto clientIP = (comma != std::string::npos) 
-                        ? xff.substr(0, comma) 
-                        : xff;
-                    
-                    // Trim whitespace
-                    clientIP.erase(0, clientIP.find_first_not_of(" \t"));
-                    clientIP.erase(clientIP.find_last_not_of(" \t") + 1);
-                    
+                    auto clientIP = rightmostUntrusted(splitList(*xff), trustConfig);
                     if (!clientIP.empty())
                     {
                         return clientIP;
@@ -187,35 +223,36 @@ namespace http
                 }
 
                 // Check X-Real-IP (nginx)
-                it = headers.find("X-Real-IP");
-                if (it != headers.end() && !it->second.empty())
+                if (const std::string* realIP = findHeader(headers, "X-Real-IP"))
                 {
-                    return it->second;
-                }
-
-                // Check Forwarded header (RFC 7239)
-                it = headers.find("Forwarded");
-                if (it != headers.end())
-                {
-                    auto forParam = extractForwardedParam(it->second, "for");
-                    if (!forParam.empty())
+                    auto ip = TrustProxyConfig::stripPort(*realIP);
+                    if (!ip.empty())
                     {
-                        // Remove quotes and port if present
-                        if (forParam.front() == '"' && forParam.back() == '"')
-                        {
-                            forParam = forParam.substr(1, forParam.length() - 2);
-                        }
-                        // Strip port (e.g., "192.168.1.1:12345" -> "192.168.1.1")
-                        auto colon = forParam.find(':');
-                        if (colon != std::string::npos)
-                        {
-                            forParam = forParam.substr(0, colon);
-                        }
-                        return forParam;
+                        return ip;
                     }
                 }
 
-                return remoteAddr;
+                // Check Forwarded header (RFC 7239): one element per hop, same
+                // right-to-left rule as X-Forwarded-For.
+                if (const std::string* forwarded = findHeader(headers, "Forwarded"))
+                {
+                    std::vector<std::string> hops;
+                    for (const auto& element : splitList(*forwarded))
+                    {
+                        auto forParam = extractForwardedParam(element, "for");
+                        if (!forParam.empty())
+                        {
+                            hops.push_back(forParam);
+                        }
+                    }
+                    auto clientIP = rightmostUntrusted(hops, trustConfig);
+                    if (!clientIP.empty())
+                    {
+                        return clientIP;
+                    }
+                }
+
+                return directIP;
             }
 
             /**
@@ -236,17 +273,17 @@ namespace http
                 // Check X-Forwarded-Host if from trusted proxy
                 if (trustConfig.isTrusted(remoteAddr))
                 {
-                    auto it = headers.find("X-Forwarded-Host");
-                    if (it != headers.end() && !it->second.empty())
+                    const std::string* value = findHeader(headers, "X-Forwarded-Host");
+                    if (value && !value->empty())
                     {
-                        return it->second;
+                        return *value;
                     }
 
                     // Check Forwarded header (RFC 7239)
-                    it = headers.find("Forwarded");
-                    if (it != headers.end())
+                    value = findHeader(headers, "Forwarded");
+                    if (value)
                     {
-                        auto hostParam = extractForwardedParam(it->second, "host");
+                        auto hostParam = extractForwardedParam(*value, "host");
                         if (!hostParam.empty())
                         {
                             return hostParam;
@@ -255,10 +292,10 @@ namespace http
                 }
 
                 // Fallback to Host header
-                auto it = headers.find("Host");
-                if (it != headers.end() && !it->second.empty())
+                const std::string* host = findHeader(headers, "Host");
+                if (host && !host->empty())
                 {
-                    return it->second;
+                    return *host;
                 }
 
                 return fallbackHost;
@@ -277,32 +314,131 @@ namespace http
             }
 
         private:
+            static std::string trim(const std::string& value)
+            {
+                auto first = value.find_first_not_of(" \t");
+                if (first == std::string::npos)
+                {
+                    return std::string();
+                }
+                auto last = value.find_last_not_of(" \t");
+                return value.substr(first, last - first + 1);
+            }
+
+            static std::string toLower(std::string value)
+            {
+                for (char& c : value)
+                {
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                return value;
+            }
+
+            static bool iequals(const std::string& a, const std::string& b)
+            {
+                return a.size() == b.size() &&
+                    std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+                        return std::tolower(static_cast<unsigned char>(x)) ==
+                               std::tolower(static_cast<unsigned char>(y));
+                    });
+            }
+
+            /// Header lookup that works for both exact-case maps and HttpRequest's
+            /// Title-Case-normalized map (where "X-Real-IP" is stored as "X-Real-Ip").
+            template<typename HeaderMap>
+            static const std::string* findHeader(const HeaderMap& headers, const std::string& name)
+            {
+                auto it = headers.find(name);
+                if (it != headers.end())
+                {
+                    return &it->second;
+                }
+                for (const auto& entry : headers)
+                {
+                    if (iequals(entry.first, name))
+                    {
+                        return &entry.second;
+                    }
+                }
+                return nullptr;
+            }
+
+            /// Split a comma-separated header value into trimmed, non-empty items.
+            static std::vector<std::string> splitList(const std::string& value)
+            {
+                std::vector<std::string> items;
+                size_t start = 0;
+                for (;;)
+                {
+                    auto comma = value.find(',', start);
+                    auto item = trim(value.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+                    if (!item.empty())
+                    {
+                        items.push_back(item);
+                    }
+                    if (comma == std::string::npos)
+                    {
+                        break;
+                    }
+                    start = comma + 1;
+                }
+                return items;
+            }
+
+            /// Walk a hop list right-to-left and return the first address that is
+            /// not a trusted proxy (port stripped). If every hop is trusted, the
+            /// left-most one is returned. Empty if the list is empty.
+            static std::string rightmostUntrusted(const std::vector<std::string>& hops,
+                                                  const TrustProxyConfig& trustConfig)
+            {
+                std::string candidate;
+                for (auto it = hops.rbegin(); it != hops.rend(); ++it)
+                {
+                    auto ip = TrustProxyConfig::stripPort(*it);
+                    if (ip.empty())
+                    {
+                        continue;
+                    }
+                    candidate = ip;
+                    if (!trustConfig.isTrusted(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+                return candidate;
+            }
+
             /**
-             * @brief Extract a parameter from RFC 7239 Forwarded header.
+             * @brief Extract a parameter from one RFC 7239 Forwarded element.
              * Example: "for=192.0.2.60;proto=https;host=example.com"
+             * Parameter names are case-insensitive; quoted values are unquoted.
              */
             static std::string extractForwardedParam(
                 const std::string& forwarded,
                 const std::string& param)
             {
-                auto paramKey = param + "=";
-                auto pos = forwarded.find(paramKey);
-                if (pos == std::string::npos)
+                size_t start = 0;
+                for (;;)
                 {
-                    return "";
+                    auto end = forwarded.find_first_of(";,", start);
+                    auto pair = trim(forwarded.substr(start, end == std::string::npos ? std::string::npos : end - start));
+                    auto eq = pair.find('=');
+                    if (eq != std::string::npos && iequals(trim(pair.substr(0, eq)), param))
+                    {
+                        auto value = trim(pair.substr(eq + 1));
+                        if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+                        {
+                            value = value.substr(1, value.size() - 2);
+                        }
+                        return value;
+                    }
+                    if (end == std::string::npos)
+                    {
+                        break;
+                    }
+                    start = end + 1;
                 }
-
-                pos += paramKey.length();
-                auto end = forwarded.find_first_of(";,", pos);
-                auto value = (end != std::string::npos)
-                    ? forwarded.substr(pos, end - pos)
-                    : forwarded.substr(pos);
-
-                // Trim whitespace
-                value.erase(0, value.find_first_not_of(" \t"));
-                value.erase(value.find_last_not_of(" \t") + 1);
-
-                return value;
+                return "";
             }
         };
 

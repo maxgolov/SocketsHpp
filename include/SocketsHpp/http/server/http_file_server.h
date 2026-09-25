@@ -12,6 +12,7 @@
 #include <vector>
 #include <algorithm>
 #include <filesystem>
+#include <cwctype>
 
 SOCKETSHPP_NS_BEGIN
 namespace http
@@ -40,7 +41,12 @@ namespace http
                 addListeningPort(port);
             };
 
-            virtual ~HttpFileServer() = default;
+            virtual ~HttpFileServer()
+            {
+                // Stop the reactor before ServeFile/mime_types_ are destroyed:
+                // ~HttpServer runs only after this class's members are gone.
+                stop();
+            }
 
             /**
              * @brief Set the document root directory for serving files
@@ -68,54 +74,140 @@ namespace http
              */
             void InitializeFileEndpoint(HttpFileServer& server) { server[root_endpt_] = ServeFile; }
 
-        private:
+        protected:
+            /**
+             * @brief Decode a percent-encoded URI path (no '+' => ' ' translation).
+             * @param encoded Raw path from the request target (query already removed)
+             * @param decoded Output
+             * @return false on malformed escapes or if the result contains a NUL byte
+             */
+            static bool decodeUriPath(const std::string& encoded, std::string& decoded)
+            {
+                decoded.clear();
+                decoded.reserve(encoded.size());
+                auto hexValue = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                for (size_t i = 0; i < encoded.size(); ++i)
+                {
+                    char c = encoded[i];
+                    if (c == '%')
+                    {
+                        if (i + 2 >= encoded.size())
+                        {
+                            return false;
+                        }
+                        int hi = hexValue(encoded[i + 1]);
+                        int lo = hexValue(encoded[i + 2]);
+                        if (hi < 0 || lo < 0)
+                        {
+                            return false;
+                        }
+                        c = static_cast<char>((hi << 4) | lo);
+                        i += 2;
+                    }
+                    if (c == '\0')
+                    {
+                        return false;
+                    }
+                    decoded += c;
+                }
+                return true;
+            }
+
+            /**
+             * @brief Component-wise check that @p path lies inside @p root.
+             *
+             * Both paths must already be absolute and normalized. A plain string
+             * prefix test is wrong ("/srv/www" would contain "/srv/www-private");
+             * comparing path elements is not. Comparison is case-sensitive except
+             * on Windows, whose file systems are case-insensitive.
+             */
+            static bool isPathWithinRoot(const std::filesystem::path& path, const std::filesystem::path& root)
+            {
+                auto rootIt = root.begin();
+                auto rootEnd = root.end();
+                auto pathIt = path.begin();
+                auto pathEnd = path.end();
+                for (; rootIt != rootEnd; ++rootIt, ++pathIt)
+                {
+                    if (rootIt->empty())
+                    {
+                        // Trailing separator on the root ("/srv/www/") yields an empty
+                        // final element; it must not require a matching element.
+                        auto next = rootIt;
+                        if (++next == rootEnd)
+                        {
+                            break;
+                        }
+                    }
+                    if (pathIt == pathEnd)
+                    {
+                        return false;
+                    }
+#ifdef _WIN32
+                    const std::wstring a = rootIt->wstring();
+                    const std::wstring b = pathIt->wstring();
+                    if (a.size() != b.size() ||
+                        !std::equal(a.begin(), a.end(), b.begin(), [](wchar_t x, wchar_t y) {
+                            return ::towlower(x) == ::towlower(y);
+                        }))
+                    {
+                        return false;
+                    }
+#else
+                    if (rootIt->native() != pathIt->native())
+                    {
+                        return false;
+                    }
+#endif
+                }
+                return true;
+            }
+
             /**
              * @brief Validate and normalize file path with security checks
-             * @param requestedPath Path requested by client
+             * @param requestedPath Decoded path requested by client, relative to the document root
              * @param resolvedPath Output parameter for the validated absolute path
-             * @return true if path is valid and safe, false otherwise
+             * @return true if path names a regular file inside the document root
              */
             bool validateFilePath(const std::string& requestedPath, std::filesystem::path& resolvedPath)
             {
                 try
                 {
-                    // Construct full path relative to document root
-                    std::filesystem::path fullPath = m_documentRoot / requestedPath;
-
-                    // Normalize path (resolve . and ..)
-                    fullPath = std::filesystem::weakly_canonical(fullPath);
-
-                    // Path traversal protection: ensure resolved path is within document root
-                    if (m_pathTraversalProtection)
-                    {
-                        auto docRootCanonical = std::filesystem::weakly_canonical(m_documentRoot);
-                        auto pathStr = fullPath.string();
-                        auto rootStr = docRootCanonical.string();
-
-                        // Check if fullPath starts with document root
-                        bool isWithinRoot = pathStr.size() >= rootStr.size() &&
-                            std::equal(rootStr.begin(), rootStr.end(), pathStr.begin(),
-                                [](char a, char b) {
-                                    return std::tolower(static_cast<unsigned char>(a)) ==
-                                           std::tolower(static_cast<unsigned char>(b));
-                                });
-
-                        if (!isWithinRoot)
-                        {
-                            LOG_WARN("Path traversal attempt blocked: %s (resolved to %s, root is %s)",
-                                requestedPath.c_str(), fullPath.string().c_str(), docRootCanonical.string().c_str());
-                            return false;
-                        }
-                    }
-
-                    // Check if path exists and is a regular file
-                    if (!std::filesystem::exists(fullPath))
+                    if (requestedPath.find('\0') != std::string::npos)
                     {
                         return false;
                     }
 
-                    // Don't serve directories directly (unless looking for index.html)
-                    if (std::filesystem::is_directory(fullPath))
+                    // Always resolve relative to the document root: drop leading
+                    // separators so "//etc/passwd" cannot become an absolute path.
+                    std::string relative = requestedPath;
+                    relative.erase(0, relative.find_first_not_of("/\\"));
+                    std::filesystem::path requested(relative);
+                    if (requested.has_root_name() || requested.has_root_directory())
+                    {
+                        return false;  // e.g. "C:/..." on Windows
+                    }
+
+                    // Resolve ".", ".." and symlinks
+                    auto docRootCanonical = std::filesystem::weakly_canonical(m_documentRoot).lexically_normal();
+                    std::filesystem::path fullPath =
+                        std::filesystem::weakly_canonical(docRootCanonical / requested).lexically_normal();
+
+                    // Path traversal protection: ensure resolved path is within document root
+                    if (m_pathTraversalProtection && !isPathWithinRoot(fullPath, docRootCanonical))
+                    {
+                        LOG_WARN("Path traversal attempt blocked: %s (resolved to %s, root is %s)",
+                            requestedPath.c_str(), fullPath.string().c_str(), docRootCanonical.string().c_str());
+                        return false;
+                    }
+
+                    // Only regular files are served (no directories, devices, FIFOs, sockets)
+                    if (!std::filesystem::is_regular_file(fullPath))
                     {
                         return false;
                     }
@@ -130,6 +222,7 @@ namespace http
                 }
             }
 
+        private:
             /**
              * Return whether a file is found whose location is searched for relative to
              * the document root. If the file is valid, fill result with
@@ -184,10 +277,9 @@ namespace http
              */
             std::string GetFileName(std::string name)
             {
-                if (name.back() == '/')
+                if (!name.empty() && name.back() == '/')
                 {
-                    auto temp = name.substr(0, name.size() - 1);
-                    name = temp;
+                    name.pop_back();
                 }
                 // If filename appears to be a directory, serve the hypothetical index.html
                 // file there
@@ -208,8 +300,20 @@ namespace http
             HttpRequestCallback ServeFile{
                 [&](HttpRequest const& req, HttpResponse& resp) {
                   LOG_INFO("File: %s\n", req.uri.c_str());
-                  auto f = GetFileName(req.uri);
-                  auto filename = f.c_str() + 1;
+                  // Strip query/fragment and percent-decode the path before lookup
+                  std::string rawPath = req.uri.substr(0, req.uri.find_first_of("?#"));
+                  std::string decodedPath;
+                  if (!decodeUriPath(rawPath, decodedPath))
+                  {
+                    resp.headers[CONTENT_TYPE] = CONTENT_TYPE_TEXT;
+                    resp.code = 400;
+                    resp.message = HttpServer::getDefaultResponseMessage(resp.code);
+                    resp.body = resp.message;
+                    return 400;
+                  }
+                  auto f = GetFileName(decodedPath);
+                  std::string filename = f;
+                  filename.erase(0, filename.find_first_not_of('/'));
 
                   std::vector<char> content;
                   if (FileGetSuccess(filename, content))

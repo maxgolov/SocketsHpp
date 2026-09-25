@@ -3,8 +3,12 @@
 #pragma once
 
 #include <SocketsHpp/config.h>
+#include <cctype>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +34,26 @@ namespace http
             const std::vector<uint8_t>& input)>;
 
         /**
+         * @brief Size-bounded decompression callback type.
+         * Takes compressed data and the maximum number of bytes the output may
+         * have; must throw (e.g. std::length_error) instead of producing more.
+         * Preferred over DecompressionCallback: it stops a "decompression bomb"
+         * before the memory is allocated rather than after.
+         */
+        using BoundedDecompressionCallback = std::function<std::vector<uint8_t>(
+            const std::vector<uint8_t>& input, size_t maxOutputSize)>;
+
+        /// @brief Lower-case an encoding token (content-codings are case-insensitive).
+        inline std::string normalizeEncodingName(std::string name)
+        {
+            for (char& c : name)
+            {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            return name;
+        }
+
+        /**
          * @brief Compression strategy with user-provided implementation.
          * 
          * This allows pluggable compression where users bring their own
@@ -41,12 +65,13 @@ namespace http
             std::string name;  // "gzip", "deflate", "br", "zstd", etc.
             CompressionCallback compress;
             DecompressionCallback decompress;
+            BoundedDecompressionCallback decompressBounded;  // Optional, preferred when set
 
             CompressionStrategy(
                 std::string strategyName,
                 CompressionCallback compressFunc,
                 DecompressionCallback decompressFunc)
-                : name(std::move(strategyName))
+                : name(normalizeEncodingName(std::move(strategyName)))
                 , compress(std::move(compressFunc))
                 , decompress(std::move(decompressFunc))
             {
@@ -80,6 +105,30 @@ namespace http
                 }
                 return input; // No decompression
             }
+
+            /**
+             * @brief Decompress data, refusing output larger than @p maxOutputSize.
+             * @throws std::length_error if the output would exceed the limit
+             * @note Uses decompressBounded when available; otherwise the whole
+             *       output is produced first and then checked.
+             */
+            std::vector<uint8_t> decompressData(const std::vector<uint8_t>& input, size_t maxOutputSize) const
+            {
+                std::vector<uint8_t> output;
+                if (decompressBounded)
+                {
+                    output = decompressBounded(input, maxOutputSize);
+                }
+                else
+                {
+                    output = decompressData(input);
+                }
+                if (output.size() > maxOutputSize)
+                {
+                    throw std::length_error("Decompressed data exceeds size limit");
+                }
+                return output;
+            }
         };
 
         /**
@@ -111,6 +160,7 @@ namespace http
              */
             void registerStrategy(std::shared_ptr<CompressionStrategy> strategy)
             {
+                strategy->name = normalizeEncodingName(strategy->name);
                 m_strategies[strategy->name] = std::move(strategy);
             }
 
@@ -121,7 +171,7 @@ namespace http
              */
             std::shared_ptr<CompressionStrategy> get(const std::string& name) const
             {
-                auto it = m_strategies.find(name);
+                auto it = m_strategies.find(normalizeEncodingName(name));
                 return (it != m_strategies.end()) ? it->second : nullptr;
             }
 
@@ -130,7 +180,7 @@ namespace http
              */
             bool isSupported(const std::string& name) const
             {
-                return m_strategies.find(name) != m_strategies.end();
+                return m_strategies.find(normalizeEncodingName(name)) != m_strategies.end();
             }
 
             /**
@@ -221,7 +271,7 @@ namespace http
                         // Trim whitespace
                         qualityPart.erase(0, qualityPart.find_first_not_of(" \t"));
                         
-                        if (qualityPart.size() >= 2 && qualityPart[0] == 'q' && qualityPart[1] == '=')
+                        if (qualityPart.size() >= 2 && (qualityPart[0] == 'q' || qualityPart[0] == 'Q') && qualityPart[1] == '=')
                         {
                             try
                             {
@@ -244,7 +294,7 @@ namespace http
 
                     if (!encoding.empty() && quality > 0.0f)
                     {
-                        preferences.emplace_back(encoding, quality);
+                        preferences.emplace_back(normalizeEncodingName(encoding), quality);
                     }
                 }
 
@@ -270,6 +320,7 @@ namespace http
         private:
             int m_compressionLevel;
             size_t m_minSizeToCompress;
+            size_t m_maxDecompressedSize;
             std::vector<std::string> m_compressibleTypes;
             std::vector<std::string> m_excludedTypes;
 
@@ -277,6 +328,7 @@ namespace http
             CompressionMiddleware()
                 : m_compressionLevel(6)
                 , m_minSizeToCompress(1024)
+                , m_maxDecompressedSize(config::MAX_HTTP_BODY_SIZE)
             {
                 // Default compressible types
                 m_compressibleTypes = {
@@ -320,6 +372,20 @@ namespace http
             void setMinSize(size_t size)
             {
                 m_minSizeToCompress = size;
+            }
+
+            /**
+             * @brief Set the maximum size of a decompressed request body.
+             * Defaults to config::MAX_HTTP_BODY_SIZE; guards against decompression bombs.
+             */
+            void setMaxDecompressedSize(size_t size)
+            {
+                m_maxDecompressedSize = size;
+            }
+
+            size_t getMaxDecompressedSize() const
+            {
+                return m_maxDecompressedSize;
             }
 
             /**
@@ -442,6 +508,9 @@ namespace http
 
             /**
              * @brief Decompress request body.
+             * @return true if the body was decompressed; false if it is not
+             *         compressed, the encoding is unknown, decoding failed, or the
+             *         output would exceed getMaxDecompressedSize() (body unchanged).
              */
             bool decompressRequest(
                 const std::string& contentEncoding,
@@ -463,7 +532,7 @@ namespace http
                 try
                 {
                     std::vector<uint8_t> input(body.begin(), body.end());
-                    auto decompressed = strategy->decompressData(input);
+                    auto decompressed = strategy->decompressData(input, m_maxDecompressedSize);
                     body.assign(decompressed.begin(), decompressed.end());
                     return true;
                 }

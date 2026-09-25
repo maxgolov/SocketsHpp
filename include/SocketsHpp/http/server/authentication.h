@@ -4,7 +4,9 @@
 
 #include <SocketsHpp/config.h>
 #include <SocketsHpp/utils/base64.h>
+#include <cctype>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <memory>
 #include <unordered_map>
@@ -53,6 +55,47 @@ namespace http
 
             operator bool() const { return authenticated; }
         };
+
+        namespace detail
+        {
+            /**
+             * @brief Match an Authorization header against an auth-scheme.
+             *
+             * The scheme is case-insensitive (RFC 9110, 11.1) and must be followed
+             * by at least one space. On success @p credentials receives the rest of
+             * the header with surrounding whitespace removed.
+             */
+            inline bool matchAuthScheme(const std::string& header, const std::string& scheme, std::string& credentials)
+            {
+                size_t start = header.find_first_not_of(" \t");
+                if (start == std::string::npos || header.size() < start + scheme.size() + 1)
+                {
+                    return false;
+                }
+                for (size_t i = 0; i < scheme.size(); ++i)
+                {
+                    if (std::tolower(static_cast<unsigned char>(header[start + i])) !=
+                        std::tolower(static_cast<unsigned char>(scheme[i])))
+                    {
+                        return false;
+                    }
+                }
+                size_t sep = start + scheme.size();
+                if (header[sep] != ' ' && header[sep] != '\t')
+                {
+                    return false;
+                }
+                size_t first = header.find_first_not_of(" \t", sep);
+                if (first == std::string::npos)
+                {
+                    credentials.clear();
+                    return true;
+                }
+                size_t last = header.find_last_not_of(" \t");
+                credentials = header.substr(first, last - first + 1);
+                return true;
+            }
+        }
 
         /**
          * @brief Base class for authentication strategies.
@@ -117,19 +160,12 @@ namespace http
                 
                 std::string authHeader = req.get_header_value("Authorization");
 
-                // Check for Bearer prefix
-                const std::string bearerPrefix = "Bearer ";
-                if (authHeader.substr(0, bearerPrefix.length()) != bearerPrefix)
+                // Check for Bearer scheme (case-insensitive) and extract the token
+                std::string token;
+                if (!detail::matchAuthScheme(authHeader, "Bearer", token))
                 {
                     return AuthResult::failure("Invalid authorization scheme");
                 }
-
-                // Extract token
-                auto token = authHeader.substr(bearerPrefix.length());
-                
-                // Trim whitespace
-                token.erase(0, token.find_first_not_of(" \t"));
-                token.erase(token.find_last_not_of(" \t") + 1);
 
                 if (token.empty())
                 {
@@ -228,15 +264,12 @@ namespace http
                 
                 std::string authHeader = req.get_header_value("Authorization");
 
-                // Check for Basic prefix
-                const std::string basicPrefix = "Basic ";
-                if (authHeader.substr(0, basicPrefix.length()) != basicPrefix)
+                // Check for Basic scheme (case-insensitive) and extract base64 credentials
+                std::string base64Creds;
+                if (!detail::matchAuthScheme(authHeader, "Basic", base64Creds))
                 {
                     return AuthResult::failure("Invalid authorization scheme");
                 }
-
-                // Extract base64 credentials
-                auto base64Creds = authHeader.substr(basicPrefix.length());
 
                 // Decode base64 using unified utility
                 std::string credentials;
@@ -244,7 +277,7 @@ namespace http
                 {
                     credentials = SocketsHpp::utils::Base64::decode(base64Creds);
                 }
-                catch (const std::invalid_argument& e)
+                catch (const std::invalid_argument&)
                 {
                     return AuthResult::failure("Invalid base64 encoding in credentials");
                 }
@@ -356,11 +389,19 @@ namespace http
                 // All strategies failed
                 if (m_requireAuth)
                 {
-                    // Set WWW-Authenticate headers
+                    // Response headers are a single-valued map, so emit all challenges
+                    // in one WWW-Authenticate field as a comma-separated list, which
+                    // RFC 9110 (11.6.1) defines as equivalent to repeated fields.
+                    std::string combined;
                     for (const auto& challenge : challenges)
                     {
-                        res.set_header("WWW-Authenticate", challenge);
+                        if (!combined.empty())
+                        {
+                            combined += ", ";
+                        }
+                        combined += challenge;
                     }
+                    res.set_header("WWW-Authenticate", combined);
                     res.set_content(R"({"error": "Unauthorized"})", "application/json");
                     
                     return false;

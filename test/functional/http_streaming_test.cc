@@ -20,8 +20,7 @@ class HttpStreamingTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        // Find available port
-        testPort = 18080;
+        testPort = 0;  // Assigned from the server's ephemeral port in each test
     }
 
     void TearDown() override
@@ -39,7 +38,9 @@ protected:
 // Test basic chunked encoding
 TEST_F(HttpStreamingTest, ChunkedEncodingBasic)
 {
-    HttpServer server("127.0.0.1", testPort);
+    HttpServer server("127.0.0.1", 0);  // ephemeral port: safe under ctest -j
+    testPort = server.getListeningPort();
+    ASSERT_GT(testPort, 0);
     
     // Handler that uses chunked encoding
     HttpRequestCallback chunkedHandler{[](HttpRequest const& req, HttpResponse& resp) {
@@ -87,7 +88,9 @@ TEST_F(HttpStreamingTest, ChunkedEncodingBasic)
 // Test Server-Sent Events (SSE)
 TEST_F(HttpStreamingTest, SSEEvents)
 {
-    HttpServer server("127.0.0.1", testPort);
+    HttpServer server("127.0.0.1", 0);  // ephemeral port: safe under ctest -j
+    testPort = server.getListeningPort();
+    ASSERT_GT(testPort, 0);
     
     HttpRequestCallback sseHandler{[](HttpRequest const& req, HttpResponse& resp) {
         resp.code = 200;
@@ -135,7 +138,9 @@ TEST_F(HttpStreamingTest, SSEEvents)
 // Test client chunked response parsing
 TEST_F(HttpStreamingTest, ClientChunkedParsing)
 {
-    HttpServer server("127.0.0.1", testPort);
+    HttpServer server("127.0.0.1", 0);  // ephemeral port: safe under ctest -j
+    testPort = server.getListeningPort();
+    ASSERT_GT(testPort, 0);
     
     HttpRequestCallback handler{[](HttpRequest const& req, HttpResponse& resp) {
         resp.code = 200;
@@ -187,7 +192,9 @@ TEST_F(HttpStreamingTest, ClientChunkedParsing)
 // Test HTTP POST with body
 TEST_F(HttpStreamingTest, PostRequest)
 {
-    HttpServer server("127.0.0.1", testPort);
+    HttpServer server("127.0.0.1", 0);  // ephemeral port: safe under ctest -j
+    testPort = server.getListeningPort();
+    ASSERT_GT(testPort, 0);
     
     HttpRequestCallback echoHandler{[](HttpRequest const& req, HttpResponse& resp) {
         resp.code = 200;
