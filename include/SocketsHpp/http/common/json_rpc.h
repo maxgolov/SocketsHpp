@@ -22,10 +22,16 @@ namespace http
         /// @brief JSON-RPC 2.0 error object
         struct JsonRpcError
         {
+            /// @brief Error code (see the factory functions for the standard codes).
+            /// @note Not initialized by default construction.
             int code;
+            /// @brief Short error description.
             std::string message;
+            /// @brief Optional additional error information ("data" member).
             std::optional<json> data;
 
+            /// @brief Build the JSON error object {"code", "message"[, "data"]}.
+            /// @return The error object.
             json toJson() const
             {
                 json j = {
@@ -39,6 +45,11 @@ namespace http
                 return j;
             }
 
+            /// @brief Read an error object.
+            /// @param j JSON object with integer "code", string "message" and optional "data".
+            /// @return The parsed error.
+            /// @throws nlohmann::json::exception if "code" or "message" is missing or has the
+            ///         wrong type.
             static JsonRpcError fromJson(const json& j)
             {
                 JsonRpcError error;
@@ -52,32 +63,52 @@ namespace http
             }
 
             // Standard JSON-RPC 2.0 error codes
+            /// @brief -32700 Parse error (invalid JSON).
+            /// @param message Error message.
+            /// @return The error.
             static JsonRpcError parseError(const std::string& message = "Parse error")
             {
                 return {-32700, message, std::nullopt};
             }
 
+            /// @brief -32600 Invalid Request (not a valid request object).
+            /// @param message Error message.
+            /// @return The error.
             static JsonRpcError invalidRequest(const std::string& message = "Invalid Request")
             {
                 return {-32600, message, std::nullopt};
             }
 
+            /// @brief -32601 Method not found; message is "Method not found: <method>".
+            /// @param method Name of the unknown method.
+            /// @return The error.
             static JsonRpcError methodNotFound(const std::string& method)
             {
                 return {-32601, "Method not found: " + method, std::nullopt};
             }
 
+            /// @brief -32602 Invalid params.
+            /// @param message Error message.
+            /// @return The error.
             static JsonRpcError invalidParams(const std::string& message = "Invalid params")
             {
                 return {-32602, message, std::nullopt};
             }
 
+            /// @brief -32603 Internal error.
+            /// @param message Error message.
+            /// @return The error.
             static JsonRpcError internalError(const std::string& message = "Internal error")
             {
                 return {-32603, message, std::nullopt};
             }
 
             // MCP-specific error codes (-32000 to -32099 reserved for implementation-defined errors)
+            /// @brief Error with a caller-chosen code (-32000 to -32099 are reserved for
+            /// implementation-defined server errors; the code is not checked).
+            /// @param code Error code.
+            /// @param message Error message.
+            /// @return The error.
             static JsonRpcError serverError(int code, const std::string& message)
             {
                 return {code, message, std::nullopt};
@@ -94,13 +125,19 @@ namespace http
         using JsonRpcId = std::variant<std::monostate, std::string, std::int64_t, std::nullptr_t>;
 
         /// @brief Returns true if the id holds a value (string, integer or explicit null).
+        /// @param id Id to test.
+        /// @return false only for std::monostate (absent id).
         inline bool jsonRpcIdPresent(const JsonRpcId& id)
         {
             return !std::holds_alternative<std::monostate>(id);
         }
 
         /// @brief Convert a JSON value to a JsonRpcId.
-        /// @return false if the value is not a valid JSON-RPC id (string, integer, null).
+        /// @param j JSON value of an "id" member.
+        /// @param out Receives the id on success; unchanged on failure.
+        /// @return false if the value is not a valid JSON-RPC id (string, integer, null);
+        ///         fractional numbers, booleans, objects, arrays and unsigned integers
+        ///         above INT64_MAX are rejected.
         inline bool jsonRpcIdFromJson(const json& j, JsonRpcId& out)
         {
             if (j.is_string())
@@ -132,6 +169,8 @@ namespace http
         }
 
         /// @brief Convert a JsonRpcId to JSON. An absent id (monostate) maps to null.
+        /// @param id Id to convert.
+        /// @return JSON string, integer or null.
         inline json jsonRpcIdToJson(const JsonRpcId& id)
         {
             if (auto s = std::get_if<std::string>(&id))
@@ -148,11 +187,18 @@ namespace http
         /// @brief JSON-RPC 2.0 request
         struct JsonRpcRequest
         {
+            /// @brief Protocol version (default "2.0"; not validated by parse()).
             std::string jsonrpc = "2.0";
-            JsonRpcId id; // absent (monostate), string, integer, or null
+            /// @brief Request id: absent (monostate, i.e. a notification), string, integer, or null.
+            JsonRpcId id;
+            /// @brief Method name.
             std::string method;
+            /// @brief Optional "params" value (any JSON; object or array per the spec).
             std::optional<json> params;
 
+            /// @brief Build the request object. "id" is omitted when absent and "params"
+            /// when not set.
+            /// @return The request object.
             json toJson() const
             {
                 json j = {
@@ -174,11 +220,19 @@ namespace http
                 return j;
             }
 
+            /// @brief Serialize toJson() as compact JSON text.
+            /// @return JSON text.
             std::string serialize() const
             {
                 return toJson().dump();
             }
 
+            /// @brief Parse a request (or notification) from JSON text.
+            /// @param jsonStr JSON object text; "jsonrpc" defaults to "2.0" when missing.
+            /// @return The request; id stays std::monostate when "id" is absent.
+            /// @throws nlohmann::json::exception on invalid JSON, a non-object value, or a
+            ///         missing/non-string "method".
+            /// @throws std::invalid_argument if "id" is not a string, integer or null.
             static JsonRpcRequest parse(const std::string& jsonStr)
             {
                 json j = json::parse(jsonStr);
@@ -206,6 +260,7 @@ namespace http
 
             /// @brief True if the message carried an "id" member (including "id": null).
             /// A request without an id is a notification.
+            /// @return jsonRpcIdPresent(id).
             bool hasId() const
             {
                 return jsonRpcIdPresent(id);
@@ -215,10 +270,15 @@ namespace http
         /// @brief JSON-RPC 2.0 notification (request without ID)
         struct JsonRpcNotification
         {
+            /// @brief Protocol version (default "2.0"; not validated by parse()).
             std::string jsonrpc = "2.0";
+            /// @brief Method name.
             std::string method;
+            /// @brief Optional "params" value.
             std::optional<json> params;
 
+            /// @brief Build the notification object (no "id"; "params" only when set).
+            /// @return The notification object.
             json toJson() const
             {
                 json j = {
@@ -234,11 +294,19 @@ namespace http
                 return j;
             }
 
+            /// @brief Serialize toJson() as compact JSON text.
+            /// @return JSON text.
             std::string serialize() const
             {
                 return toJson().dump();
             }
 
+            /// @brief Parse a notification from JSON text. An "id" member, if present, is
+            /// ignored (use JsonRpcRequest::parse() to distinguish requests).
+            /// @param jsonStr JSON object text.
+            /// @return The notification.
+            /// @throws nlohmann::json::exception on invalid JSON, a non-object value, or a
+            ///         missing/non-string "method".
             static JsonRpcNotification parse(const std::string& jsonStr)
             {
                 json j = json::parse(jsonStr);
@@ -259,11 +327,18 @@ namespace http
         /// @brief JSON-RPC 2.0 response
         struct JsonRpcResponse
         {
+            /// @brief Protocol version (default "2.0"; not validated by parse()).
             std::string jsonrpc = "2.0";
+            /// @brief Id of the request being answered; absent (monostate) serializes as null.
             JsonRpcId id;
+            /// @brief Result on success (ignored by toJson() when error is set).
             std::optional<json> result;
+            /// @brief Error on failure; takes precedence over result.
             std::optional<JsonRpcError> error;
 
+            /// @brief Build the response object. Always includes "id"; includes "error" if
+            /// set, else "result" (null when unset).
+            /// @return The response object.
             json toJson() const
             {
                 json j = {
@@ -289,11 +364,20 @@ namespace http
                 return j;
             }
 
+            /// @brief Serialize toJson() as compact JSON text.
+            /// @return JSON text.
             std::string serialize() const
             {
                 return toJson().dump();
             }
 
+            /// @brief Parse a response from JSON text. "error" wins over "result"; neither
+            /// is required (both then stay unset).
+            /// @param jsonStr JSON object text.
+            /// @return The response; id stays std::monostate when "id" is absent.
+            /// @throws nlohmann::json::exception on invalid JSON, a non-object value, or a
+            ///         malformed "error" object.
+            /// @throws std::invalid_argument if "id" is not a string, integer or null.
             static JsonRpcResponse parse(const std::string& jsonStr)
             {
                 json j = json::parse(jsonStr);
@@ -322,6 +406,10 @@ namespace http
                 return resp;
             }
 
+            /// @brief Make a success response.
+            /// @param id Id of the request being answered.
+            /// @param result Result value.
+            /// @return The response.
             static JsonRpcResponse success(const JsonRpcId& id, const json& result)
             {
                 JsonRpcResponse resp;
@@ -330,6 +418,10 @@ namespace http
                 return resp;
             }
 
+            /// @brief Make an error response.
+            /// @param id Id of the request being answered (monostate/null if unknown).
+            /// @param error Error to report.
+            /// @return The response.
             static JsonRpcResponse failure(const JsonRpcId& id, const JsonRpcError& error)
             {
                 JsonRpcResponse resp;

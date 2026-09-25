@@ -13,8 +13,10 @@ namespace utils {
 /**
  * @brief Base64 encoding and decoding utilities
  * 
- * Provides RFC 4648 compliant base64 encoding and decoding.
- * All functions are header-only and have no external dependencies.
+ * Provides RFC 4648 (section 4) base64 encoding and decoding with the standard
+ * alphabet and '=' padding (no URL-safe variant, no line wrapping).
+ * All functions are header-only, stateless (safe to call from any thread) and
+ * have no external dependencies.
  */
 class Base64
 {
@@ -254,9 +256,10 @@ inline std::string encode(const std::string& data)
 }
 
 /**
- * @brief Decode base64 string
+ * @brief Decode base64 string (strict; see Base64::decode())
  * @param encoded_string Base64-encoded string
  * @return Decoded binary data as string
+ * @throws std::invalid_argument if the input is not strictly valid, padded base64
  */
 inline std::string decode(const std::string& encoded_string)
 {
@@ -264,7 +267,7 @@ inline std::string decode(const std::string& encoded_string)
 }
 
 /**
- * @brief Validate base64 string
+ * @brief Validate base64 string (same strict rules as decode())
  * @param str String to validate
  * @return true if valid base64
  */
