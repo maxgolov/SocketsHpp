@@ -155,6 +155,69 @@ namespace testing
         server.stop();
     }
 
+    // A stateful (mutable) stream callback must keep its state across chunks in
+    // both dispatch modes; the stream must end when it returns "".
+    TEST_P(HttpServerEndToEndTest, StatefulStreamCallback)
+    {
+        const bool useThreadPool = GetParam();
+        HttpServer server("127.0.0.1", 0);
+        if (useThreadPool)
+            server.enableThreadPool(2);
+        server.route("/events", [](const HttpRequest&, HttpResponse& res) {
+            res.set_header("Content-Type", "text/event-stream");
+            int n = 0;
+            res.send_chunk_stream([n]() mutable -> std::string {
+                if (n == 3)
+                    return "";
+                ++n;
+                return SSEEvent::message("e" + std::to_string(n), std::to_string(n)).format();
+            });
+            return 200;
+        });
+        server.start();
+
+        SOCKETSHPP_NS::http::client::HttpClient client;
+        client.setReadTimeout(5000);
+        SOCKETSHPP_NS::http::client::HttpClientResponse res;
+        ASSERT_TRUE(client.get("http://127.0.0.1:" + std::to_string(server.getListeningPort()) + "/events", res));
+        EXPECT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "id: 1\ndata: e1\n\nid: 2\ndata: e2\n\nid: 3\ndata: e3\n\n");
+        server.stop();
+    }
+
+    // Handlers that set a body (or a status) but return 0 have handled the request,
+    // and the most specific route wins regardless of registration order.
+    TEST_P(HttpServerEndToEndTest, BodyWithoutStatusIsOkAndLongestPrefixWins)
+    {
+        const bool useThreadPool = GetParam();
+        HttpServer server("127.0.0.1", 0);
+        if (useThreadPool)
+            server.enableThreadPool(2);
+        server.route("/", [](const HttpRequest&, HttpResponse& res) {
+            res.set_content("root");
+            return 0;
+        });
+        server.route("/api", [](const HttpRequest&, HttpResponse& res) {
+            res.set_content("api");
+            return 0;
+        });
+        server.route("/declines", [](const HttpRequest&, HttpResponse&) { return 0; });
+        server.start();
+        const std::string base = "http://127.0.0.1:" + std::to_string(server.getListeningPort());
+
+        SOCKETSHPP_NS::http::client::HttpClient client;
+        SOCKETSHPP_NS::http::client::HttpClientResponse res;
+        ASSERT_TRUE(client.get(base + "/api/items", res));
+        EXPECT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "api");
+        ASSERT_TRUE(client.get(base + "/other", res));
+        EXPECT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "root");
+        ASSERT_TRUE(client.get(base + "/declines", res));  // falls through to "/"
+        EXPECT_EQ(res.body, "root");
+        server.stop();
+    }
+
     INSTANTIATE_TEST_SUITE_P(Dispatch, HttpServerEndToEndTest, ::testing::Values(false, true),
                              [](const ::testing::TestParamInfo<bool>& info) {
                                  return info.param ? std::string("ThreadPool") : std::string("Reactor");

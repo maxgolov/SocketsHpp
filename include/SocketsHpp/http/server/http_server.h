@@ -757,21 +757,15 @@ namespace http
                 onStreamEnd = std::move(onEnd);
             }
 
-            /// @brief Send a single chunk (for manual chunked streaming)
-            /// @param chunk Chunk data to send
-            /// @note This is used internally; for setting up streaming use send_chunk_stream
+            /// @brief Append data to a buffered (non-streaming) response body.
+            /// @warning Nothing is sent until the handler returns: calling this in a loop
+            ///          (e.g. to emit SSE events over time) delivers everything at once,
+            ///          at the end. To stream, use send_chunk_stream(), whose callback is
+            ///          invoked repeatedly and each returned chunk is sent immediately.
+            /// @param chunk Data to append; an empty string is ignored.
             void send_chunk(const std::string& chunk)
             {
-                // This is a placeholder for API compatibility
-                // Actual chunking is handled by the server's streaming mechanism
-                if (chunk.empty())
-                {
-                    streaming = false;
-                }
-                else
-                {
-                    body += chunk;
-                }
+                body += chunk;
             }
         };
 
@@ -1253,8 +1247,17 @@ namespace http
                 {
                     return;
                 }
-                Connection& conn = connIt->second;
+                flushAndContinue(connIt->second);  // may close and erase the connection
+            }
 
+            /// @brief Send pending output, then advance the state machine - what a writable
+            /// event does. Also used by thread-pool workers after they queue output: sending
+            /// from the worker (rather than only arming Writable) is required on Windows,
+            /// where FD_WRITE is signalled only after a send fails with WSAEWOULDBLOCK.
+            /// Called with m_connectionsMutex held.
+            /// @warning May close and erase conn; callers must not use it afterwards.
+            void flushAndContinue(Connection& conn)
+            {
                 if (sendMore(conn))
                 {
                     if (conn.closeRequested)
@@ -1263,7 +1266,7 @@ namespace http
                     }
                     return;
                 }
-                handleConnection(conn);  // May close and erase conn - must be the last use
+                handleConnection(conn);
             }
 
             virtual void onSocketClosed(Socket socket) override
@@ -1925,11 +1928,13 @@ namespace http
                             if (m_threadPool.has_value())
                             {
                                 Socket sock = conn.socket;
+                                const uint64_t token = ++m_asyncSerial;
+                                conn.asyncToken = token;
                                 conn.state = Connection::ProcessingAsync;  // prevent re-entry
                                 auto streamCb  = conn.response.streamCallback;  // copy by value
                                 auto onEndCb   = conn.response.onStreamEnd;     // copy by value
                                 bool kaAllowed = allowKeepalive;
-                                m_threadPool->detach_task([this, sock, streamCb, onEndCb, kaAllowed]() mutable
+                                m_threadPool->detach_task([this, sock, token, streamCb, onEndCb, kaAllowed]() mutable
                                 {
                                     // *** Run outside the mutex — may block for up to writeDeadlineSeconds ***
                                     std::string chunkData = streamCb();
@@ -1939,7 +1944,8 @@ namespace http
                                     auto it = m_connections.find(sock);
                                     if (it == m_connections.end()) return;  // connection gone
                                     Connection& ac = it->second;
-                                    if (ac.state != Connection::ProcessingAsync) return;  // state changed
+                                    if (ac.state != Connection::ProcessingAsync || ac.asyncToken != token)
+                                        return;  // closed (fd possibly reused) or state changed
 
                                     if (chunkData.empty())
                                     {
@@ -1961,8 +1967,10 @@ namespace http
                                         ac.state = Connection::StreamingChunked;
                                         LOG_TRACE("HttpServer: stream chunk #%zu ready (thread pool)", ac.chunksSent);
                                     }
-                                    // Wake up reactor to send the buffered data
-                                    m_reactor.addSocket(sock, Reactor::Writable | Reactor::Closed);
+                                    if (m_stopped.load()) return;
+                                    // Send now; if the socket would block, sendMore() arms
+                                    // Writable and the reactor finishes the chunk.
+                                    flushAndContinue(ac);  // may close and erase ac - last use
                                 });
                                 return;  // reactor thread is now free
                             }
@@ -2410,27 +2418,46 @@ namespace http
                         conn.request.method = "GET";
                     }
 
-                    // Registered handlers run first, for every method. A handler
-                    // "handles" the request by returning a non-zero status or by
-                    // setting response.code itself (e.g. via set_status()).
+                    // Registered handlers run first, for every method. Candidates are the
+                    // handlers whose path is a prefix of the URI, most specific (longest)
+                    // first, then in registration order - so a "/" catch-all never shadows
+                    // "/events". A handler handles the request - and later candidates are
+                    // skipped - when it returns a non-zero status, sets a status itself
+                    // (set_status()), or produces a response (a body or a streaming
+                    // callback; the status then defaults to 200). Returning 0 without
+                    // touching the response declines, so the next candidate runs.
                     conn.response.code = 0;
+                    std::vector<HttpRequestHandler*> candidates;
                     for (auto& handler : m_handlers)
                     {
-                        if (handler.second == nullptr)
+                        if (handler.second != nullptr &&
+                            conn.request.uri.compare(0, handler.first.length(), handler.first) == 0)
                         {
-                            continue;
+                            candidates.push_back(&handler);
                         }
-                        if (conn.request.uri.length() >= handler.first.length() &&
-                            strncmp(conn.request.uri.c_str(), handler.first.c_str(), handler.first.length()) == 0)
+                    }
+                    std::stable_sort(candidates.begin(), candidates.end(),
+                        [](const HttpRequestHandler* a, const HttpRequestHandler* b) {
+                            return a->first.length() > b->first.length();
+                        });
+                    for (HttpRequestHandler* handler : candidates)
+                    {
+                        LOG_TRACE("HttpServer: [%s] using handler for %s", conn.request.client.c_str(),
+                            handler->first.c_str());
+                        int result = handler->second->onHttpRequest(conn.request, conn.response);
+                        if (result != 0)
                         {
-                            LOG_TRACE("HttpServer: [%s] using handler for %s", conn.request.client.c_str(),
-                                handler.first.c_str());
-                            int result = handler.second->onHttpRequest(conn.request, conn.response);
-                            if (result != 0)
-                            {
-                                conn.response.code = result;
-                                break;
-                            }
+                            conn.response.code = result;
+                            break;
+                        }
+                        if (conn.response.code != 0)
+                        {
+                            break;  // status set via set_status()
+                        }
+                        if (!conn.response.body.empty() || conn.response.streamCallback)
+                        {
+                            conn.response.code = 200;
+                            break;
                         }
                     }
 
@@ -2536,6 +2563,13 @@ namespace http
                 {
                     conn.streamingActive = true;
                     conn.chunksSent = 0;
+
+                    // The thread-pool path copies the callback for every chunk. Share
+                    // one instance so a stateful callback (e.g. a mutable lambda that
+                    // counts events) keeps its state across calls.
+                    auto shared = std::make_shared<std::function<std::string()>>(
+                        std::move(conn.response.streamCallback));
+                    conn.response.streamCallback = [shared]() { return (*shared)(); };
 
                     // Use chunked encoding for streaming
                     if (chunkedResponse)

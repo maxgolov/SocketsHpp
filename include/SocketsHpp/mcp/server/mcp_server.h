@@ -1063,7 +1063,8 @@ namespace mcp
                         headerValue(req, "Accept").find("text/event-stream") != std::string::npos;
                     if (isInit && wantsSSE && m_config.responseMode == ServerConfig::ResponseMode::STREAM)
                     {
-                        // Send response via SSE
+                        // Send response via SSE (one complete event, then end of stream)
+                        res.set_status(200);
                         res.set_header("Content-Type", "text/event-stream");
                         res.set_header("Cache-Control", "no-cache");
                         res.set_header("Connection", "keep-alive");
@@ -1077,8 +1078,7 @@ namespace mcp
                             m_sessionManager.addEvent(sessionId, event.id, event.format());
                         }
 
-                        res.send_chunk(event.format());
-                        res.send_chunk(""); // End stream
+                        res.send(event.format());
                         return;
                     }
 

@@ -33,7 +33,11 @@ curl -N http://localhost:8080/json-events
 - Server-Sent Events (SSE) with `text/event-stream`
 - `SSEEvent` helper class for formatting events
 - Event fields: `data`, `event`, `id`
-- Streaming chunks with `res.send_chunk()`
+- Streaming with `res.send_chunk_stream(callback)`: the callback is called repeatedly,
+  each returned chunk is sent immediately, and returning `""` ends the stream
+  (`res.send_chunk()` only appends to a buffered response - it does not stream)
+- `server.enableThreadPool()` so stream callbacks that wait between events don't block
+  other clients
 - Custom event types
 - JSON data in SSE events
 - HTML/JavaScript SSE client
