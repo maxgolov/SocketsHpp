@@ -782,7 +782,10 @@ namespace http
 
             // Streaming support
             bool streaming = false;           ///< Streaming response; set by send_chunk_stream().
-            bool useChunkedEncoding = false;  ///< Use chunked transfer coding; set by send_chunk_stream().
+            /// Set by send_chunk_stream(); informational only. The framing of a streamed
+            /// body follows the request's protocol: chunked for HTTP/1.1, raw and
+            /// close-delimited for HTTP/1.0 (which has no chunked coding).
+            bool useChunkedEncoding = false;
             /// @brief Produces the next chunk of a streaming response; returning an empty
             ///        string ends the stream. Set by send_chunk_stream().
             std::function<std::string()> streamCallback;
@@ -828,11 +831,14 @@ namespace http
                 body = content;
             }
 
-            /// @brief Make this a streaming response sent with chunked transfer coding.
+            /// @brief Make this a streaming response.
             ///
             /// After the headers are sent the server calls @p callback repeatedly and
-            /// sends each returned string as one chunk immediately; returning "" ends
-            /// the stream, after which @p callback is not called again and @p onEnd runs.
+            /// sends each returned string immediately - as one chunk of a chunked body for
+            /// HTTP/1.1, or raw (the body then ends when the connection closes) for
+            /// HTTP/1.0. Returning "" ends the stream, after which @p callback is not
+            /// called again and @p onEnd runs. A HEAD request gets the headers only and
+            /// the callback is never called.
             /// @note Without a thread pool the callback runs on the reactor thread and
             ///       blocks every other connection while it waits; with
             ///       HttpServer::enableThreadPool() each call runs on a worker thread.
@@ -998,6 +1004,10 @@ namespace http
                 /// @brief Identifies the in-flight thread-pool dispatch; lets the worker detect
                 /// that the connection was closed (and its fd possibly reused) meanwhile.
                 uint64_t asyncToken = 0;
+
+                /// Streamed body uses chunked framing (HTTP/1.1). HTTP/1.0 clients get the
+                /// raw data, delimited by closing the connection.
+                bool chunkedStream = true;
             };
 
             std::string m_serverHost;                ///< Value of the "Server" response header.
@@ -2190,7 +2200,7 @@ namespace http
                                     {
                                         // End of stream: queue terminal chunk, transition to SendingBody
                                         // so the normal send/keepalive path handles the rest.
-                                        ac.sendBuffer = "0\r\n\r\n";
+                                        ac.sendBuffer = streamTerminator(ac);
                                         ac.streamingActive = false;
                                         ac.keepalive &= kaAllowed;
                                         if (onEndCb) onEndCb();
@@ -2199,9 +2209,7 @@ namespace http
                                     }
                                     else
                                     {
-                                        std::ostringstream hdr;
-                                        hdr << std::hex << chunkData.size() << "\r\n";
-                                        ac.sendBuffer = hdr.str() + chunkData + "\r\n";
+                                        ac.sendBuffer = frameStreamChunk(ac, chunkData);
                                         ac.chunksSent++;
                                         ac.state = Connection::StreamingChunked;
                                         LOG_TRACE("HttpServer: stream chunk #%zu ready (thread pool)", ac.chunksSent);
@@ -2224,7 +2232,7 @@ namespace http
                                 // several writable events) and then applies keep-alive.
                                 // Leaving StreamingChunked here guarantees the callback is
                                 // never invoked again after it signalled end-of-stream.
-                                conn.sendBuffer = "0\r\n\r\n";  // Terminal chunk
+                                conn.sendBuffer = streamTerminator(conn);  // Terminal chunk
                                 LOG_TRACE("HttpServer: [%s] sending terminal chunk (sent %zu chunks)",
                                     conn.request.client.c_str(), conn.chunksSent);
                                 conn.streamingActive = false;
@@ -2236,10 +2244,8 @@ namespace http
                                 continue;
                             }
 
-                            // Format as chunked data: <size in hex>\r\n<data>\r\n
-                            std::ostringstream chunkHeader;
-                            chunkHeader << std::hex << chunkData.size() << "\r\n";
-                            conn.sendBuffer = chunkHeader.str() + chunkData + "\r\n";
+                            // Chunked framing (<size in hex>\r\n<data>\r\n), raw for HTTP/1.0
+                            conn.sendBuffer = frameStreamChunk(conn, chunkData);
                             conn.chunksSent++;
 
                             LOG_TRACE("HttpServer: [%s] sending chunk #%zu (%zu bytes)",
@@ -2256,7 +2262,7 @@ namespace http
                         else
                         {
                             // No callback - end stream
-                            conn.sendBuffer = "0\r\n\r\n";
+                            conn.sendBuffer = streamTerminator(conn);
                             conn.streamingActive = false;
                             conn.state = Connection::SendingBody;
                             continue;
@@ -2569,6 +2575,31 @@ namespace http
                 return (code >= 100 && code < 200) || code == 204 || code == 304;
             }
 
+            /// @brief Wire format of one streamed chunk: chunked framing, or raw data for
+            ///        HTTP/1.0 (see Connection::chunkedStream).
+            /// @param conn Connection being streamed to
+            /// @param data Chunk payload returned by the stream callback
+            /// @return Bytes to send
+            static std::string frameStreamChunk(const Connection& conn, const std::string& data)
+            {
+                if (!conn.chunkedStream)
+                {
+                    return data;
+                }
+                std::ostringstream framed;
+                framed << std::hex << data.size() << "\r\n" << data << "\r\n";
+                return framed.str();
+            }
+
+            /// @brief End-of-stream marker: the terminal chunk, or nothing for HTTP/1.0
+            ///        (closing the connection ends the body).
+            /// @param conn Connection being streamed to
+            /// @return Bytes to send
+            static std::string streamTerminator(const Connection& conn)
+            {
+                return conn.chunkedStream ? std::string("0\r\n\r\n") : std::string();
+            }
+
             /// @brief Serialize the status line and headers and move to SendingHeaders.
             void beginResponse(Connection& conn)
             {
@@ -2785,15 +2816,22 @@ namespace http
 
                 // Decide on connection persistence before emitting the Connection header,
                 // so the header always matches what the server actually does.
-                const bool isStreaming = conn.response.streaming && conn.response.streamCallback;
-                bool chunkedResponse = false;
-                if (isStreaming)
+                bool isStreaming = conn.response.streaming && conn.response.streamCallback;
+                // HEAD never carries a body: answer a streaming route with its headers only.
+                const bool headOfStream = isStreaming && isHeadRequest;
+                if (headOfStream)
                 {
-                    chunkedResponse = conn.response.useChunkedEncoding || conn.request.protocol == constants::HTTP_1_1;
-                    if (!chunkedResponse)
-                    {
-                        conn.keepalive = false;  // Body is delimited by connection close
-                    }
+                    isStreaming = false;
+                    conn.response.streaming = false;
+                    conn.response.streamCallback = nullptr;
+                    conn.response.onStreamEnd = nullptr;
+                }
+                // Chunked transfer coding exists only in HTTP/1.1; an HTTP/1.0 client gets
+                // the raw stream, delimited by closing the connection.
+                const bool chunkedResponse = conn.request.protocol == constants::HTTP_1_1;
+                if (isStreaming && !chunkedResponse)
+                {
+                    conn.keepalive = false;
                 }
                 conn.keepalive &= allowKeepalive;
 
@@ -2821,6 +2859,7 @@ namespace http
                 {
                     conn.streamingActive = true;
                     conn.chunksSent = 0;
+                    conn.chunkedStream = chunkedResponse;
 
                     // The thread-pool path copies the callback for every chunk. Share
                     // one instance so a stateful callback (e.g. a mutable lambda that
@@ -2843,6 +2882,16 @@ namespace http
                         conn.response.headers[constants::CACHE_CONTROL] = constants::CACHE_CONTROL_NO_CACHE;
                         conn.response.headers[constants::X_ACCEL_BUFFERING] = "no";  // Disable nginx buffering
                     }
+                }
+                else if (headOfStream)
+                {
+                    // Same headers as the GET would get, but no body
+                    if (chunkedResponse)
+                    {
+                        conn.response.headers[constants::TRANSFER_ENCODING] = constants::TRANSFER_ENCODING_CHUNKED;
+                    }
+                    conn.response.headers.erase(constants::CONTENT_LENGTH);
+                    conn.response.body.clear();
                 }
                 else if (isBodylessStatus(conn.response.code))
                 {

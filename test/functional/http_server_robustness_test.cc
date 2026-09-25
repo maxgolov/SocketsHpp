@@ -729,6 +729,67 @@ TEST(HttpServerLifetimeTest, DestroyWithoutStopWhileClientsConnected)
     }
 }
 
+// --- Streaming framing per protocol version and HEAD -------------------------
+
+namespace
+{
+    void addCountingStream(HttpServer& server)
+    {
+        server.route("/stream", [](const HttpRequest&, HttpResponse& res) {
+            res.set_header("Content-Type", "text/plain");
+            int n = 0;
+            res.send_chunk_stream([n]() mutable -> std::string {
+                return n < 3 ? "part" + std::to_string(++n) + ";" : std::string();
+            });
+            return 200;
+        });
+    }
+}  // namespace
+
+TEST_F(HttpServerRobustnessTest, StreamToHttp10ClientIsRawAndCloseDelimited)
+{
+    addCountingStream(*server);
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("GET /stream HTTP/1.0\r\n\r\n"));
+    auto res = client.readResponse();
+    ASSERT_TRUE(res.complete);
+    EXPECT_EQ(res.code, 200);
+    EXPECT_EQ(res.statusLine.rfind("HTTP/1.0 200", 0), 0u) << res.statusLine;
+    EXPECT_FALSE(res.hasHeader("transfer-encoding")) << "no chunked coding for HTTP/1.0";
+    EXPECT_EQ(res.body, "part1;part2;part3;");  // no chunk framing, ends at close
+}
+
+TEST_F(HttpServerRobustnessTest, StreamToHttp11ClientIsChunked)
+{
+    addCountingStream(*server);
+    start();
+    auto res = roundTrip("GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    ASSERT_TRUE(res.complete);
+    EXPECT_EQ(toLower(res.header("transfer-encoding")), "chunked");
+    EXPECT_EQ(res.body, "part1;part2;part3;");
+}
+
+TEST_F(HttpServerRobustnessTest, HeadOnStreamingRouteSendsHeadersOnly)
+{
+    addCountingStream(*server);
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("HEAD /stream HTTP/1.1\r\nHost: x\r\n\r\n"));
+    auto head = client.readResponse(true);
+    ASSERT_TRUE(head.complete);
+    EXPECT_EQ(head.code, 200);
+    EXPECT_EQ(toLower(head.header("transfer-encoding")), "chunked");
+    // No body bytes may follow: the next response on the connection must parse cleanly.
+    ASSERT_TRUE(client.send("GET /after HTTP/1.1\r\nHost: x\r\n\r\n"));
+    auto next = client.readResponse();
+    ASSERT_TRUE(next.complete);
+    EXPECT_EQ(next.code, 200);
+    EXPECT_EQ(next.body, "/after");
+}
+
 // --- Thread pool dispatch ------------------------------------------------------
 // With enableThreadPool(), handlers run on worker threads; the reactor must keep
 // serving other connections and the response path must behave exactly as before.

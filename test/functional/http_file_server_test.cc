@@ -44,6 +44,8 @@ namespace
             writeFile(base / "www" / "data" / "items.json", "[1,2]");
             writeFile(base / "www" / "with space.txt", "spaced");
             writeFile(base / "www" / "empty.txt", "");
+            writeFile(base / "www" / "v1.2" / "docs" / "index.html", "<p>v1.2 docs</p>");
+            writeFile(base / "www" / "UPPER.CSS", "p{}");
             writeFile(base / "www-private" / "secret.txt", "TOP SECRET");
 
             server = std::make_unique<HttpFileServer>("127.0.0.1", 0, (base / "www").string());
@@ -151,4 +153,29 @@ TEST_F(HttpFileServerTest, MoreSpecificRoutesWinOverFileEndpoint)
     auto api = get("/api/anything");
     EXPECT_EQ(api.code, 200);
     EXPECT_EQ(api.body, "api");
+}
+
+TEST_F(HttpFileServerTest, DottedDirectoriesAndUppercaseExtensions)
+{
+    auto docs = get("/v1.2/docs");
+    EXPECT_EQ(docs.code, 200);
+    EXPECT_EQ(docs.body, "<p>v1.2 docs</p>");
+    EXPECT_EQ(get("/v1.2/docs/").body, "<p>v1.2 docs</p>");
+
+    auto upper = get("/UPPER.CSS");
+    EXPECT_EQ(upper.code, 200);
+    EXPECT_EQ(upper.getHeader("Content-Type"), "text/css");
+}
+
+TEST_F(HttpFileServerTest, DestroyWithThreadPoolAndRequestInFlightIsSafe)
+{
+    server.reset();
+    server = std::make_unique<HttpFileServer>("127.0.0.1", 0, (base / "www").string());
+    server->enableThreadPool(2);
+    server->InitializeFileEndpoint(*server);
+    server->start();
+    url = "http://127.0.0.1:" + std::to_string(server->getListeningPort());
+    for (int i = 0; i < 20; ++i)
+        EXPECT_EQ(get("/style.css").code, 200);
+    server.reset();  // must not touch the destroyed handler from a worker
 }

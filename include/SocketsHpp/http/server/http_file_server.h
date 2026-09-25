@@ -76,9 +76,11 @@ namespace http
             /// @brief Stop the server (joining the reactor) before the file endpoint is destroyed.
             virtual ~HttpFileServer()
             {
-                // Stop the reactor before ServeFile/mime_types_ are destroyed:
-                // ~HttpServer runs only after this class's members are gone.
+                // Stop the reactor and drain the worker pool before ServeFile/mime_types_
+                // are destroyed: ~HttpServer runs only after this class's members are
+                // gone, and a request may still be running on a pool thread.
                 stop();
+                disableThreadPool();
             }
 
             /**
@@ -300,7 +302,12 @@ namespace http
              */
             std::string GetMimeContentType(const std::string& filename)
             {
-                std::string file_ext = filename.substr(filename.find_last_of(".") + 1);
+                // Extension of the last path segment, case-insensitively ("A.CSS" -> "css")
+                const std::string leaf = filename.substr(filename.find_last_of('/') + 1);
+                const size_t dot = leaf.find_last_of('.');
+                std::string file_ext = (dot == std::string::npos) ? std::string() : leaf.substr(dot + 1);
+                std::transform(file_ext.begin(), file_ext.end(), file_ext.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 auto file_type = mime_types_.find(file_ext);
                 return (file_type != mime_types_.end()) ? file_type->second : CONTENT_TYPE_TEXT;
             };
@@ -313,13 +320,16 @@ namespace http
              */
             std::string GetFileName(std::string name)
             {
-                if (!name.empty() && name.back() == '/')
+                const bool explicitDirectory = !name.empty() && name.back() == '/';
+                if (explicitDirectory)
                 {
                     name.pop_back();
                 }
-                // If filename appears to be a directory, serve the hypothetical index.html
-                // file there
-                if (name.find(".") == std::string::npos)
+                // A trailing '/' or a last segment without an extension is treated as a
+                // directory: serve its index.html (dots in parent directories, e.g.
+                // "/v1.2/docs", don't matter).
+                const std::string leaf = name.substr(name.find_last_of('/') + 1);
+                if (explicitDirectory || leaf.find('.') == std::string::npos)
                     name += "/index.html";
 
                 return name;
