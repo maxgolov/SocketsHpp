@@ -64,6 +64,7 @@ set(FUNCTIONAL_TESTS
   http_server_test
   http_streaming_test
   http_methods_test
+  http_file_server_test
 )
 
 foreach(testname ${FUNCTIONAL_TESTS})

@@ -19,6 +19,23 @@ namespace http
 {
     namespace server {
 
+        /**
+         * @brief HTTP server that can serve static files from a document root.
+         *
+         * Usage:
+         * @code
+         *   HttpFileServer server("127.0.0.1", 8080, "./public");
+         *   server.route("/api/", apiHandler);         // your own routes, any order
+         *   server.InitializeFileEndpoint(server);     // serve files for everything else
+         *   server.start();
+         * @endcode
+         *
+         * Requests are percent-decoded, stripped of their query string and resolved
+         * inside the document root; paths escaping the root, absolute paths, NUL bytes
+         * and non-regular files are refused (404). A path without an extension maps to
+         * its index.html. The Content-Type is chosen from the file extension. Files are
+         * read into memory in full, so this is meant for small static assets.
+         */
         class HttpFileServer : public HttpServer
         {
 
@@ -26,10 +43,14 @@ namespace http
             std::filesystem::path m_documentRoot;  // Document root directory
             bool m_pathTraversalProtection = true; // Path traversal protection enabled by default
 
+        public:
             /**
-             * Construct the server by initializing the endpoint for serving static files,
-             * which show up on the web if the user is on the given host:port. Static
-             * files can be seen relative to the folder where the executable was ran.
+             * @brief Create the server and start listening on host:port (0 = ephemeral,
+             *        see getListeningPort()). Files are not served until
+             *        InitializeFileEndpoint() is called.
+             * @param host Name used in the "Server" response header
+             * @param port Port to listen on (all IPv4 interfaces)
+             * @param docRoot Directory to serve files from (default: current directory)
              */
             HttpFileServer(const std::string& host = "127.0.0.1", int port = 3333, const std::string& docRoot = ".")
                 : HttpServer()
@@ -67,10 +88,10 @@ namespace http
             }
 
             /**
-             * Set the HTTP server to serve static files from the root of host:port.
-             * Derived HTTP servers should initialize the file endpoint AFTER they
-             * initialize their own, otherwise everything will be served like a file
-             * @param server should be an instance of this object
+             * @brief Serve static files for every request not claimed by a more specific
+             *        route. Routes are matched longest-prefix first, so this "/" endpoint
+             *        can be registered before or after your own routes.
+             * @param server should be this object
              */
             void InitializeFileEndpoint(HttpFileServer& server) { server[root_endpt_] = ServeFile; }
 

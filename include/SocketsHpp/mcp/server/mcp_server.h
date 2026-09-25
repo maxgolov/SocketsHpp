@@ -299,19 +299,60 @@ namespace mcp
             /// @param sessionId  Session to push to (from initialize response Mcp-Session-Id header)
             /// @param eventData  Raw SSE event string (e.g. "event: message\ndata: {...}\n\n")
             /// @return true if the session exists and event was queued
+            /// @note With resumability enabled, every event gets an "id:" (unless it
+            ///       already has one) and is recorded in the session's history, so a
+            ///       client reconnecting with Last-Event-ID receives what it missed.
             bool push_event(const std::string& sessionId, const std::string& eventData)
             {
                 std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
                 auto it = m_sseQueues.find(sessionId);
                 if (it == m_sseQueues.end() || it->second->closed.load())
                     return false;
+
+                std::string data = eventData;
+                if (m_config.resumability.enabled)
+                {
+                    std::string id = sseEventId(data);
+                    if (id.empty())
+                    {
+                        id = std::to_string(++m_eventSequence);
+                        data = "id: " + id + "\n" + data;
+                    }
+                    m_sessionManager.addEvent(sessionId, id, data);
+                }
                 {
                     std::lock_guard<std::mutex> qlock(it->second->mutex);
-                    it->second->events.push(eventData);
+                    it->second->events.push(std::move(data));
                     it->second->lastActivity = std::chrono::steady_clock::now();
                 }
                 it->second->cv.notify_one();
                 return true;
+            }
+
+            /// @brief The value of an event's "id:" field, or "" if it has none.
+            static std::string sseEventId(const std::string& event)
+            {
+                size_t pos = 0;
+                while (pos < event.size())
+                {
+                    size_t end = event.find('\n', pos);
+                    if (end == std::string::npos)
+                        end = event.size();
+                    const std::string line = event.substr(pos, end - pos);
+                    if (line.compare(0, 3, "id:") == 0)
+                    {
+                        std::string value = line.substr(3);
+                        if (!value.empty() && value[0] == ' ')
+                            value.erase(0, 1);
+                        if (!value.empty() && value.back() == '\r')
+                            value.pop_back();
+                        return value;
+                    }
+                    if (line.empty() || line == "\r")
+                        break;  // end of the first event
+                    pos = end + 1;
+                }
+                return std::string();
             }
 
             /// @brief Close and remove all SSE streams idle longer than sseIdleTimeoutSeconds.
@@ -497,6 +538,7 @@ namespace mcp
 
             // SSE queues: sessionId → queue (push_event writes here, GET handler reads)
             std::map<std::string, std::shared_ptr<SSESessionQueue>> m_sseQueues;
+            std::atomic<uint64_t> m_eventSequence{0};  // SSE event ids (resumability)
             std::mutex m_sseQueuesMutex;
 
             // Rate limiting
@@ -1147,6 +1189,11 @@ namespace mcp
                 // Install a fresh queue for this stream. Events already queued for the
                 // session (e.g. pushed between initialize and this GET) are carried over,
                 // and any previous stream for the session is told to close.
+                // When resuming (Last-Event-ID + resumability), the session history is
+                // the single source of truth: it holds everything after that id,
+                // including events still pending on the previous stream, so those are
+                // not carried over (they would be delivered twice).
+                const bool resuming = !lastEventId.empty() && m_config.resumability.enabled;
                 auto queue = std::make_shared<SSESessionQueue>();
                 {
                     std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
@@ -1155,7 +1202,7 @@ namespace mcp
                     {
                         auto& old = existing->second;
                         std::lock_guard<std::mutex> qlock(old->mutex);
-                        while (!old->events.empty())
+                        while (!resuming && !old->events.empty())
                         {
                             queue->events.push(std::move(old->events.front()));
                             old->events.pop();
@@ -1163,18 +1210,16 @@ namespace mcp
                         old->closed.store(true);
                         old->cv.notify_all();
                     }
-                    m_sseQueues[sessionId] = queue;
-                }
-
-                // Pre-populate missed events for resumability
-                if (!lastEventId.empty() && m_config.resumability.enabled)
-                {
-                    auto missedEvents = m_sessionManager.getEventsSince(sessionId, lastEventId);
-                    std::lock_guard<std::mutex> qlock(queue->mutex);
-                    for (const auto& event : missedEvents)
+                    if (resuming)
                     {
-                        queue->events.push(event);
+                        // Under m_sseQueuesMutex, so no push_event() can slip in between
+                        // the replay and the new queue becoming visible.
+                        for (auto& event : m_sessionManager.getEventsSince(sessionId, lastEventId))
+                        {
+                            queue->events.push(std::move(event));
+                        }
                     }
+                    m_sseQueues[sessionId] = queue;
                 }
 
                 // Write deadline: if no event arrives within this many seconds, send a keepalive

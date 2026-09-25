@@ -143,7 +143,8 @@ static TestHttpResponse http_request(int port,
     return res;
 }
 
-static int open_sse_stream(int port, const std::string& session_id)
+static int open_sse_stream(int port, const std::string& session_id,
+                           const std::string& last_event_id = std::string())
 {
     int sock = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
@@ -159,8 +160,10 @@ static int open_sse_stream(int port, const std::string& session_id)
     req << "GET /mcp HTTP/1.1\r\n"
         << "Host: 127.0.0.1:" << port << "\r\n"
         << "Accept: text/event-stream\r\n"
-        << "Mcp-Session-Id: " << session_id << "\r\n"
-        << "Connection: keep-alive\r\n\r\n";
+        << "Mcp-Session-Id: " << session_id << "\r\n";
+    if (!last_event_id.empty())
+        req << "Last-Event-ID: " << last_event_id << "\r\n";
+    req << "Connection: keep-alive\r\n\r\n";
     auto request = req.str();
     if (::send(sock, request.c_str(), request.size(), 0) <= 0) {
         ::close(sock);
@@ -1453,6 +1456,141 @@ TEST(McpLegacyHttpTest, StreamModeInitializeReturnsSseEvent)
     auto msg = json::parse(r.body.substr(dataPos + 6, r.body.find('\n', dataPos) - dataPos - 6));
     EXPECT_EQ(msg["id"], 1);
     EXPECT_TRUE(msg.contains("result"));
+}
+
+// ── Resumability (Last-Event-ID replay) ─────────────────────────────────────
+
+struct StreamEvent
+{
+    std::string id;
+    std::string text;  // params.data of a notifications/message
+};
+
+// Read events from a raw SSE stream until `count` arrive or the timeout expires.
+static std::vector<StreamEvent> read_events(int sock, size_t count, int timeoutMs = 5000)
+{
+    timeval tv{0, 100 * 1000};
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::vector<StreamEvent> events;
+    std::string buffer;
+    std::string pendingId;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (events.size() < count && std::chrono::steady_clock::now() < deadline)
+    {
+        char buf[4096];
+        ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
+        if (n == 0)
+            break;
+        if (n < 0)
+            continue;
+        buffer.append(buf, static_cast<size_t>(n));
+        size_t nl;
+        while ((nl = buffer.find('\n')) != std::string::npos)
+        {
+            std::string line = buffer.substr(0, nl);
+            buffer.erase(0, nl + 1);
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            if (line.rfind("id: ", 0) == 0)
+                pendingId = line.substr(4);
+            else if (line.rfind("data: ", 0) == 0)
+            {
+                try
+                {
+                    auto msg = json::parse(line.substr(6));
+                    events.push_back({pendingId, msg["params"]["data"].get<std::string>()});
+                }
+                catch (...)
+                {
+                }
+                pendingId.clear();
+            }
+        }
+    }
+    return events;
+}
+
+TEST(McpResumabilityTest, ReconnectWithLastEventIdReplaysMissedEventsOnce)
+{
+    ServerConfig cfg;
+    cfg.transport            = TransportType::HTTP_STREAMABLE;
+    cfg.resumability.enabled = true;
+    CustomServer srv(cfg);
+
+    auto init = http_request(srv.port, "POST", kInitBody, json_headers());
+    ASSERT_EQ(init.status, 200);
+    const std::string session = init.session_id;
+
+    int first = open_sse_stream(srv.port, session);
+    ASSERT_GE(first, 0);
+    for (const char* text : {"a", "b", "c"})
+        ASSERT_TRUE(srv.server->push_log(session, "error", "t", json(text)));
+    auto seen = read_events(first, 3);
+    ASSERT_EQ(seen.size(), 3u);
+    for (const auto& e : seen)
+        EXPECT_FALSE(e.id.empty()) << "pushed events must carry an id for resumption";
+    ::close(first);  // connection lost
+
+    // Pushed while the client is away (may be swallowed by the dying stream).
+    ASSERT_TRUE(srv.server->push_log(session, "error", "t", json("d")));
+    ASSERT_TRUE(srv.server->push_log(session, "error", "t", json("e")));
+
+    // The client says it only processed "b": expect c, d, e - once each, in order.
+    int resumed = open_sse_stream(srv.port, session, seen[1].id);
+    ASSERT_GE(resumed, 0);
+    auto replay = read_events(resumed, 3);
+    auto extra = read_events(resumed, 1, 500);  // nothing may follow (no duplicates)
+    ::close(resumed);
+    ASSERT_EQ(replay.size(), 3u);
+    EXPECT_EQ(replay[0].text, "c");
+    EXPECT_EQ(replay[1].text, "d");
+    EXPECT_EQ(replay[2].text, "e");
+    EXPECT_TRUE(extra.empty()) << "duplicate event: " << extra[0].text;
+}
+
+TEST(McpResumabilityTest, WithoutResumabilityEventsHaveNoIds)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    CustomServer srv(cfg);
+    auto init = http_request(srv.port, "POST", kInitBody, json_headers());
+    int sock = open_sse_stream(srv.port, init.session_id);
+    ASSERT_GE(sock, 0);
+    ASSERT_TRUE(srv.server->push_log(init.session_id, "error", "t", json("x")));
+    auto events = read_events(sock, 1);
+    ::close(sock);
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_TRUE(events[0].id.empty());
+}
+
+// ── CORS and rate limiting (HTTP transport) ─────────────────────────────────
+
+TEST(McpHttpPolicyTest, CorsPreflightAnswered)
+{
+    ServerConfig cfg;
+    cfg.transport       = TransportType::HTTP_STREAMABLE;
+    cfg.cors.allowOrigin = "https://app.example";
+    CustomServer srv(cfg);
+    auto r = http_request(srv.port, "OPTIONS", "", {{"Origin", "https://app.example"},
+                                                     {"Access-Control-Request-Method", "POST"}});
+    EXPECT_TRUE(r.status == 200 || r.status == 204) << r.status;
+}
+
+TEST(McpHttpPolicyTest, RateLimitRejectsExcessRequests)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    cfg.maxRequestsPerMinute = 3;
+    CustomServer srv(cfg);
+    int ok = 0, limited = 0;
+    for (int i = 0; i < 6; ++i)
+    {
+        auto r = http_request(srv.port, "POST", kInitBody, json_headers());
+        if (r.status == 200) ++ok;
+        if (r.status == 429) ++limited;
+    }
+    EXPECT_EQ(ok, 3);
+    EXPECT_EQ(limited, 3);
 }
 
 // ── Binding behaviour ────────────────────────────────────────────────────────
