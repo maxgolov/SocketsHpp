@@ -1381,6 +1381,59 @@ int main(int argc, char** argv)
     return RUN_ALL_TESTS();
 }
 
+// ── Cancellation scoped to sessions (HTTP) ─────────────────────────────────
+
+// Request ids are only unique per client: a notifications/cancelled from one
+// session must never cancel another session's in-flight request with the same id.
+TEST(McpCancellationTest, CancelIsScopedToSession)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    std::atomic<int> started{0};
+    CustomServer srv(cfg, [&](MCPServer& s) {
+        s.registerCancellable("slow", [&](const json&, std::shared_ptr<std::atomic<bool>> cancel) -> json {
+            ++started;
+            for (int i = 0; i < 150 && !cancel->load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return {{"cancelled", cancel->load()}};
+        });
+    });
+
+    auto initA = http_request(srv.port, "POST", kInitBody, json_headers());
+    auto initB = http_request(srv.port, "POST", kInitBody, json_headers());
+    ASSERT_EQ(initA.status, 200);
+    ASSERT_EQ(initB.status, 200);
+    ASSERT_FALSE(initA.session_id.empty());
+    ASSERT_NE(initA.session_id, initB.session_id);
+
+    auto runSlow = [&](const std::string& canceller) {
+        started = 0;
+        TestHttpResponse slowResp;
+        std::thread worker([&] {
+            slowResp = http_request(srv.port, "POST", R"({"jsonrpc":"2.0","id":1,"method":"slow"})",
+                                    json_headers({{"Mcp-Session-Id", initA.session_id}}));
+        });
+        for (int i = 0; i < 300 && started.load() == 0; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        EXPECT_EQ(started.load(), 1);
+        auto cancel = http_request(
+            srv.port, "POST",
+            R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})",
+            json_headers({{"Mcp-Session-Id", canceller}}));
+        EXPECT_EQ(cancel.status, 202);
+        worker.join();
+        EXPECT_EQ(slowResp.status, 200);
+        return json::parse(slowResp.body);
+    };
+
+    // Session B cannot cancel session A's request id 1...
+    auto fromOther = runSlow(initB.session_id);
+    EXPECT_EQ(fromOther["result"]["cancelled"], false) << fromOther.dump();
+    // ...but session A can.
+    auto fromOwner = runSlow(initA.session_id);
+    EXPECT_EQ(fromOwner["result"]["cancelled"], true) << fromOwner.dump();
+}
+
 // ── Binding behaviour ────────────────────────────────────────────────────────
 
 // A STDIO server must never open a network port, even if config.port is taken.

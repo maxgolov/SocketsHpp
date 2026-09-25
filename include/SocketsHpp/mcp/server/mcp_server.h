@@ -159,7 +159,9 @@ namespace mcp
                         if (jsonRpcIdFromJson(params["requestId"], id))
                         {
                             std::lock_guard<std::mutex> lock(m_pendingMutex);
-                            auto it = m_pendingCancellations.find(jsonRpcIdToJson(id));
+                            // Scoped to the sender's session: a client can only
+                            // cancel its own requests.
+                            auto it = m_pendingCancellations.find(cancellationKey(id));
                             if (it != m_pendingCancellations.end())
                                 it->second->store(true);
                         }
@@ -896,7 +898,7 @@ namespace mcp
                         std::vector<json> responses;
                         for (const auto& item : body)
                         {
-                            auto outcome = processOne(item, nullptr);
+                            auto outcome = processOne(item, nullptr, getSessionId(req));
                             if (outcome.response)
                                 responses.push_back(std::move(*outcome.response));
                         }
@@ -915,7 +917,7 @@ namespace mcp
                     if (!isInit && !checkSession(req, res, true)) return;
 
                     InitOutcome init;
-                    auto outcome = processOne(body, isInit ? &init : nullptr);
+                    auto outcome = processOne(body, isInit ? &init : nullptr, getSessionId(req));
                     if (!outcome.response)
                     {
                         res.set_status(202);
@@ -1016,7 +1018,7 @@ namespace mcp
                         json responses = json::array();
                         for (const auto& item : body)
                         {
-                            auto outcome = processOne(item, nullptr);
+                            auto outcome = processOne(item, nullptr, getSessionId(req));
                             if (outcome.response)
                                 responses.push_back(std::move(*outcome.response));
                         }
@@ -1041,7 +1043,7 @@ namespace mcp
                     if (!isInit && !checkSession(req, res, false)) return;
 
                     InitOutcome init;
-                    auto outcome = processOne(body, isInit ? &init : nullptr);
+                    auto outcome = processOne(body, isInit ? &init : nullptr, getSessionId(req));
                     if (!outcome.response)
                     {
                         // JSON-RPC notification — 202 Accepted (no body)
@@ -1411,11 +1413,42 @@ namespace mcp
                 return headerValue(req, m_config.session.headerName);
             }
 
+            /// Session of the message being dispatched on this thread. Handlers run
+            /// synchronously inside processOne(), so a thread-local is sufficient.
+            static std::string& currentSession()
+            {
+                thread_local std::string session;
+                return session;
+            }
+
+            struct SessionScope
+            {
+                std::string previous;
+                explicit SessionScope(const std::string& session) : previous(currentSession())
+                {
+                    currentSession() = session;
+                }
+                ~SessionScope() { currentSession() = previous; }
+                SessionScope(const SessionScope&) = delete;
+                SessionScope& operator=(const SessionScope&) = delete;
+            };
+
+            /// Cancellation tokens are keyed by (session, request id) so that ids reused
+            /// across sessions never collide.
+            static json cancellationKey(const JsonRpcId& id)
+            {
+                return json::array({currentSession(), jsonRpcIdToJson(id)});
+            }
+
             /// @brief Validate and dispatch one JSON-RPC message.
             /// @param init  non-null only where an initialize request is allowed
             ///              (a single, non-batched message); receives its outcome.
-            MessageOutcome processOne(const json& msg, InitOutcome* init)
+            /// @param session  session the message belongs to ("" for STDIO / sessionless);
+            ///                  scopes request ids for cancellation.
+            MessageOutcome processOne(const json& msg, InitOutcome* init,
+                                      const std::string& session = std::string())
             {
+                SessionScope scope(session);
                 MessageOutcome out;
                 auto invalid = [&out](const JsonRpcId& id, const std::string& why) {
                     out.response = invalidRequestResponse(id, why);
@@ -1564,7 +1597,7 @@ namespace mcp
                                    const json& params)
             {
                 auto token = std::make_shared<std::atomic<bool>>(false);
-                const json key = jsonRpcIdToJson(id);
+                const json key = cancellationKey(id);
                 {
                     std::lock_guard<std::mutex> lock(m_pendingMutex);
                     m_pendingCancellations[key] = token;

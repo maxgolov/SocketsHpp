@@ -866,6 +866,10 @@ namespace http
                 // m_connections - only by handleConnection()/onSocketWritable(), as
                 // the very last step, so nothing touches it afterwards.
                 bool closeRequested = false;
+
+                // Identifies the in-flight thread-pool dispatch; lets the worker detect
+                // that the connection was closed (and its fd possibly reused) meanwhile.
+                uint64_t asyncToken = 0;
             };
 
             std::string m_serverHost;
@@ -914,7 +918,8 @@ namespace http
 
             std::map<Socket, Connection> m_connections;
             std::mutex m_connectionsMutex;  // Protects m_connections
-            std::optional<BS::thread_pool<>> m_threadPool;  // Optional thread pool for async request processing
+            std::optional<BS::thread_pool<>> m_threadPool;
+            std::atomic<uint64_t> m_asyncSerial{0};  // tokens for dispatchToThreadPool()  // Optional thread pool for async request processing
             size_t m_maxRequestHeadersSize, m_maxRequestContentSize;
             size_t m_maxSessions;  // Maximum allowed sessions
 
@@ -979,7 +984,12 @@ namespace http
 
             void setServerName(std::string const& name) { m_serverHost = name; }
 
-            // Thread pool configuration
+            /// @brief Run request handlers (and streaming callbacks) on a worker pool so
+            /// slow handlers never block the I/O reactor or other connections.
+            /// @note Handlers may then run concurrently for different connections and
+            ///       must be thread-safe. Requests on one connection are still handled in
+            ///       order. Call before start().
+            /// @param numThreads Worker count (0 = hardware concurrency)
             void enableThreadPool(size_t numThreads = 0)
             {
                 if (numThreads == 0)
@@ -1820,32 +1830,21 @@ namespace http
 
                     if (conn.state == Connection::Processing)
                     {
-                        // Process synchronously on the reactor thread.
-                        // NOTE: The thread pool is intentionally NOT used here for regular POST
-                        // requests. On Windows, WSAEventSelect(FD_WRITE) only fires after a
-                        // prior send() returned WSAEWOULDBLOCK, so an off-thread addSocket()
-                        // call would never wake the reactor and the response would be lost.
-                        // The SSE streaming path (StreamingChunked) uses the thread pool
-                        // correctly because it calls onSocketWritable from the same path.
+                        if (m_threadPool.has_value() && !m_stopped.load())
+                        {
+                            // Run the handlers on the pool so a slow handler never stalls
+                            // the reactor (and with it every other connection).
+                            dispatchToThreadPool(conn);
+                            return;
+                        }
+
                         processRequest(conn);
                         if (conn.closeRequested)
                         {
                             LOG_TRACE("HttpServer: [%s] closing by request", conn.request.client.c_str());
                             return;  // handleConnection() closes the connection
                         }
-
-                        std::ostringstream os;
-                        os << responseProtocol(conn.request) << ' ' << conn.response.code << ' ' << conn.response.message
-                            << "\r\n";
-                        for (auto const& header : conn.response.headers)
-                        {
-                            os << header.first << ": " << header.second << "\r\n";
-                        }
-                        os << "\r\n";
-
-                        conn.sendBuffer = os.str();
-                        conn.state = Connection::SendingHeaders;
-                        LOG_TRACE("HttpServer: [%s] sending headers", conn.request.client.c_str());
+                        beginResponse(conn);
                     }
 
                     if (conn.state == Connection::ProcessingAsync)
@@ -2306,6 +2305,75 @@ namespace http
             static bool isBodylessStatus(int code)
             {
                 return (code >= 100 && code < 200) || code == 204 || code == 304;
+            }
+
+            /// Serialize the status line and headers and move to SendingHeaders.
+            void beginResponse(Connection& conn)
+            {
+                std::ostringstream os;
+                os << responseProtocol(conn.request) << ' ' << conn.response.code << ' ' << conn.response.message
+                    << "\r\n";
+                for (auto const& header : conn.response.headers)
+                {
+                    os << header.first << ": " << header.second << "\r\n";
+                }
+                os << "\r\n";
+
+                conn.sendBuffer = os.str();
+                conn.state = Connection::SendingHeaders;
+                LOG_TRACE("HttpServer: [%s] sending headers", conn.request.client.c_str());
+            }
+
+            /// Run processRequest() for `conn` on the thread pool.
+            ///
+            /// The handlers work on a detached copy of the request, so the reactor can
+            /// keep serving other connections (and may even close this one) meanwhile.
+            /// When done, the worker re-locates the connection under m_connectionsMutex
+            /// and starts sending the response itself. If the socket would block, the
+            /// remainder is finished by the reactor on the next writable event; this
+            /// also arms FD_WRITE on Windows, which only signals after WSAEWOULDBLOCK.
+            /// Called with m_connectionsMutex held.
+            void dispatchToThreadPool(Connection& conn)
+            {
+                auto work = std::make_shared<Connection>();
+                work->request = std::move(conn.request);
+                work->response = std::move(conn.response);
+                work->keepalive = conn.keepalive;
+                conn.request.client = work->request.client;  // keep for logging
+
+                const uint64_t token = ++m_asyncSerial;
+                conn.asyncToken = token;
+                conn.state = Connection::ProcessingAsync;
+                Socket sock = conn.socket;
+                LOG_TRACE("HttpServer: [%s] processing on thread pool", conn.request.client.c_str());
+
+                m_threadPool->detach_task([this, sock, token, work]() {
+                    processRequest(*work);  // user handlers: no server lock held
+
+                    std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                    if (m_stopped.load())
+                    {
+                        return;
+                    }
+                    auto it = m_connections.find(sock);
+                    if (it == m_connections.end() || it->second.asyncToken != token ||
+                        it->second.state != Connection::ProcessingAsync)
+                    {
+                        return;  // connection closed (fd possibly reused) meanwhile
+                    }
+                    Connection& c = it->second;
+                    c.request = std::move(work->request);
+                    c.response = std::move(work->response);
+                    c.keepalive = work->keepalive;
+                    c.closeRequested = work->closeRequested;
+                    c.streamingActive = work->streamingActive;
+                    c.chunksSent = work->chunksSent;
+                    if (!c.closeRequested)
+                    {
+                        beginResponse(c);
+                    }
+                    handleConnection(c);  // may close and erase c - last use
+                });
             }
 
             void processRequest(Connection& conn)

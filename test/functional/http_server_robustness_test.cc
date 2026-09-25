@@ -729,6 +729,158 @@ TEST(HttpServerLifetimeTest, DestroyWithoutStopWhileClientsConnected)
     }
 }
 
+// --- Thread pool dispatch ------------------------------------------------------
+// With enableThreadPool(), handlers run on worker threads; the reactor must keep
+// serving other connections and the response path must behave exactly as before.
+
+namespace
+{
+    class HttpServerThreadPoolTest : public HttpServerRobustnessTest
+    {
+    protected:
+        void SetUp() override
+        {
+            HttpServerRobustnessTest::SetUp();
+            server->enableThreadPool(4);
+        }
+    };
+}  // namespace
+
+TEST_F(HttpServerThreadPoolTest, SlowHandlerDoesNotBlockOtherRequests)
+{
+    std::atomic<bool> release{false};
+    server->route("/slow", [&release](const HttpRequest&, HttpResponse& res) {
+        for (int i = 0; i < 500 && !release.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        res.set_content("slow");
+        return 200;
+    });
+    start();
+
+    RawClient slow(port);
+    ASSERT_TRUE(slow.connected());
+    ASSERT_TRUE(slow.send("GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // /slow is now running
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 5; ++i)
+    {
+        auto res = roundTrip("GET /fast" + std::to_string(i) + " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        EXPECT_EQ(res.code, 200);
+    }
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2))
+        << "fast requests were blocked behind the slow handler";
+
+    release = true;
+    auto res = slow.readResponse();
+    EXPECT_EQ(res.code, 200);
+    EXPECT_EQ(res.body, "slow");
+}
+
+TEST_F(HttpServerThreadPoolTest, LargeResponseFromWorkerIsComplete)
+{
+    const size_t size = 8 * 1024 * 1024;
+    std::string payload(size, '\0');
+    for (size_t i = 0; i < size; ++i)
+        payload[i] = static_cast<char>('a' + (i * 7919) % 26);
+    server->route("/big", [&payload](const HttpRequest&, HttpResponse& res) {
+        res.set_content(payload, "application/octet-stream");
+        return 200;
+    });
+    start();
+
+    RawClient client(port, 4096);
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("GET /big HTTP/1.1\r\nHost: x\r\n\r\n"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));  // force EWOULDBLOCK on the worker
+    auto res = client.readResponse(false, 10000);
+    ASSERT_TRUE(res.complete);
+    ASSERT_EQ(res.body.size(), size);
+    EXPECT_TRUE(res.body == payload);
+
+    ASSERT_TRUE(client.send("GET /again HTTP/1.1\r\nHost: x\r\n\r\n"));
+    auto res2 = client.readResponse();
+    EXPECT_EQ(res2.code, 200);
+    EXPECT_EQ(res2.body, "/again");
+}
+
+TEST_F(HttpServerThreadPoolTest, PipelinedRequestsAnsweredInOrder)
+{
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    std::string batch;
+    for (int i = 0; i < 10; ++i)
+        batch += "GET /p" + std::to_string(i) + " HTTP/1.1\r\nHost: x\r\n\r\n";
+    ASSERT_TRUE(client.send(batch));
+    for (int i = 0; i < 10; ++i)
+    {
+        auto res = client.readResponse();
+        ASSERT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "/p" + std::to_string(i));
+    }
+}
+
+TEST_F(HttpServerThreadPoolTest, ClientGoneWhileHandlerRunsIsSafe)
+{
+    std::atomic<int> finished{0};
+    server->route("/linger", [&finished](const HttpRequest&, HttpResponse& res) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        res.set_content(std::string(64 * 1024, 'z'));
+        ++finished;
+        return 200;
+    });
+    start();
+    for (int i = 0; i < 8; ++i)
+    {
+        RawClient client(port);
+        ASSERT_TRUE(client.connected());
+        ASSERT_TRUE(client.send("GET /linger HTTP/1.1\r\nHost: x\r\n\r\n"));
+        // Destructor closes the socket while the handler is still running.
+    }
+    for (int i = 0; i < 300 && finished.load() < 8; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(finished.load(), 8);
+
+    auto res = roundTrip("GET /alive HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    EXPECT_EQ(res.code, 200);
+    EXPECT_EQ(res.body, "/alive");
+}
+
+TEST_F(HttpServerThreadPoolTest, HandlerReturningMinusOneClosesConnection)
+{
+    start();
+    for (int i = 0; i < 20; ++i)
+    {
+        RawClient client(port);
+        ASSERT_TRUE(client.connected());
+        ASSERT_TRUE(client.send("GET /drop HTTP/1.1\r\nHost: x\r\n\r\nGET /after HTTP/1.1\r\nHost: x\r\n\r\n"));
+        EXPECT_TRUE(client.waitForClose());
+    }
+    auto res = roundTrip("GET /alive HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    EXPECT_EQ(res.code, 200);
+}
+
+TEST_F(HttpServerThreadPoolTest, StopWithHandlerInFlightIsSafe)
+{
+    std::atomic<bool> entered{false};
+    server->route("/busy", [&entered](const HttpRequest&, HttpResponse& res) {
+        entered = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        res.set_content("late");
+        return 200;
+    });
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("GET /busy HTTP/1.1\r\nHost: x\r\n\r\n"));
+    for (int i = 0; i < 200 && !entered.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_TRUE(entered.load());
+    server->stop();
+    server.reset();  // waits for the worker; must not touch freed state
+}
+
 int main(int argc, char** argv)
 {
     testing::InitGoogleTest(&argc, argv);

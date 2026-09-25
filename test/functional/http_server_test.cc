@@ -7,6 +7,10 @@
 #include "sockets.hpp"
 #include "../common/test_utils.h"
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 using namespace SOCKETSHPP_NS::net::common;
 using namespace SOCKETSHPP_NS::http::server;
 
@@ -66,6 +70,95 @@ namespace testing
         }
         EXPECT_TRUE(true);
     }
+
+    // --- Portable end-to-end tests (run on Windows too) -------------------------
+    // These exercise the thread-pool dispatch path, whose send handoff relies on
+    // platform-specific writable notifications (FD_WRITE on Windows).
+
+    static std::string MakePayload(size_t size)
+    {
+        std::string payload(size, '\0');
+        for (size_t i = 0; i < size; ++i)
+            payload[i] = static_cast<char>('a' + (i * 7919) % 26);
+        return payload;
+    }
+
+    class HttpServerEndToEndTest : public ::testing::TestWithParam<bool>
+    {
+    };
+
+    TEST_P(HttpServerEndToEndTest, SmallAndLargeResponses)
+    {
+        const bool useThreadPool = GetParam();
+        HttpServer server("127.0.0.1", 0);
+        if (useThreadPool)
+            server.enableThreadPool(2);
+        const std::string big = MakePayload(4 * 1024 * 1024);
+        server.route("/small", [](const HttpRequest&, HttpResponse& res) {
+            res.set_content("hello");
+            return 200;
+        });
+        server.route("/big", [&big](const HttpRequest&, HttpResponse& res) {
+            res.set_content(big, "application/octet-stream");
+            return 200;
+        });
+        server.start();
+        const std::string base = "http://127.0.0.1:" + std::to_string(server.getListeningPort());
+
+        SOCKETSHPP_NS::http::client::HttpClient client;
+        for (int i = 0; i < 20; ++i)
+        {
+            SOCKETSHPP_NS::http::client::HttpClientResponse res;
+            ASSERT_TRUE(client.get(base + "/small", res)) << "request " << i;
+            EXPECT_EQ(res.code, 200);
+            EXPECT_EQ(res.body, "hello");
+        }
+        SOCKETSHPP_NS::http::client::HttpClientResponse res;
+        ASSERT_TRUE(client.get(base + "/big", res));
+        EXPECT_EQ(res.code, 200);
+        ASSERT_EQ(res.body.size(), big.size());
+        EXPECT_TRUE(res.body == big);
+        server.stop();
+    }
+
+    TEST_P(HttpServerEndToEndTest, ConcurrentClients)
+    {
+        const bool useThreadPool = GetParam();
+        HttpServer server("127.0.0.1", 0);
+        if (useThreadPool)
+            server.enableThreadPool(4);
+        server.route("/id/", [](const HttpRequest& req, HttpResponse& res) {
+            res.set_content(req.uri);
+            return 200;
+        });
+        server.start();
+        const std::string base = "http://127.0.0.1:" + std::to_string(server.getListeningPort());
+
+        std::atomic<int> ok{0};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t)
+        {
+            threads.emplace_back([&, t]() {
+                SOCKETSHPP_NS::http::client::HttpClient client;
+                for (int i = 0; i < 10; ++i)
+                {
+                    const std::string path = "/id/" + std::to_string(t) + "-" + std::to_string(i);
+                    SOCKETSHPP_NS::http::client::HttpClientResponse res;
+                    if (client.get(base + path, res) && res.code == 200 && res.body == path)
+                        ++ok;
+                }
+            });
+        }
+        for (auto& th : threads)
+            th.join();
+        EXPECT_EQ(ok.load(), 80);
+        server.stop();
+    }
+
+    INSTANTIATE_TEST_SUITE_P(Dispatch, HttpServerEndToEndTest, ::testing::Values(false, true),
+                             [](const ::testing::TestParamInfo<bool>& info) {
+                                 return info.param ? std::string("ThreadPool") : std::string("Reactor");
+                             });
 
 }  // namespace testing
 
