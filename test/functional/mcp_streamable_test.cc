@@ -31,6 +31,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -1320,6 +1322,48 @@ static void run_client_e2e(TransportType transport)
 
 TEST(McpClientTest, EndToEndStreamableHttp) { run_client_e2e(TransportType::HTTP_STREAMABLE); }
 TEST(McpClientTest, EndToEndHttp) { run_client_e2e(TransportType::HTTP); }
+
+// The client's notification stream must carry its configured headers (auth) and
+// the session id header, so server pushes reach an authenticated client.
+TEST(McpClientTest, NotificationStreamAuthenticatesAndReceivesPushes)
+{
+    ServerConfig cfg;
+    cfg.transport              = TransportType::HTTP_STREAMABLE;
+    cfg.auth.enabled           = true;
+    cfg.auth.type              = ServerConfig::AuthConfig::Type::API_KEY;
+    cfg.auth.headerName        = "X-Api-Key";
+    cfg.auth.secretOrPublicKey = "k3y";
+    CustomServer srv(cfg);
+
+    ClientConfig cc;
+    cc.transport         = TransportType::HTTP_STREAMABLE;
+    cc.http.url          = "http://127.0.0.1:" + std::to_string(srv.port) + "/mcp";
+    cc.http.headers["X-Api-Key"] = "k3y";
+
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<json> messages;
+
+    MCPClient client;
+    client.onNotification("notifications/message", [&](const json& params) {
+        std::lock_guard<std::mutex> lock(m);
+        messages.push_back(params);
+        cv.notify_all();
+    });
+    ASSERT_TRUE(client.connect(cc));
+    client.initialize({{"name", "push"}, {"version", "1"}});
+    const std::string session = client.sessionId();
+    ASSERT_FALSE(session.empty());
+
+    ASSERT_TRUE(srv.server->push_log(session, "error", "test", json("pushed")));
+    {
+        std::unique_lock<std::mutex> lock(m);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return !messages.empty(); }))
+            << "notification never arrived over the SSE stream";
+        EXPECT_EQ(messages[0]["data"], "pushed");
+    }
+    client.disconnect();
+}
 
 TEST(McpClientTest, StdioTransportNotSupported)
 {

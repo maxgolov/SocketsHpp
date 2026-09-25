@@ -89,9 +89,12 @@ namespace mcp
                     return;
                 }
 
-                if (m_sseClient)
                 {
-                    m_sseClient->close();  // stop auto-reconnect
+                    std::lock_guard<std::mutex> lock(m_sseMutex);
+                    if (m_sseClient)
+                    {
+                        m_sseClient->close();  // stop auto-reconnect, unblock the reader
+                    }
                 }
 
                 const std::string sid = sessionId();
@@ -109,12 +112,14 @@ namespace mcp
                     }
                 }
 
-                // The server closes the SSE stream when the session is terminated
-                if (m_sseThread.joinable())
                 {
-                    m_sseThread.join();
+                    std::lock_guard<std::mutex> lock(m_sseMutex);
+                    if (m_sseThread.joinable())
+                    {
+                        m_sseThread.join();
+                    }
+                    m_sseClient.reset();
                 }
-                m_sseClient.reset();
 
                 std::lock_guard<std::mutex> lock(m_sessionMutex);
                 m_sessionId.clear();
@@ -148,10 +153,11 @@ namespace mcp
                 sendNotification(initialized);
 
                 // The server→client notification stream needs the session id, which is
-                // only known now.
-                if (m_config.http.enableResumability && !m_sseThread.joinable())
+                // only known now. It is opened when resumability is enabled or when a
+                // notification handler is registered (see onNotification()).
+                if (m_config.http.enableResumability || hasNotificationHandlers())
                 {
-                    setupSSEStream();
+                    ensureSSEStream();
                 }
 
                 return response;
@@ -267,10 +273,18 @@ namespace mcp
             /// @brief Register notification handler
             /// @param method Notification method (e.g., "notifications/message")
             /// @param handler Handler function
+            /// @note Registering a handler opens the server→client notification stream
+            ///       (immediately if already initialized, otherwise after initialize()).
             void onNotification(const std::string& method, NotificationCallback handler)
             {
-                std::lock_guard<std::mutex> lock(m_notificationMutex);
-                m_notificationHandlers[method] = handler;
+                {
+                    std::lock_guard<std::mutex> lock(m_notificationMutex);
+                    m_notificationHandlers[method] = handler;
+                }
+                if (m_connected.load() && !sessionId().empty())
+                {
+                    ensureSSEStream();
+                }
             }
 
             /// @brief Register connection status callback (call before connect()).
@@ -306,6 +320,7 @@ namespace mcp
             std::unique_ptr<HttpClient> m_httpClient;
             std::unique_ptr<SSEClient> m_sseClient;
             std::thread m_sseThread;
+            std::mutex m_sseMutex;  // guards m_sseClient / m_sseThread start and stop
 
             // Notification handling
             std::map<std::string, NotificationCallback> m_notificationHandlers;
@@ -368,22 +383,41 @@ namespace mcp
                 return true;
             }
 
-            /// @brief Setup SSE stream for server notifications (after initialize).
+            bool hasNotificationHandlers()
+            {
+                std::lock_guard<std::mutex> lock(m_notificationMutex);
+                return !m_notificationHandlers.empty();
+            }
+
+            /// @brief Open the notification stream once (after initialize).
+            void ensureSSEStream()
+            {
+                std::lock_guard<std::mutex> lock(m_sseMutex);
+                if (!m_sseThread.joinable())
+                {
+                    setupSSEStream();
+                }
+            }
+
+            /// @brief Setup SSE stream for server notifications. Caller holds m_sseMutex.
             void setupSSEStream()
             {
                 m_sseClient = std::make_unique<SSEClient>();
                 m_sseClient->setAutoReconnect(true, 3000);
 
-                // SSEClient cannot send custom request headers, so the session is passed
-                // as the ?session= query parameter, which the SocketsHpp server accepts
-                // as a fallback for the Mcp-Session-Id header.
-                std::string sseUrl = m_config.http.url;
+                // The stream carries the same configured headers as regular requests
+                // (e.g. Authorization) plus the session id in the Mcp-Session-Id header;
+                // keeping it out of the URL keeps it out of access logs.
+                for (const auto& header : m_config.http.headers)
+                {
+                    m_sseClient->setRequestHeader(header.first, header.second);
+                }
                 const std::string sid = sessionId();
                 if (!sid.empty())
                 {
-                    sseUrl += (sseUrl.find('?') == std::string::npos ? "?" : "&");
-                    sseUrl += "session=" + sid;
+                    m_sseClient->setRequestHeader("Mcp-Session-Id", sid);
                 }
+                const std::string sseUrl = m_config.http.url;
 
                 SSEClient* sse = m_sseClient.get();
                 m_sseThread = std::thread([this, sse, sseUrl]() {

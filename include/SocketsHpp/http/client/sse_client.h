@@ -300,6 +300,22 @@ namespace http
                 m_lastEventId = id;
             }
 
+            /// @brief Add a header sent with every stream request (including reconnects),
+            /// e.g. Authorization or Mcp-Session-Id. Replaces an existing header of the
+            /// same name. Accept, Cache-Control and Last-Event-ID are managed by the client.
+            void setRequestHeader(const std::string& name, const std::string& value)
+            {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_requestHeaders[name] = value;
+            }
+
+            /// @brief Remove all headers added with setRequestHeader()
+            void clearRequestHeaders()
+            {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_requestHeaders.clear();
+            }
+
             /// @brief Get current Last-Event-ID
             /// @note The returned reference is only stable while the stream is not running,
             ///       or when called from the event callback.
@@ -336,6 +352,7 @@ namespace http
         private:
             std::string m_url;
             std::string m_lastEventId;
+            std::map<std::string, std::string> m_requestHeaders;  // guarded by m_stateMutex
             EventCallback m_eventCallback;
             ErrorCallback m_errorCallback;
             std::atomic<bool> m_autoReconnect{false};
@@ -376,10 +393,15 @@ namespace http
                     HttpClientRequest request;
                     request.method = METHOD_GET;
                     request.uri = m_url;
-                    request.setAccept("text/event-stream");
-                    request.setHeader("Cache-Control", "no-cache");
                     {
                         std::lock_guard<std::mutex> lock(m_stateMutex);
+                        // Custom headers first, so the SSE-managed ones below win.
+                        for (const auto& header : m_requestHeaders)
+                        {
+                            request.setHeader(header.first, header.second);
+                        }
+                        request.setAccept("text/event-stream");
+                        request.setHeader("Cache-Control", "no-cache");
                         if (!m_lastEventId.empty())
                         {
                             request.setHeader("Last-Event-ID", m_lastEventId);

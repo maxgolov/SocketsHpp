@@ -785,6 +785,52 @@ TEST(SSEClientTest, AutoReconnectSendsLastEventIdAndHonorsRetry)
     EXPECT_NE(lowerCopy(reqs[1]).find("\r\naccept: text/event-stream\r\n"), std::string::npos);
 }
 
+TEST(SSEClientTest, RequestHeadersSentOnEveryConnectAndCannotOverrideAccept)
+{
+    std::atomic<int> connection{0};
+    ScriptedServer server([&](int fd, const std::string&, const std::string&) {
+        const int n = ++connection;
+        if (n == 1)
+        {
+            writeAll(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                         "retry: 20\ndata: first\n\n");
+            // Close after the first event so the client reconnects.
+        }
+        else
+        {
+            writeAll(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: second\n\n");
+            waitForPeerClose(fd);
+        }
+    });
+    ASSERT_TRUE(server.ok());
+
+    SSEClient client;
+    client.setAutoReconnect(true, 20);
+    client.setRequestHeader("Authorization", "Bearer abc");
+    client.setRequestHeader("Mcp-Session-Id", "sess-1");
+    client.setRequestHeader("Accept", "application/json");  // must not win
+    std::vector<std::string> received;
+    const bool ok = client.connect(server.url("/events"), [&](const SSEEvent& e) {
+        received.push_back(e.data);
+        if (e.data == "second")
+            client.close();
+    });
+    EXPECT_TRUE(ok);
+    ASSERT_EQ(received.size(), 2u);
+
+    auto reqs = server.requests();
+    ASSERT_GE(reqs.size(), 2u);
+    for (size_t i = 0; i < 2; ++i)
+    {
+        const std::string req = lowerCopy(reqs[i]);
+        EXPECT_NE(req.find("\r\nauthorization: bearer abc\r\n"), std::string::npos) << reqs[i];
+        EXPECT_NE(req.find("\r\nmcp-session-id: sess-1\r\n"), std::string::npos) << reqs[i];
+        EXPECT_NE(req.find("\r\naccept: text/event-stream\r\n"), std::string::npos) << reqs[i];
+        EXPECT_EQ(req.find("accept: application/json"), std::string::npos) << reqs[i];
+        EXPECT_EQ(req.find("session="), std::string::npos) << "session id must not be in the URL";
+    }
+}
+
 TEST(SSEClientTest, ReconnectRetriesAfterConnectFailureAndCloseStopsBackoff)
 {
     // Nothing listens on this port: every attempt fails; close() must stop the loop.
