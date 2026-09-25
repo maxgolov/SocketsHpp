@@ -163,6 +163,15 @@ jobs:
           -DCMAKE_FIND_ROOT_PATH="$PWD/mingw-deps"
           -DCMAKE_CROSSCOMPILING_EMULATOR="$(command -v wine64 || echo /usr/lib/wine/wine64)"
 
+      # Create the Wine prefix once up front; its first start is slow.
+      - name: Initialize Wine
+        env:
+          WINEDEBUG: -all
+        run: |
+          WINE="$(command -v wine64 || echo /usr/lib/wine/wine64)"
+          "$WINE" wineboot --init
+          "$WINE" cmd /c echo wine ready
+
       - name: Build
         run: cmake --build build --parallel
 

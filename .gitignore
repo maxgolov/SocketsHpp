@@ -48,3 +48,6 @@ vcpkg_installed/
 # Environment variables (keep .env.example for reference)
 .env
 .claude/worktrees/
+
+# Generated API reference (doxygen docs/Doxyfile)
+docs/api/

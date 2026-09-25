@@ -1,6 +1,16 @@
 find_package(GTest CONFIG REQUIRED)
 include(GoogleTest)
 
+# gtest_discover_tests() runs each test binary to list its tests. When cross-compiling
+# (e.g. MinGW + Wine) that goes through an emulator whose first start can be slow, so
+# list the tests at ctest time instead of build time and allow more time for it.
+if(CMAKE_CROSSCOMPILING)
+  set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+  set(SOCKETSHPP_GTEST_DISCOVERY_TIMEOUT 120)
+else()
+  set(SOCKETSHPP_GTEST_DISCOVERY_TIMEOUT 30)
+endif()
+
 # Try to find optional dependencies for MCP tests
 find_package(nlohmann_json CONFIG QUIET)
 
@@ -52,7 +62,7 @@ foreach(testname ${UNIT_TESTS})
   endif()
   
   target_include_directories(${testname} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  gtest_discover_tests(${testname} TEST_PREFIX unit.)
+  gtest_discover_tests(${testname} TEST_PREFIX unit. DISCOVERY_TIMEOUT ${SOCKETSHPP_GTEST_DISCOVERY_TIMEOUT})
 endforeach()
 
 # Functional tests - test end-to-end scenarios and integration
@@ -72,7 +82,7 @@ foreach(testname ${FUNCTIONAL_TESTS})
   target_link_libraries(${testname} ${GTEST_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
   
   target_include_directories(${testname} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  gtest_discover_tests(${testname} TEST_PREFIX functional.)
+  gtest_discover_tests(${testname} TEST_PREFIX functional. DISCOVERY_TIMEOUT ${SOCKETSHPP_GTEST_DISCOVERY_TIMEOUT})
 endforeach()
 
 # Streamable HTTP functional tests (MCP 2025-03-26) — require nlohmann-json.
@@ -87,7 +97,7 @@ if(NOT WIN32 AND TARGET nlohmann_json::nlohmann_json)
   target_include_directories(mcp_streamable_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  gtest_discover_tests(mcp_streamable_test TEST_PREFIX functional.)
+  gtest_discover_tests(mcp_streamable_test TEST_PREFIX functional. DISCOVERY_TIMEOUT ${SOCKETSHPP_GTEST_DISCOVERY_TIMEOUT})
 endif()
 
 # HttpClient / SSEClient functional tests. They drive the client against a scripted
@@ -99,7 +109,7 @@ if(NOT WIN32)
   target_include_directories(http_client_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  gtest_discover_tests(http_client_test TEST_PREFIX functional.)
+  gtest_discover_tests(http_client_test TEST_PREFIX functional. DISCOVERY_TIMEOUT ${SOCKETSHPP_GTEST_DISCOVERY_TIMEOUT})
 endif()
 
 # Header self-containment check: every public header must compile on its own
@@ -142,7 +152,7 @@ if(NOT WIN32)
   add_executable(http_server_robustness_test "functional/http_server_robustness_test.cc")
   target_link_libraries(http_server_robustness_test ${GTEST_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
   target_include_directories(http_server_robustness_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  gtest_discover_tests(http_server_robustness_test TEST_PREFIX functional.)
+  gtest_discover_tests(http_server_robustness_test TEST_PREFIX functional. DISCOVERY_TIMEOUT ${SOCKETSHPP_GTEST_DISCOVERY_TIMEOUT})
 endif()
 
 # Header-only guarantee: two translation units that each include every public
