@@ -47,3 +47,4 @@ vcpkg_installed/
 
 # Environment variables (keep .env.example for reference)
 .env
+.claude/worktrees/

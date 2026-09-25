@@ -22,6 +22,11 @@ jobs:
             cc: gcc
             cxx: g++
           - os: ubuntu-latest
+            compiler: gcc-sanitizers
+            cc: gcc
+            cxx: g++
+            cmake_extra: -DENABLE_ASAN=ON -DENABLE_UBSAN=ON
+          - os: ubuntu-latest
             compiler: clang
             cc: clang
             cxx: clang++
@@ -62,7 +67,9 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
           -DSOCKETSHPP_BUILD_TESTS=ON
+          -DSOCKETSHPP_WARNINGS_AS_ERRORS=ON
           -DBUILD_EXAMPLES=ON
+          ${{ matrix.cmake_extra }}
 
       - name: Configure macOS
         if: runner.os == 'macOS'
@@ -88,4 +95,6 @@ jobs:
         run: cmake --build build --config Debug --parallel
 
       - name: Test
-        run: ctest --test-dir build --build-config Debug --output-on-failure
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --build-config Debug --output-on-failure --timeout 120

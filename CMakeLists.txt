@@ -1,4 +1,4 @@
-﻿cmake_minimum_required (VERSION 3.8.0)
+﻿cmake_minimum_required (VERSION 3.14)
 
 project ("SocketsHpp" VERSION 1.0.0)
 
@@ -16,6 +16,15 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
     # Disable specific warnings
     add_compile_options(-Wno-unused-parameter)
+endif()
+
+option(SOCKETSHPP_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+if(SOCKETSHPP_WARNINGS_AS_ERRORS)
+    if(MSVC)
+        add_compile_options(/WX)
+    else()
+        add_compile_options(-Werror)
+    endif()
 endif()
 
 # Optional: Enable sanitizers for debug builds

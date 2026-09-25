@@ -64,7 +64,7 @@ set(FUNCTIONAL_TESTS
 # endif()
 
 foreach(testname ${FUNCTIONAL_TESTS})
-  add_executable(${testname} "functional/${testname}.cc" "functional/utils.h")
+  add_executable(${testname} "functional/${testname}.cc")
   target_link_libraries(${testname} ${GTEST_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
   
   target_include_directories(${testname} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -84,4 +84,37 @@ if(NOT WIN32 AND TARGET nlohmann_json::nlohmann_json)
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   gtest_discover_tests(mcp_streamable_test TEST_PREFIX functional.)
+endif()
+
+# Header self-containment check: every public header must compile on its own
+# (and twice, to verify include guards). One generated translation unit per
+# header is compiled into a static library; nothing is executed.
+file(GLOB_RECURSE SOCKETSHPP_PUBLIC_HEADERS
+  RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../include/*.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../include/*.hpp")
+set(SOCKETSHPP_HEADER_CHECK_SOURCES)
+foreach(header ${SOCKETSHPP_PUBLIC_HEADERS})
+  # MCP headers depend on nlohmann-json; the Windows compression backend is
+  # Windows-only.
+  if(header MATCHES "^SocketsHpp/mcp/|^sockets\\.hpp$" AND NOT TARGET nlohmann_json::nlohmann_json)
+    continue()
+  endif()
+  if(header MATCHES "compression_windows\\.h$" AND NOT WIN32)
+    continue()
+  endif()
+  string(MAKE_C_IDENTIFIER "${header}" header_id)
+  set(check_source "${CMAKE_CURRENT_BINARY_DIR}/header_check/${header_id}.cc")
+  file(WRITE "${check_source}.in"
+    "#include <${header}>\n#include <${header}>\n")
+  configure_file("${check_source}.in" "${check_source}" COPYONLY)
+  list(APPEND SOCKETSHPP_HEADER_CHECK_SOURCES "${check_source}")
+endforeach()
+add_library(header_self_contained_check STATIC ${SOCKETSHPP_HEADER_CHECK_SOURCES})
+target_include_directories(header_self_contained_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+if(TARGET nlohmann_json::nlohmann_json)
+  target_link_libraries(header_self_contained_check PRIVATE nlohmann_json::nlohmann_json)
+endif()
+if(WIN32)
+  target_link_libraries(header_self_contained_check PRIVATE Cabinet)
 endif()
