@@ -15,37 +15,45 @@ namespace http
 {
     namespace common
     {
-        // http://user:password@host:port/path1/path2?key1=val2&key2=val2
-        // http://host:port/path1/path2?key1=val1&key2=val2
-        // http://[::1]:8080/path
-        // host:port/path1
-        // host:port ( path defaults to "/")
-        // host:port?
-        //
-        // Fields:
-        //   scheme_  lower-cased scheme ("http" when absent)
-        //   host_    host name / IPv4 literal / IPv6 literal *without* brackets
-        //   port_    explicit port, else the scheme default (http/ws 80, https/wss 443), else 0
-        //   path_    path ("/" when absent); no query or fragment
-        //   query_   text after '?' up to '#' (no leading '?')
-        //   success_ false if the URL is empty or malformed (bad scheme, empty
-        //            host, bad IPv6 literal, non-numeric or out-of-range port)
-        //
-        // Only the authority (between "scheme://" and the first '/', '?' or '#')
-        // is searched for userinfo ('@') and the port (':'), so characters in the
-        // path or query can never change the host.
-
+        /// @brief Minimal URL splitter; parses in the constructor and exposes the parts
+        /// as public fields.
+        ///
+        /// Accepted forms include:
+        /// - http://user:password@host:port/path1/path2?key1=val2&key2=val2 (userinfo is dropped)
+        /// - http://host:port/path1/path2?key1=val1&key2=val2
+        /// - http://[::1]:8080/path
+        /// - host:port/path1
+        /// - host:port (path defaults to "/")
+        /// - host:port?
+        ///
+        /// Only the authority (between "scheme://" and the first '/', '?' or '#')
+        /// is searched for userinfo ('@') and the port (':'), so characters in the
+        /// path or query can never change the host. No percent-decoding is done.
+        ///
+        /// @note Check success_ before using the other fields; after a failure they may
+        ///       be partially filled.
         class UrlParser
         {
         public:
+            /// @brief The original URL, unchanged.
             std::string url_;
+            /// @brief Host name, IPv4 literal, or IPv6 literal *without* brackets.
             std::string host_;
+            /// @brief Lower-cased scheme ("http" when absent).
             std::string scheme_;
+            /// @brief Path ("/" when absent); no query or fragment.
             std::string path_;
+            /// @brief Explicit port, else the scheme default (http/ws 80, https/wss 443),
+            /// else 0. An empty port ("host:") also means the default.
             uint16_t port_ = 0;
+            /// @brief Text after '?' up to '#' (no leading '?'); empty if none.
             std::string query_;
+            /// @brief False if the URL is empty or malformed (bad scheme, empty host, bad
+            /// IPv6 literal, non-numeric or out-of-range port).
             bool success_ = false;
 
+            /// @brief Parse `url`; the result is reported in success_.
+            /// @param url URL to parse. Never throws on malformed input.
             UrlParser(std::string url) : url_(std::move(url))
             {
                 success_ = parse();

@@ -24,17 +24,26 @@ namespace http
         /// @brief Parsed Server-Sent Event
         struct SSEEvent
         {
+            /// @brief Value of the "id" field in this event's block (meaningful only if hasId).
             std::string id;
-            std::string event;      // Event type (empty means the default, "message")
-            std::string data;       // Event data (multi-line joined with '\n')
-            int retry = -1;         // Reconnection time in ms (-1 = not set)
-            bool hasData = false;   // True if a data field was present (even if empty)
-            bool hasId = false;     // True if an id field was present (an empty id resets Last-Event-ID)
+            /// @brief Event type from the "event" field (empty means the default, "message").
+            std::string event;
+            /// @brief Event data; multiple "data" lines are joined with '\n'.
+            std::string data;
+            /// @brief Reconnection time in ms from a "retry" field, or -1 if not set.
+            int retry = -1;
+            /// @brief True if a data field was present (even if empty).
+            bool hasData = false;
+            /// @brief True if an id field was present (an empty id resets Last-Event-ID).
+            bool hasId = false;
 
-            /// @brief Check if event is valid (has data)
+            /// @brief Check if the event should be dispatched (a data field was present).
+            /// @return hasData
             bool isValid() const { return hasData; }
 
-            /// @brief Check if this is a comment event
+            /// @brief Check if the event carries no fields at all.
+            /// @return true if no data, event, id or retry field is set.
+            /// @note SSEParser never returns such events (comment lines are dropped).
             bool isComment() const { return !hasData && event.empty() && !hasId && retry < 0; }
         };
 
@@ -51,12 +60,15 @@ namespace http
         /// that callers can track Last-Event-ID and the reconnection time. Each event
         /// carries only the id set in its own block (Last-Event-ID tracking across
         /// events is left to the caller, e.g. SSEClient).
+        ///
+        /// @note Not thread-safe; state is kept between calls, so feed one stream per parser.
         class SSEParser
         {
         public:
             /// @brief Parse SSE chunk and extract complete events
-            /// @param chunk Data chunk from stream
-            /// @return Vector of complete events found in chunk
+            /// @param chunk Data chunk from stream (may split lines or events anywhere)
+            /// @return Events completed by this chunk (possibly none); incomplete data is
+            ///         buffered for the next call
             std::vector<SSEEvent> parseChunk(const std::string& chunk)
             {
                 std::vector<SSEEvent> events;
@@ -116,7 +128,8 @@ namespace http
                 return events;
             }
 
-            /// @brief Reset parser state (e.g. before reconnecting)
+            /// @brief Reset parser state (e.g. before reconnecting): drops buffered line and
+            /// event data and re-enables BOM detection
             void reset()
             {
                 m_line.clear();
@@ -127,6 +140,7 @@ namespace http
             }
 
             /// @brief Get size of buffered, not yet terminated line data (for debugging)
+            /// @return Number of bytes in the pending partial line
             size_t getBufferSize() const { return m_line.size(); }
 
         private:
@@ -253,26 +267,37 @@ namespace http
         /// callback) and makes connect() return promptly.
         ///
         /// Unlike HttpClient, the read timeout defaults to 0 (none) so that idle streams
-        /// are not dropped; call setReadTimeout() to enable one.
+        /// are not dropped; call setReadTimeout() to enable one. Other HttpClient settings
+        /// (connect timeout, redirects, User-Agent) apply; only http:// URLs work.
+        ///
+        /// Each (re)connection sends a GET with "Accept: text/event-stream",
+        /// "Cache-Control: no-cache", the headers from setRequestHeader() and, when known,
+        /// "Last-Event-ID". Callbacks run on the thread that called connect().
         class SSEClient : public HttpClient
         {
         public:
-            /// @brief Event callback type
+            /// @brief Event callback type; called for each event with data (SSEEvent::isValid()).
             using EventCallback = std::function<void(const SSEEvent&)>;
 
-            /// @brief Error callback type
+            /// @brief Error callback type; receives a short description of the failure.
             using ErrorCallback = std::function<void(const std::string&)>;
 
+            /// @brief Create a client with no read timeout and auto-reconnect disabled.
             SSEClient() { m_readTimeoutMs = 0; }
 
             /// @brief Connect to SSE endpoint and receive events until the stream ends
             /// (or, with auto-reconnect enabled, until close() is called or the server
-            /// answers with a non-200 status).
-            /// @param url SSE endpoint URL
-            /// @param onEvent Callback for each event
-            /// @param onError Optional error callback
-            /// @return true if the last connection attempt succeeded (status 200), or if the
-            ///         stream was stopped by close() after connecting at least once.
+            /// answers with a non-200 status). Blocks the calling thread.
+            /// @param url SSE endpoint URL (http:// only)
+            /// @param onEvent Callback for each event with data
+            /// @param onError Optional error callback: called on a non-200 status, a failed
+            ///        connection or an interrupted stream (not after close())
+            /// @return true if the last connection attempt got status 200 and its stream
+            ///         ended without error, or if the stream was stopped by close() after
+            ///         connecting at least once; false otherwise (always false on a non-200
+            ///         status, which is never retried).
+            /// @note Resets a previous close(), but not the auto-reconnect flag that close()
+            ///       cleared: call setAutoReconnect() again before reconnecting a closed client.
             bool connect(const std::string& url, EventCallback onEvent, ErrorCallback onError = nullptr)
             {
                 m_eventCallback = onEvent;
@@ -283,7 +308,9 @@ namespace http
                 return run();
             }
 
-            /// @brief Reconnect with Last-Event-ID (same semantics as connect()).
+            /// @brief Reconnect to the URL and callbacks of the last connect(), sending
+            /// Last-Event-ID when known (same semantics as connect()).
+            /// @return As connect(); false immediately if close() has been called.
             bool reconnect()
             {
                 if (m_closed)
@@ -293,7 +320,9 @@ namespace http
                 return run();
             }
 
-            /// @brief Set Last-Event-ID for resumable streams
+            /// @brief Set Last-Event-ID for resumable streams. Thread-safe; sent on the next
+            /// (re)connection if non-empty. Updated automatically from received "id:" fields.
+            /// @param id Last event id (empty: send no Last-Event-ID header)
             void setLastEventId(const std::string& id)
             {
                 std::lock_guard<std::mutex> lock(m_stateMutex);
@@ -302,14 +331,18 @@ namespace http
 
             /// @brief Add a header sent with every stream request (including reconnects),
             /// e.g. Authorization or Mcp-Session-Id. Replaces an existing header of the
-            /// same name. Accept, Cache-Control and Last-Event-ID are managed by the client.
+            /// same (exact-case) name. Accept and Cache-Control are always set by the client,
+            /// and Last-Event-ID is replaced whenever a last event id is known.
+            /// @param name Header field name
+            /// @param value Header field value
+            /// @note Thread-safe; takes effect on the next (re)connection.
             void setRequestHeader(const std::string& name, const std::string& value)
             {
                 std::lock_guard<std::mutex> lock(m_stateMutex);
                 m_requestHeaders[name] = value;
             }
 
-            /// @brief Remove all headers added with setRequestHeader()
+            /// @brief Remove all headers added with setRequestHeader(). Thread-safe.
             void clearRequestHeaders()
             {
                 std::lock_guard<std::mutex> lock(m_stateMutex);
@@ -317,16 +350,22 @@ namespace http
             }
 
             /// @brief Get current Last-Event-ID
-            /// @note The returned reference is only stable while the stream is not running,
-            ///       or when called from the event callback.
+            /// @return The last id received (or set with setLastEventId())
+            /// @note Not synchronized: the returned reference is only stable while the stream
+            ///       is not running, or when called from the event callback.
             const std::string& getLastEventId() const
             {
                 return m_lastEventId;
             }
 
-            /// @brief Enable/disable automatic reconnection
+            /// @brief Enable/disable automatic reconnection (disabled by default). Thread-safe.
+            ///
+            /// With auto-reconnect, a stream that ends or fails is reopened after the delay;
+            /// consecutive connection failures double the delay up to
+            /// setMaxReconnectDelay(). A non-200 status or close() stops reconnecting.
             /// @param enable Enable auto-reconnect
-            /// @param delay Reconnection delay in milliseconds (overridden by server "retry:")
+            /// @param delay Base reconnection delay in milliseconds. A server "retry:" field
+            ///        replaces it (and stays in effect until the next setAutoReconnect()).
             void setAutoReconnect(bool enable, int delay = 3000)
             {
                 m_autoReconnect = enable;
@@ -334,10 +373,16 @@ namespace http
             }
 
             /// @brief Set maximum reconnection delay used by the exponential backoff after
-            /// consecutive connection failures (milliseconds).
+            /// consecutive connection failures (milliseconds, default 60000). Thread-safe.
+            /// @param delay Upper bound in ms (a larger base delay is still honoured)
             void setMaxReconnectDelay(int delay) { m_maxReconnectDelay = delay; }
 
-            /// @brief Close SSE connection. Thread-safe; unblocks a connect() in progress.
+            /// @brief Close SSE connection. Thread-safe (also callable from a callback);
+            /// unblocks a connect() in progress, including one waiting to reconnect.
+            ///
+            /// Disables auto-reconnect, shuts down the active socket and makes further
+            /// requests on this client fail until the next connect(). No more events or
+            /// errors are delivered after it takes effect.
             void close()
             {
                 m_autoReconnect = false;

@@ -394,16 +394,34 @@ namespace http
             }
         }  // namespace detail
 
+        /// @brief An HTTP request to be sent with HttpClient::send().
+        ///
+        /// Missing Host, User-Agent, Accept ("*/*"), Content-Length (for a non-empty body
+        /// without Transfer-Encoding) and Connection ("close") headers are filled in by
+        /// the client when the request is sent.
         struct HttpClientRequest
         {
+            /// @brief Request method, sent verbatim (default "GET").
             std::string method = METHOD_GET;
+            /// @brief Target URL, e.g. "http://host:8080/path?query". The scheme defaults
+            /// to "http" when omitted; only "http" is accepted by HttpClient. Userinfo
+            /// ("user:pass@") and any "#fragment" are dropped. Bracketed IPv6 literals
+            /// are supported.
             std::string uri;
+            /// @brief Protocol version written in the request line (default "HTTP/1.1").
             std::string protocol = HTTP_1_1;
+            /// @brief Request headers, written as "Name: value" lines in map order. Keys are
+            /// case-sensitive in the map; use setHeader() to replace case-insensitively.
             std::map<std::string, std::string> headers;
+            /// @brief Request body, sent as-is after the header section.
+            /// @note If you set "Transfer-Encoding: chunked" yourself, the body must
+            ///       already be chunk-encoded; the client does not encode it.
             std::string body;
 
-            /// Set a header. Field names are case-insensitive: an existing header whose
+            /// @brief Set a header. Field names are case-insensitive: an existing header whose
             /// name differs only in case is replaced rather than duplicated.
+            /// @param name Header field name.
+            /// @param value Header field value.
             void setHeader(const std::string& name, const std::string& value)
             {
                 auto it = detail::findHeader(headers, name);
@@ -414,93 +432,163 @@ namespace http
                 headers[name] = value;
             }
 
-            // Common headers
+            /// @brief Set the Content-Type header (see setHeader()).
+            /// @param contentType Media type, e.g. "application/json".
             void setContentType(const std::string& contentType)
             {
                 setHeader(CONTENT_TYPE, contentType);
             }
 
+            /// @brief Set the User-Agent header for this request, overriding
+            /// HttpClient::setUserAgent().
+            /// @param userAgent User-Agent value.
             void setUserAgent(const std::string& userAgent)
             {
                 setHeader("User-Agent", userAgent);
             }
 
+            /// @brief Set the Accept header (the client sends "*/*" when none is set).
+            /// @param accept Accept value, e.g. "text/event-stream".
             void setAccept(const std::string& accept)
             {
                 setHeader(ACCEPT, accept);
             }
         };
 
+        /// @brief Response filled in by HttpClient::send().
+        ///
+        /// Status, headers, body and isChunked are reset at the start of every exchange;
+        /// the chunkCallback and onComplete callbacks are kept. After a redirect chain
+        /// the object describes the last response received.
         struct HttpClientResponse
         {
+            /// @brief Status code (e.g. 200); 0 until a status line has been parsed.
             int code = 0;
+            /// @brief Reason phrase from the status line (may be empty).
             std::string message;
+            /// @brief Protocol version from the status line, e.g. "HTTP/1.1".
             std::string protocol;
-            /// Response headers, keyed by the field name exactly as received from the
-            /// server. HTTP field names are case-insensitive, so prefer getHeader() /
-            /// hasHeader(), which match names case-insensitively. Repeated fields are
-            /// combined into one entry with ", " (RFC 9110 5.3).
+            /// @brief Response headers, keyed by the field name exactly as received from the
+            /// server, with surrounding whitespace trimmed from values. HTTP field names are
+            /// case-insensitive, so prefer getHeader() / hasHeader(), which match names
+            /// case-insensitively. Repeated fields are combined into one entry with ", "
+            /// (RFC 9110 5.3).
             std::map<std::string, std::string> headers;
+            /// @brief Accumulated response body. Stays empty when chunkCallback is set.
+            /// Limited by HttpClient::setMaxResponseBodySize().
             std::string body;
 
-            // Streaming support
+            /// @brief True if the response used "Transfer-Encoding: chunked" (as the final coding).
             bool isChunked = false;
-            /// When set, body data is delivered here instead of being appended to `body`:
-            /// once per HTTP chunk for chunked responses, and once per received buffer for
-            /// Content-Length and read-until-close responses.
+            /// @brief Optional streaming sink. When set, body data is delivered here instead
+            /// of being appended to `body`: once per HTTP chunk (decoded, without chunk
+            /// framing) for chunked responses, and once per received buffer (up to 4 KiB,
+            /// plus any bytes read together with the headers) for Content-Length and
+            /// read-until-close responses. Never called with empty data.
+            /// @note Invoked synchronously on the thread running HttpClient::send(). When
+            ///       redirects are followed it is only called for the final response.
             std::function<void(const std::string&)> chunkCallback;
-            std::function<void()> onComplete;  // Called when response is complete
+            /// @brief Optional callback invoked once after the whole body has been received
+            /// successfully (also for responses without a body). Not called when the
+            /// exchange fails; only called for the final response of a redirect chain.
+            std::function<void()> onComplete;
 
-            /// Get header value (case-insensitive name match); "" if absent.
+            /// @brief Get a header value (case-insensitive name match).
+            /// @param name Header field name.
+            /// @return The (combined) value, or "" if the header is absent.
             std::string getHeader(const std::string& name) const
             {
                 auto it = detail::findHeader(headers, name);
                 return (it != headers.end()) ? it->second : "";
             }
 
-            /// Check header presence (case-insensitive name match).
+            /// @brief Check header presence (case-insensitive name match).
+            /// @param name Header field name.
+            /// @return true if the response contains the header.
             bool hasHeader(const std::string& name) const
             {
                 return detail::findHeader(headers, name) != headers.end();
             }
         };
 
+        /// @brief Blocking HTTP/1.1 client (plain http only, no TLS).
+        ///
+        /// Each request opens a new TCP connection (IPv4/IPv6/DNS via getaddrinfo) and,
+        /// unless the request sets its own Connection header, sends "Connection: close";
+        /// there is no connection reuse. Follows redirects by default (see send()).
+        ///
+        /// @note Thread-safety: an instance runs one request at a time and its setters are
+        ///       not synchronized. cancel() is the only member intended to be called from
+        ///       another thread. Copying a client copies its settings only.
         class HttpClient
         {
         protected:
+            /// @brief Default User-Agent, used when a request sets none.
             std::string m_userAgent = "SocketsHpp/1.1";
-            int m_connectTimeoutMs = 10000;  // 10 seconds; <= 0 means OS default (blocking)
-            int m_readTimeoutMs = 30000;     // 30 seconds; <= 0 means no timeout
-            bool m_followRedirects = true;   // follow 301/302/303/307/308 (see send())
+            /// @brief Connect timeout in ms (default 10 s); <= 0 means a plain blocking
+            /// connect() limited only by the OS.
+            int m_connectTimeoutMs = 10000;
+            /// @brief Socket receive/send timeout in ms (default 30 s); <= 0 means none.
+            int m_readTimeoutMs = 30000;
+            /// @brief Whether send() follows 301/302/303/307/308 redirects (default true).
+            bool m_followRedirects = true;
+            /// @brief Maximum number of redirects followed per send() (default 10).
             int m_maxRedirects = 10;
-            /// Upper bound on a response body accumulated into HttpClientResponse::body,
-            /// and on any single chunk of a chunked response.
+            /// @brief Upper bound on a response body accumulated into HttpClientResponse::body,
+            /// and on any single chunk of a chunked response (default 1 GiB).
             size_t m_maxResponseBodySize = static_cast<size_t>(1) << 30;  // 1 GiB
 
-            /// Maximum size of the status line + header section.
+            /// @brief Maximum size of the status line + header section.
             static constexpr size_t kMaxHeaderBytes = 1024 * 1024;
-            /// Maximum length of a chunk-size line (including extensions) or trailer line.
+            /// @brief Maximum length of a chunk-size line (including extensions) or trailer line.
             static constexpr size_t kMaxChunkLineBytes = 64 * 1024;
 
         public:
+            /// @brief Create a client with default settings.
             HttpClient() = default;
 
+            /// @brief Set the User-Agent sent when a request does not set one
+            /// (default "SocketsHpp/1.1").
+            /// @param userAgent User-Agent value.
             void setUserAgent(const std::string& userAgent) { m_userAgent = userAgent; }
+            /// @brief Get the default User-Agent.
+            /// @return The User-Agent sent when a request does not set one.
             const std::string& getUserAgent() const { return m_userAgent; }
-            /// Connect timeout in milliseconds (<= 0: use the OS default).
+            /// @brief Set the connect timeout in milliseconds (default 10000).
+            /// @param ms Timeout; > 0 uses a non-blocking connect() + poll()/select(), applied
+            ///           to each resolved address in turn; <= 0 uses a blocking connect()
+            ///           limited only by the OS.
+            /// @note DNS resolution (getaddrinfo) is not covered by this timeout.
             void setConnectTimeout(int ms) { m_connectTimeoutMs = ms; }
-            /// Per-operation socket receive/send timeout in milliseconds (<= 0: none).
+            /// @brief Set the socket receive and send timeout in milliseconds (default 30000).
+            /// @param ms Applied as SO_RCVTIMEO and SO_SNDTIMEO; <= 0 means no timeout.
+            /// @note The limit applies to each individual recv()/send() call, not to the whole
+            ///       request; a timeout fails the request.
             void setReadTimeout(int ms) { m_readTimeoutMs = ms; }
+            /// @brief Enable or disable following redirects (default enabled).
+            /// @param follow false returns 3xx responses to the caller unchanged.
             void setFollowRedirects(bool follow) { m_followRedirects = follow; }
+            /// @brief Set the maximum number of redirects followed per send() (default 10).
+            /// @param max Maximum hops; <= 0 disables redirect following. Exceeding the limit
+            ///            makes send() return false.
             void setMaxRedirects(int max) { m_maxRedirects = max; }
-            /// Maximum accumulated body size / single chunk size (bytes).
+            /// @brief Set the maximum response body size in bytes (default 1 GiB).
+            /// @param bytes Limit on the body accumulated into HttpClientResponse::body and on
+            ///              any single chunk of a chunked response (the chunk limit also
+            ///              applies when a chunkCallback is used). Exceeding it fails the request.
             void setMaxResponseBodySize(size_t bytes) { m_maxResponseBodySize = bytes; }
 
-            /// Abort the request currently in flight on this client (if any) from another
+            /// @brief Abort the request currently in flight on this client (if any) from another
             /// thread by shutting its socket down. The blocked send() then returns false.
+            /// @note Thread-safe. Only affects a request whose connection is already
+            ///       established; it does not interrupt DNS resolution or connect(), and has
+            ///       no effect on later requests.
             void cancel() { shutdownActiveSocket(false); }
 
-            // Simple GET request
+            /// @brief Send a GET request (see send()).
+            /// @param url Target URL (http:// only).
+            /// @param response Receives the response.
+            /// @return true if a complete response was received (any status code).
             bool get(const std::string& url, HttpClientResponse& response)
             {
                 HttpClientRequest request;
@@ -509,7 +597,11 @@ namespace http
                 return send(request, response);
             }
 
-            // Simple POST request
+            /// @brief Send a POST request with a body and no Content-Type header (see send()).
+            /// @param url Target URL (http:// only).
+            /// @param body Request body.
+            /// @param response Receives the response.
+            /// @return true if a complete response was received (any status code).
             bool post(const std::string& url, const std::string& body, HttpClientResponse& response)
             {
                 HttpClientRequest request;
@@ -519,16 +611,27 @@ namespace http
                 return send(request, response);
             }
 
-            /// Send a request. Redirects (301/302/303/307/308 with a Location header) are
+            /// @brief Send a request and read the response. Blocks until done, failed,
+            /// timed out or cancel()ed.
+            ///
+            /// Redirects (301/302/303/307/308 with a Location header) are
             /// followed up to setMaxRedirects() times unless disabled with
             /// setFollowRedirects(false):
             ///  - 303, and 301/302 for methods other than GET/HEAD, switch to GET without
-            ///    a body; 307/308 repeat the original method and body.
+            ///    a body (HEAD stays HEAD); 307/308 repeat the original method and body.
             ///  - Authorization, Cookie and Proxy-Authorization are dropped when the
-            ///    redirect leaves the original host/port.
+            ///    redirect leaves the original scheme/host/port.
+            ///  - Relative Location values are resolved against the current URL.
             /// Streaming callbacks (chunkCallback/onComplete) only see the final response.
             /// Only plain "http" URLs are supported; https (TLS) is rejected rather than
             /// sent in cleartext.
+            /// @param request Request to send. Default headers are added to it in place when
+            ///        redirects are disabled; with redirect following a copy is sent.
+            /// @param response Receives the (final) response; see HttpClientResponse.
+            /// @return true if a complete response was received, whatever its status code.
+            ///         false on an invalid or non-http URL, DNS/connect failure, send/receive
+            ///         error or timeout, malformed response, size limit exceeded, cancel(),
+            ///         an invalid redirect Location or too many redirects (errors are logged).
             bool send(HttpClientRequest& request, HttpClientResponse& response)
             {
                 if (!m_followRedirects || m_maxRedirects <= 0)
@@ -612,7 +715,10 @@ namespace http
             }
 
         protected:
-            /// Send a single request/response exchange (no redirect handling).
+            /// @brief Send a single request/response exchange (no redirect handling).
+            /// Adds missing default headers to `request`, connects, sends and reads the
+            /// response; the socket is always closed before returning.
+            /// @return true if a complete response was received.
             bool sendOnce(HttpClientRequest& request, HttpClientResponse& response)
             {
                 detail::ParsedUrl url;
@@ -701,23 +807,36 @@ namespace http
             // Active socket tracking (for cancel()/SSEClient::close())
             // ---------------------------------------------------------------------
 
-            /// Holds the socket of the in-flight request. Copying an HttpClient yields a
+            /// @brief Holds the socket of the in-flight request. Copying an HttpClient yields a
             /// fresh, idle slot (the mutex and the in-flight socket are never shared).
             struct ActiveSocketSlot
             {
+                /// @brief Guards sock and stickyCancel.
                 std::mutex mutex;
+                /// @brief Socket of the in-flight request, or Socket::Invalid when idle.
                 Socket::Type sock = Socket::Invalid;
+                /// @brief When set, new requests are refused until clearCancel().
                 bool stickyCancel = false;  // cancel also the next request(s) until cleared
 
+                /// @brief Create an idle slot.
                 ActiveSocketSlot() = default;
+                /// @brief Copying yields an idle slot; nothing is copied.
                 ActiveSocketSlot(const ActiveSocketSlot&) {}
+                /// @brief Assignment is a no-op; the target keeps its own state.
+                /// @return *this
                 ActiveSocketSlot& operator=(const ActiveSocketSlot&) { return *this; }
             };
+            /// @brief In-flight socket slot used by cancel() and shutdownActiveSocket().
             ActiveSocketSlot m_active;
 
+            /// @brief RAII helper that publishes a connected socket in m_active for the
+            /// duration of an exchange, so another thread can shut it down.
             class ActiveSocketGuard
             {
             public:
+                /// @brief Publish `sock` unless a sticky cancel is pending.
+                /// @param client Owning client.
+                /// @param sock Connected socket of the current exchange.
                 ActiveSocketGuard(HttpClient& client, Socket& sock) : m_client(client)
                 {
                     std::lock_guard<std::mutex> lock(m_client.m_active.mutex);
@@ -727,6 +846,7 @@ namespace http
                         m_client.m_active.sock = sock.m_sock;
                     }
                 }
+                /// @brief Unpublish the socket.
                 ~ActiveSocketGuard()
                 {
                     std::lock_guard<std::mutex> lock(m_client.m_active.mutex);
@@ -734,6 +854,8 @@ namespace http
                 }
                 ActiveSocketGuard(const ActiveSocketGuard&) = delete;
                 ActiveSocketGuard& operator=(const ActiveSocketGuard&) = delete;
+                /// @brief True if a sticky cancel was pending; the exchange must be abandoned.
+                /// @return Whether the request was cancelled before it started.
                 bool cancelled() const { return m_cancelled; }
 
             private:
@@ -741,8 +863,10 @@ namespace http
                 bool m_cancelled = false;
             };
 
-            /// Shut down the in-flight socket (unblocks recv/send in the request thread).
+            /// @brief Shut down the in-flight socket (unblocks recv/send in the request thread).
             /// If sticky, subsequent requests are refused until clearCancel() is called.
+            /// @param sticky Also cancel requests started later (used by SSEClient::close()).
+            /// @note Thread-safe.
             void shutdownActiveSocket(bool sticky)
             {
                 std::lock_guard<std::mutex> lock(m_active.mutex);
@@ -756,6 +880,7 @@ namespace http
                 }
             }
 
+            /// @brief Clear a sticky cancel set by shutdownActiveSocket(true). Thread-safe.
             void clearCancel()
             {
                 std::lock_guard<std::mutex> lock(m_active.mutex);
@@ -766,6 +891,9 @@ namespace http
             // Low-level socket helpers
             // ---------------------------------------------------------------------
 
+            /// @brief True if the last socket error was EINTR (always false on Windows).
+            /// @param socket Socket whose last error is checked.
+            /// @return Whether the failed call should be retried.
             static bool interrupted(Socket& socket)
             {
 #ifdef _WIN32
@@ -776,7 +904,8 @@ namespace http
 #endif
             }
 
-            /// send() until all bytes are written or an error occurs.
+            /// @brief send() until all bytes are written or an error occurs (EINTR is retried).
+            /// @return true if every byte was sent.
             static bool sendAll(Socket& socket, const char* data, size_t len)
             {
                 while (len > 0)
@@ -797,7 +926,8 @@ namespace http
                 return true;
             }
 
-            /// recv() retrying on EINTR. Returns >0 bytes, 0 on orderly EOF, <0 on error/timeout.
+            /// @brief recv() retrying on EINTR.
+            /// @return >0 bytes received, 0 on orderly EOF, <0 on error/timeout.
             static int recvSome(Socket& socket, char* buf, size_t size)
             {
                 while (true)
@@ -811,7 +941,7 @@ namespace http
                 }
             }
 
-            /// Apply m_readTimeoutMs as SO_RCVTIMEO and SO_SNDTIMEO.
+            /// @brief Apply m_readTimeoutMs as SO_RCVTIMEO and SO_SNDTIMEO (no-op if <= 0).
             void applyIoTimeouts(Socket& socket) const
             {
                 if (m_readTimeoutMs <= 0)
@@ -829,6 +959,9 @@ namespace http
                 ::setsockopt(socket.m_sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
             }
 
+            /// @brief Switch a socket between blocking and non-blocking mode (errors ignored).
+            /// @param sock Native socket handle.
+            /// @param nonBlocking true for non-blocking mode.
             static void setNonBlockingMode(Socket::Type sock, bool nonBlocking)
             {
 #ifdef _WIN32
@@ -845,7 +978,9 @@ namespace http
 #endif
             }
 
-            /// connect() honoring m_connectTimeoutMs (non-blocking connect + poll/select).
+            /// @brief connect() honoring m_connectTimeoutMs (non-blocking connect + poll/select).
+            /// The socket is left in blocking mode.
+            /// @return true if the connection was established within the timeout.
             bool connectWithTimeout(Socket::Type sock, const sockaddr* addr, size_t addrLen) const
             {
                 if (m_connectTimeoutMs <= 0)
@@ -918,8 +1053,9 @@ namespace http
                 return ok;
             }
 
-            /// Resolve the URL host (IPv4, IPv6 or DNS name) and connect to the first
+            /// @brief Resolve the URL host (IPv4, IPv6 or DNS name) and connect to the first
             /// address that accepts. On success `out` owns the connected socket.
+            /// @return true if connected.
             bool connectTo(const detail::ParsedUrl& url, net::utils::ScopedSocket& out) const
             {
                 addrinfo hints{};
@@ -962,7 +1098,8 @@ namespace http
             // Response parsing
             // ---------------------------------------------------------------------
 
-            /// Deliver body bytes to the chunk callback, or append them to response.body.
+            /// @brief Deliver body bytes to the chunk callback, or append them to response.body.
+            /// @return false if appending would exceed m_maxResponseBodySize.
             bool deliverBody(HttpClientResponse& response, const std::string& data) const
             {
                 if (data.empty())
@@ -983,6 +1120,8 @@ namespace http
                 return true;
             }
 
+            /// @brief Invoke response.onComplete (if set).
+            /// @return Always true.
             static bool complete(HttpClientResponse& response)
             {
                 if (response.onComplete)
@@ -992,12 +1131,22 @@ namespace http
                 return true;
             }
 
-            /// Backward-compatible overload (assumes a request method with a response body).
+            /// @brief Backward-compatible overload (assumes a request method with a response body).
+            /// @return See receiveResponse(Socket&, HttpClientResponse&, const std::string&).
             bool receiveResponse(Socket& socket, HttpClientResponse& response)
             {
                 return receiveResponse(socket, response, METHOD_GET);
             }
 
+            /// @brief Read one response from `socket` into `response`.
+            ///
+            /// Skips interim 1xx responses (except 101), then reads the body framed by
+            /// chunked Transfer-Encoding, Content-Length, or connection close. HEAD, 1xx,
+            /// 204 and 304 responses have no body.
+            /// @param socket Connected socket.
+            /// @param response Reset, then filled in; its callbacks are invoked.
+            /// @param method Request method (a HEAD response carries no body).
+            /// @return true if a complete response was received.
             bool receiveResponse(Socket& socket, HttpClientResponse& response, const std::string& method)
             {
                 response.code = 0;
@@ -1108,8 +1257,9 @@ namespace http
                 return receiveUntilClose(socket, bodyBuffer, response);
             }
 
-            /// Read the body until the peer closes the connection. A receive error or
+            /// @brief Read the body until the peer closes the connection. A receive error or
             /// timeout (as opposed to an orderly close) fails the request.
+            /// @return true on an orderly close.
             bool receiveUntilClose(Socket& socket, std::string& bodyBuffer, HttpClientResponse& response)
             {
                 if (!deliverBody(response, bodyBuffer))
@@ -1137,6 +1287,9 @@ namespace http
                 return complete(response);
             }
 
+            /// @brief Parse a status line and header section (CRLF or LF line endings) into
+            /// response.protocol/code/message/headers. Repeated fields are joined with ", ".
+            /// @return false if the status line or a header line is malformed.
             bool parseHeaders(const std::string& headerData, HttpClientResponse& response)
             {
                 const char* ptr = headerData.c_str();
@@ -1247,6 +1400,8 @@ namespace http
                 return true;
             }
 
+            /// @brief Read exactly `contentLength` body bytes (bytes beyond it are ignored).
+            /// @return false if the connection ends early or the size limit is exceeded.
             bool receiveFixedBody(Socket& socket, std::string& bodyBuffer, size_t contentLength, HttpClientResponse& response)
             {
                 if (bodyBuffer.size() > contentLength)
@@ -1279,8 +1434,9 @@ namespace http
                 return complete(response);
             }
 
-            /// Read one line (terminated by LF, optional preceding CR) from buffer+socket.
+            /// @brief Read one line (terminated by LF, optional preceding CR) from buffer+socket.
             /// On success the line (without terminator) is removed from the buffer.
+            /// @return false on EOF/error or a line longer than kMaxChunkLineBytes.
             static bool readLine(Socket& socket, std::string& buffer, std::string& line)
             {
                 size_t lineEnd = buffer.find('\n');
@@ -1313,6 +1469,10 @@ namespace http
                 return true;
             }
 
+            /// @brief Decode a chunked body, delivering each chunk via deliverBody(); chunk
+            /// extensions and trailers are ignored.
+            /// @return false on malformed framing, an oversized chunk or early EOF before
+            ///         the last chunk.
             bool receiveChunkedBody(Socket& socket, std::string& buffer, HttpClientResponse& response)
             {
                 // Chunked encoding: <size in hex>[;ext]\r\n<data>\r\n ... 0\r\n[trailers]\r\n
