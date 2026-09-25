@@ -75,16 +75,10 @@ fi
 echo "Found SocketsHpp port at: $SOCKETSHPP_PORT"
 echo ""
 
-# Step 3: Install SocketsHpp via vcpkg overlay
-echo "[3/5] Installing SocketsHpp via vcpkg..."
-echo "Command: vcpkg install socketshpp --overlay-ports=$OVERLAY_PORTS_DIR"
-
-if vcpkg install socketshpp --overlay-ports="$OVERLAY_PORTS_DIR"; then
-    echo "SocketsHpp installed successfully!"
-else
-    echo "ERROR: Failed to install SocketsHpp"
-    exit 1
-fi
+# Step 3: Dependencies are installed by vcpkg in manifest mode during the CMake
+# configure step (vcpkg.json declares the in-repo overlay port), so there is no
+# separate "vcpkg install" (vcpkg rejects package arguments in manifest mode).
+echo "[3/5] SocketsHpp will be installed from the overlay port during configure"
 echo ""
 
 # Step 4: Build the example
@@ -93,7 +87,7 @@ if [ $SKIP_BUILD -eq 1 ]; then
     echo ""
     echo "Setup complete! To build manually:"
     echo "  cd $EXAMPLE_DIR"
-    echo "  cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+    echo "  cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake -DVCPKG_OVERLAY_PORTS=$OVERLAY_PORTS_DIR"
     echo "  cmake --build build --config Release"
     exit 0
 fi
@@ -109,7 +103,8 @@ fi
 # Configure with CMake
 echo "Configuring CMake..."
 TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-if ! cmake -B "$BUILD_DIR" -S "$EXAMPLE_DIR" -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE"; then
+if ! cmake -B "$BUILD_DIR" -S "$EXAMPLE_DIR" -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
+        -DVCPKG_OVERLAY_PORTS="$OVERLAY_PORTS_DIR"; then
     echo "ERROR: CMake configuration failed"
     exit 1
 fi

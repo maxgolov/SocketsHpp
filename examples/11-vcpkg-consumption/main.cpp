@@ -50,7 +50,7 @@ int main()
                 "</ul>"
                 "<h3>vcpkg Integration Benefits:</h3>"
                 "<ul>"
-                "<li>Automatic dependency management (nlohmann-json, cpp-jwt, thread-pool)</li>"
+                "<li>Automatic dependency management (nlohmann-json, thread-pool; jwt-cpp optional)</li>"
                 "<li>Cross-platform builds (Windows, Linux, macOS)</li>"
                 "<li>Header-only library - no linking required</li>"
                 "<li>Easy version management</li>"
@@ -68,7 +68,7 @@ int main()
                 "\"server\":\"SocketsHpp\","
                 "\"version\":\"1.0.0\","
                 "\"installation\":\"vcpkg\","
-                "\"dependencies\":[\"nlohmann-json\",\"cpp-jwt\",\"bshoshany-thread-pool\"],"
+                "\"dependencies\":[\"nlohmann-json\",\"bshoshany-thread-pool\"],"
                 "\"features\":[\"HTTP/1.1\",\"SSE\",\"MCP\",\"Authentication\",\"Compression\"]"
                 "}"
             );

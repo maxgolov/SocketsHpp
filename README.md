@@ -65,15 +65,15 @@ which carries the include directories, C++17, threads and (on Windows) `ws2_32`.
 ### add_subdirectory
 
 ```cmake
-find_package(nlohmann_json CONFIG REQUIRED)   # or provide it with FetchContent
 add_subdirectory(external/SocketsHpp)
 
 add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp nlohmann_json::nlohmann_json)
+target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
 ```
 
-In a subproject build the target does not carry nlohmann/json by itself, so link
-`nlohmann_json::nlohmann_json` yourself when you use `sockets.hpp` or the MCP headers.
+The target carries nlohmann/json (needed by `sockets.hpp` and the MCP headers): an
+existing `nlohmann_json::nlohmann_json` target or package is used if present,
+otherwise the bundled `external/nlohmann-json` submodule.
 
 ### FetchContent
 
@@ -84,10 +84,10 @@ FetchContent_Declare(json
 FetchContent_Declare(SocketsHpp
     GIT_REPOSITORY https://github.com/maxgolov/SocketsHpp.git
     GIT_TAG main)   # pin a commit or tag in real projects
-FetchContent_MakeAvailable(json SocketsHpp)
+FetchContent_MakeAvailable(json SocketsHpp)   # json first, so SocketsHpp uses it
 
 add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp nlohmann_json::nlohmann_json)
+target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
 ```
 
 ### Install + find_package
@@ -284,9 +284,11 @@ Handlers are `int(const HttpRequest&, HttpResponse&)`. `HttpRequest` has `method
 `parse_query()` and `accepts()`. `HttpResponse` has `set_status()`, `set_header()`,
 `set_content(body, contentType)` and `send_chunk_stream()`.
 
-Handlers must not let exceptions escape: the server does not catch them, and an
-exception thrown on the reactor or a pool thread terminates the process. Note that
-`parse_query()` throws `std::invalid_argument` for malformed or oversized query strings.
+If a handler throws, the server answers 500 Internal Server Error and keeps running;
+if a stream callback throws, the stream is aborted (the connection closes without the
+end-of-stream marker). Catch exceptions yourself when you want a more specific status -
+for example `parse_query()` throws `std::invalid_argument` for malformed or oversized
+query strings, which is better answered with 400.
 
 **Listening address.** To bind a specific address (for example loopback only), or to
 use an ephemeral port, start from the default constructor:

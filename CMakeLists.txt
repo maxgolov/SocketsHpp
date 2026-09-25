@@ -75,7 +75,7 @@ if(NOT TARGET nlohmann_json::nlohmann_json)
         message(WARNING "nlohmann-json not found via vcpkg or submodule - MCP tests will be skipped")
     endif()
 else()
-    message(STATUS "Using nlohmann-json from vcpkg")
+    message(STATUS "Using nlohmann-json package (${nlohmann_json_DIR})")
     # The submodule path above adds a global include directory. Do the same for
     # the vcpkg imported target so that examples and tests which do not link
     # nlohmann_json::nlohmann_json explicitly still resolve <nlohmann/json.hpp>
@@ -115,6 +115,11 @@ if(BSHOSHANY_THREAD_POOL_INCLUDE_DIRS)
         $<BUILD_INTERFACE:${BSHOSHANY_THREAD_POOL_INCLUDE_DIRS}>)
 endif()
 target_link_libraries(SocketsHpp INTERFACE Threads::Threads)
+# nlohmann-json (needed by the MCP headers and <sockets.hpp>) for in-tree consumers;
+# the installed package config attaches it when found.
+if(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(SocketsHpp INTERFACE $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
+endif()
 if(WIN32)
     # MSVC also picks these up via #pragma comment(lib); MinGW needs them here.
     target_link_libraries(SocketsHpp INTERFACE ws2_32)
@@ -144,7 +149,8 @@ option(SOCKETSHPP_INSTALL "Generate install rules for SocketsHpp" ${_socketshpp_
 option(SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL "Install the bundled BS_thread_pool.hpp" ON)
 
 if(SOCKETSHPP_INSTALL)
-    install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
     if(SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/BS_thread_pool.hpp")
         install(FILES external/BS_thread_pool.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     endif()

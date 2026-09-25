@@ -257,6 +257,57 @@ namespace testing
         server.stop();
     }
 
+    // An exception escaping a handler or stream callback must never take the server
+    // down (it used to reach std::terminate on the reactor / pool thread).
+    TEST_P(HttpServerEndToEndTest, ThrowingHandlersDoNotKillTheServer)
+    {
+        const bool useThreadPool = GetParam();
+        HttpServer server("127.0.0.1", 0);
+        if (useThreadPool)
+            server.enableThreadPool(2);
+        server.route("/throws", [](const HttpRequest&, HttpResponse&) -> int {
+            throw std::runtime_error("boom");
+        });
+        server.route("/throws-int", [](const HttpRequest&, HttpResponse&) -> int {
+            throw 42;
+        });
+        server.route("/query", [](const HttpRequest& req, HttpResponse& res) {
+            res.set_content(std::to_string(req.parse_query().size()));  // throws on bad input
+            return 200;
+        });
+        server.route("/stream-fails", [](const HttpRequest&, HttpResponse& res) {
+            int n = 0;
+            res.send_chunk_stream([n]() mutable -> std::string {
+                if (++n == 2)
+                    throw std::runtime_error("stream broke");
+                return "first;";
+            });
+            return 200;
+        });
+        server.route("/ok", [](const HttpRequest&, HttpResponse& res) {
+            res.set_content("alive");
+            return 200;
+        });
+        server.start();
+        const std::string base = "http://127.0.0.1:" + std::to_string(server.getListeningPort());
+
+        SOCKETSHPP_NS::http::client::HttpClient client;
+        client.setReadTimeout(5000);
+        SOCKETSHPP_NS::http::client::HttpClientResponse res;
+        for (const char* path : {"/throws", "/throws-int", "/query?a=%zz"})
+        {
+            ASSERT_TRUE(client.get(base + path, res)) << path;
+            EXPECT_EQ(res.code, 500) << path;
+        }
+        // A stream that fails after its headers were sent is cut off (no terminator).
+        EXPECT_FALSE(client.get(base + "/stream-fails", res));
+
+        ASSERT_TRUE(client.get(base + "/ok", res));
+        EXPECT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "alive");
+        server.stop();
+    }
+
     INSTANTIATE_TEST_SUITE_P(Dispatch, HttpServerEndToEndTest, ::testing::Values(false, true),
                              [](const ::testing::TestParamInfo<bool>& info) {
                                  return info.param ? std::string("ThreadPool") : std::string("Reactor");

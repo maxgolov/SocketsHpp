@@ -12,6 +12,8 @@
 
 #include <sockets.hpp>
 #include <iostream>
+#include <map>
+#include <string>
 
 using namespace SOCKETSHPP_NS::http::server;
 
@@ -64,7 +66,15 @@ int main()
 
         // Echo endpoint with query parameters
         server.route("/echo", [](const HttpRequest& req, HttpResponse& res) -> int {
-            auto params = req.parse_query();
+            std::map<std::string, std::string> params;
+            try {
+                params = req.parse_query();
+            } catch (const std::exception& e) {
+                // Malformed query (e.g. a bad %-escape): reject the request
+                res.set_status(400);
+                res.set_content(std::string("Bad query string: ") + e.what());
+                return 0;
+            }
             std::string msg = "No message provided";
             
             auto it = params.find("msg");
@@ -81,8 +91,8 @@ int main()
         server.route("/api/data", [](const HttpRequest& req, HttpResponse& res) -> int {
             if (req.method == "POST") {
                 std::string body = req.content;
-                res.set_header("Content-Type", "application/json");
-                res.set_content(R"({"received": )" + std::to_string(body.length()) + R"( bytes", "status": "ok"})");
+                res.set_content(R"({"receivedBytes": )" + std::to_string(body.length()) + R"(, "status": "ok"})",
+                                "application/json");
             } else {
                 res.set_status(405); // Method Not Allowed
                 res.set_content("Only POST allowed");
@@ -93,7 +103,7 @@ int main()
         std::cout << "Server running! Press Ctrl+C to stop" << std::endl;
         std::cout << "Visit http://localhost:8080 in your browser" << std::endl;
 
-        // Start server (blocks until stopped)
+        // Start server (non-blocking: requests are served on a background thread)
         server.start();
         
         // Keep server running

@@ -92,19 +92,11 @@ if [ ! -d "$GTEST_ARM64_DIR/lib" ]; then
 fi
 
 # Create ARM64 build directory
-cd /mnt/c/build/maxgolov/SocketsHpp
+cd "$(dirname "${BASH_SOURCE[0]}")/.."  # repository root
 echo "Creating ARM64 build directory..."
 rm -rf build/linux-arm64
-mkdir -p build/linux-arm64/external/include
-
-# Copy BS thread pool header (header-only library from Windows vcpkg)
-echo "Copying BS thread pool header..."
-if [ -f build/windows-x64/vcpkg_installed/x64-windows/include/BS_thread_pool.hpp ]; then
-    cp build/windows-x64/vcpkg_installed/x64-windows/include/BS_thread_pool.hpp build/linux-arm64/external/include/
-    echo "BS thread pool header copied successfully"
-else
-    echo "Warning: BS thread pool header not found in Windows build, attempting to continue..."
-fi
+mkdir -p build/linux-arm64
+# BS_thread_pool.hpp is bundled in external/ and found by the top-level CMakeLists.txt.
 
 # Configure for ARM64
 echo "Configuring CMake for ARM64..."

@@ -1701,7 +1701,8 @@ namespace mcp
                         response = JsonRpcResponse::success(id, {
                             {"protocolVersion", negotiated},
                             {"capabilities",    json::object()},
-                            {"serverInfo",      server_info()}
+                            {"serverInfo",      {{"name", server_info()["name"]},
+                                                 {"version", server_info()["version"]}}}
                         });
                     }
                     init->succeeded = true;

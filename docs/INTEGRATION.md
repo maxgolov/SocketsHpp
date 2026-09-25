@@ -36,11 +36,10 @@ git submodule update --init --recursive   # also fetches SocketsHpp's own submod
 cmake_minimum_required(VERSION 3.14)
 project(myapp CXX)
 
-find_package(nlohmann_json CONFIG REQUIRED)   # from your package manager or FetchContent
 add_subdirectory(external/SocketsHpp)
 
 add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp nlohmann_json::nlohmann_json)
+target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
 ```
 
 Notes:
@@ -48,13 +47,10 @@ Notes:
 - Tests and examples are off by default (`SOCKETSHPP_BUILD_TESTS`, `BUILD_EXAMPLES`), so
   GoogleTest is not required. Install rules are off in subproject builds
   (`SOCKETSHPP_INSTALL` defaults to `ON` only for top-level builds).
-- If `nlohmann_json::nlohmann_json` already exists when SocketsHpp is added, SocketsHpp
-  uses it. Otherwise it falls back to its `external/nlohmann-json` submodule, but only
-  for its own directory: in a subproject build, link `nlohmann_json::nlohmann_json`
-  from your own project as shown above.
-- If you only use headers that do not need JSON (for example
-  `SocketsHpp/http/server/http_server.h` or `SocketsHpp/net/tcp/tcp.h`, but not
-  `sockets.hpp`), you can drop the nlohmann/json lines.
+- `SocketsHpp::SocketsHpp` carries nlohmann/json (needed by `sockets.hpp` and the MCP
+  headers): an existing `nlohmann_json::nlohmann_json` target or package is used if
+  present when SocketsHpp is added, otherwise the bundled `external/nlohmann-json`
+  submodule.
 
 ## FetchContent
 
@@ -71,7 +67,7 @@ FetchContent_Declare(SocketsHpp
 FetchContent_MakeAvailable(json SocketsHpp)
 
 add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp nlohmann_json::nlohmann_json)
+target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
 ```
 
 Declare nlohmann/json first so SocketsHpp picks up the same target.

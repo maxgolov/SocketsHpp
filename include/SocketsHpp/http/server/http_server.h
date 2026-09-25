@@ -918,6 +918,8 @@ namespace http
         /// response: the request still counts as handled if the handler called
         /// set_status() or set a body / stream (status then defaults to 200). Returning
         /// 0 without touching the response declines, and the next matching route runs.
+        /// An exception escaping the handler is caught: the response is replaced by a
+        /// plain 500 Internal Server Error and the server keeps running.
         using CallbackFunction = std::function<int(HttpRequest const& request, HttpResponse& response)>;
 
         /// @brief Polymorphic request handler: wraps a CallbackFunction, or override
@@ -2242,7 +2244,8 @@ namespace http
                                 m_threadPool->detach_task([this, sock, token, streamCb, onEndCb, kaAllowed]() mutable
                                 {
                                     // *** Run outside the mutex — may block for up to writeDeadlineSeconds ***
-                                    std::string chunkData = streamCb();
+                                    bool failed = false;
+                                    std::string chunkData = invokeStreamCallback(streamCb, failed);
 
                                     // Re-acquire mutex to update the connection state
                                     std::lock_guard<std::mutex> lock(m_connectionsMutex);
@@ -2251,6 +2254,14 @@ namespace http
                                     Connection& ac = it->second;
                                     if (ac.state != Connection::ProcessingAsync || ac.asyncToken != token)
                                         return;  // closed (fd possibly reused) or state changed
+                                    if (failed)
+                                    {
+                                        // Headers are already out: abort the stream by closing
+                                        // without a terminator, so the client sees it truncated.
+                                        ac.closeRequested = true;
+                                        handleConnectionClosed(ac);  // erases ac - last use
+                                        return;
+                                    }
 
                                     if (chunkData.empty())
                                     {
@@ -2279,7 +2290,14 @@ namespace http
                             }
 
                             // --- Synchronous path (no thread pool) — may block reactor ---
-                            std::string chunkData = conn.response.streamCallback();
+                            bool failed = false;
+                            std::string chunkData = invokeStreamCallback(conn.response.streamCallback, failed);
+                            if (failed)
+                            {
+                                // Abort: close without a terminator (see the pool path).
+                                conn.closeRequested = true;
+                                return;  // handleConnection() closes the connection
+                            }
 
                             if (chunkData.empty())
                             {
@@ -2631,6 +2649,41 @@ namespace http
                 return (code >= 100 && code < 200) || code == 204 || code == 304;
             }
 
+            /// @brief Replace a response with a plain 500 after a handler threw.
+            /// @param res Response to reset
+            static void setInternalError(HttpResponse& res)
+            {
+                res.headers.clear();
+                res.streaming = false;
+                res.streamCallback = nullptr;
+                res.onStreamEnd = nullptr;
+                res.set_status(500);
+                res.set_content("Internal Server Error");
+            }
+
+            /// @brief Call a stream callback, turning an exception into a failure flag
+            ///        (an exception must never escape onto the reactor or a pool thread).
+            /// @param callback Stream callback
+            /// @param failed Set to true if the callback threw
+            /// @return The chunk, or "" on failure
+            static std::string invokeStreamCallback(const std::function<std::string()>& callback, bool& failed)
+            {
+                try
+                {
+                    return callback();
+                }
+                catch (const std::exception& e)
+                {
+                    LOG_ERROR("HttpServer: stream callback threw: %s - aborting the stream", e.what());
+                }
+                catch (...)
+                {
+                    LOG_ERROR("HttpServer: stream callback threw - aborting the stream");
+                }
+                failed = true;
+                return std::string();
+            }
+
             /// @brief Wire format of one streamed chunk: chunked framing, or raw data for
             ///        HTTP/1.0 (see Connection::chunkedStream).
             /// @param conn Connection being streamed to
@@ -2789,7 +2842,25 @@ namespace http
                     {
                         LOG_TRACE("HttpServer: [%s] using handler for %s", conn.request.client.c_str(),
                             handler->first.c_str());
-                        int result = handler->second->onHttpRequest(conn.request, conn.response);
+                        int result = 0;
+                        try
+                        {
+                            result = handler->second->onHttpRequest(conn.request, conn.response);
+                        }
+                        catch (const std::exception& e)
+                        {
+                            LOG_ERROR("HttpServer: [%s] handler for %s threw: %s", conn.request.client.c_str(),
+                                handler->first.c_str(), e.what());
+                            setInternalError(conn.response);
+                            result = 500;
+                        }
+                        catch (...)
+                        {
+                            LOG_ERROR("HttpServer: [%s] handler for %s threw", conn.request.client.c_str(),
+                                handler->first.c_str());
+                            setInternalError(conn.response);
+                            result = 500;
+                        }
                         if (result != 0)
                         {
                             conn.response.code = result;
