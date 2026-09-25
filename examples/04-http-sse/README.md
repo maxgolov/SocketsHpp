@@ -1,76 +1,71 @@
 # HTTP Server-Sent Events (SSE) Example
 
-Demonstrates real-time event streaming using Server-Sent Events.
+Real-time event streaming with Server-Sent Events, plus a small browser client.
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake --build build --target http-sse
 ```
 
 ## Running
 
 ```bash
-./http-sse
+./build/examples/04-http-sse/http-sse
 ```
 
-Then open http://localhost:8080 in a browser.
-
-## Testing with curl
+Then open http://localhost:8080 in a browser (the page subscribes to `/events` with
+`EventSource`), or use curl:
 
 ```bash
-# Stream events (use -N to disable buffering)
-curl -N http://localhost:8080/events
-
-# Stream JSON events
-curl -N http://localhost:8080/json-events
+curl -N http://localhost:8080/events        # 10 events, 1 s apart, then "done"
+curl -N http://localhost:8080/json-events   # 5 JSON events, 0.5 s apart
 ```
+
+## Routes
+
+| Route | Response |
+|-------|----------|
+| `/events` | `text/event-stream`: events `#1`-`#10` (ids `1`-`10`) one second apart, an extra `custom` event after every third one, then a `done` event, then the stream ends |
+| `/json-events` | `text/event-stream`: five `json-update` events carrying JSON data |
+| `/` (and any other path) | The HTML/JavaScript demo page |
 
 ## What it demonstrates
 
-- Server-Sent Events (SSE) with `text/event-stream`
-- `SSEEvent` helper class for formatting events
-- Event fields: `data`, `event`, `id`
-- Streaming with `res.send_chunk_stream(callback)`: the callback is called repeatedly,
-  each returned chunk is sent immediately, and returning `""` ends the stream
-  (`res.send_chunk()` only appends to a buffered response - it does not stream)
-- `server.enableThreadPool()` so stream callbacks that wait between events don't block
-  other clients
-- Custom event types
-- JSON data in SSE events
-- HTML/JavaScript SSE client
-
-## SSE Format
-
-Each event is formatted as:
-
-```
-id: 1
-event: custom
-data: Event message here
-<blank line>
-```
+- Streaming with `res.send_chunk_stream(callback, onEnd)`: the server calls the
+  callback repeatedly, sends each returned chunk immediately (chunked transfer
+  encoding), and ends the stream when it returns `""`. (`res.send_chunk()` only appends
+  to a buffered response; it does not stream.)
+- `server.enableThreadPool(4)`: the callbacks sleep between events, and on the worker
+  pool that does not block other clients
+- `SSEEvent::message()`, `SSEEvent::custom()` and setting `event`/`data`/`id` directly,
+  then `format()`
+- Headers the server adds for `text/event-stream`: `Cache-Control: no-cache` and
+  `X-Accel-Buffering: no`
+- A browser `EventSource` client handling default and custom event types
 
 ## Expected output (curl)
 
 ```
 id: 1
-data: Event #1 at 1704110400
+data: Event #1 at 1790323626
 
 id: 2
-data: Event #2 at 1704110401
+data: Event #2 at 1790323627
 
 id: 3
-data: Event #3 at 1704110402
+data: Event #3 at 1790323628
 
 id: 3-custom
 event: custom
 data: This is a custom event type!
+
+id: 4
+data: Event #4 at 1790323629
 ...
 ```
 
-## Browser output
-
-The HTML page will display messages as they arrive in real-time, with custom events shown in blue.
+In the browser, messages appear as they arrive; custom events are shown in blue.

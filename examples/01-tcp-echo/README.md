@@ -1,39 +1,39 @@
-# TCP Echo Client Example
+# TCP Client Example
 
-A simple TCP client that connects to a server and sends 1MB of data.
+Despite the directory name, this is a TCP **client**: it connects to
+`127.0.0.1:40000`, sends 1 MB of patterned data and closes the connection.
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake --build build --target tcp-echo
 ```
 
 ## Running
 
-First, start a TCP server to receive data:
+Start something that listens on port 40000 first:
 
 ```bash
-# Using netcat
-nc -l -p 40000 > received.bin
-
-# Or on Windows
-ncat -l -p 40000 > received.bin
+nc -l 40000 > received.bin        # netcat (BSD/macOS syntax; GNU netcat: nc -l -p 40000)
+ncat -l 40000 > received.bin      # Windows (nmap's ncat)
 ```
 
-Then run the example:
+Then run the client:
 
 ```bash
-./tcp-echo
+./build/examples/01-tcp-echo/tcp-echo
 ```
 
 ## What it demonstrates
 
-- Creating a TCP socket with `SocketParams`
-- Connecting to a server with `SocketAddr`
-- Sending data with `Socket::send()`
-- Proper socket cleanup with `Socket::close()`
+- Creating a TCP socket from `SocketParams{AF_INET, SOCK_STREAM, 0}`
+- Connecting with `Socket::connect(SocketAddr{"127.0.0.1:40000"})`
+- Sending with `Socket::send()` (a single call; it reports how many bytes the kernel
+  accepted)
+- Closing with `Socket::close()`
 
 ## Expected output
 
@@ -44,3 +44,6 @@ Sending 1048576 bytes...
 Successfully sent 1048576 bytes
 Connection closed
 ```
+
+The byte count on the "Successfully sent" line can be lower than 1048576 if the
+kernel accepts only part of the buffer in one `send()`.

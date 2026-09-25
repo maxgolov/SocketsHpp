@@ -9,7 +9,7 @@ Header-only RFC 4648 compliant base64 encoding and decoding implementation.
 - **Zero dependencies** - Uses only C++ standard library
 - **Exception safety** - Throws `std::invalid_argument` for malformed input (decoding is strict: padded standard alphabet only, length a multiple of 4, `=` only as the final 1-2 characters, canonical trailing bits, no whitespace; `is_valid()` applies the same rules)
 - **Multiple interfaces** - Class-based and namespace-based APIs
-- **Full test coverage** - 21 comprehensive unit tests
+- **Tested** - covered by `base64_test` (see [test/README.md](../../../test/README.md))
 
 ## Usage
 
@@ -118,17 +118,16 @@ std::string auth_header = "Authorization: Basic " + encoded;
 ### Data URLs
 
 ```cpp
-unsigned char image_data[] = { /* ... */ };
-std::string encoded = Base64::encode(image_data, sizeof(image_data));
+std::vector<unsigned char> image_data = loadPng();  // your bytes
+std::string encoded = Base64::encode(image_data.data(), image_data.size());
 std::string data_url = "data:image/png;base64," + encoded;
 ```
 
-### WebSocket Protocol
+### Binary digests
 
 ```cpp
-std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
-// ... perform SHA-1 hash ...
-std::string accept = Base64::encode(hash_result, 20);
+unsigned char sha1[20] = {};  // e.g. a SHA-1 digest computed elsewhere
+std::string encoded = Base64::encode(sha1, sizeof(sha1));
 ```
 
 ## Performance
@@ -140,7 +139,7 @@ std::string accept = Base64::encode(hash_result, 20);
 
 ## Test Coverage
 
-The implementation includes 21 comprehensive tests covering:
+`test/unit/base64_test.cc` covers:
 
 - RFC 4648 test vectors
 - Binary data encoding/decoding
@@ -151,7 +150,7 @@ The implementation includes 21 comprehensive tests covering:
 - Invalid input handling
 - Large data sets
 
-All tests pass on Windows (MSVC), Linux (GCC), and ARM64 platforms.
+The tests run in CI on Linux (GCC, Clang), macOS, Windows (MSVC) and MinGW-w64.
 
 ## License
 

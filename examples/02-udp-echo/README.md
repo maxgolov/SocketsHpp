@@ -1,48 +1,48 @@
-# UDP Echo Client Example
+# UDP Client Example
 
-A simple UDP client that sends a datagram to a server.
+Despite the directory name, this is a UDP **client**: it sends one datagram,
+`Hello from SocketsHpp UDP client!`, to `127.0.0.1:40000`.
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake --build build --target udp-echo
 ```
 
 ## Running
 
-First, start a UDP server:
+Start a UDP listener first:
 
 ```bash
-# Using netcat
-nc -u -l -p 40000
-
-# Or on Windows
-ncat -u -l -p 40000
+nc -u -l 40000        # netcat (BSD/macOS syntax; GNU netcat: nc -u -l -p 40000)
+ncat -u -l 40000      # Windows (nmap's ncat)
 ```
 
-Then run the example:
+Then run the client:
 
 ```bash
-./udp-echo
+./build/examples/02-udp-echo/udp-echo
 ```
 
 ## What it demonstrates
 
-- Creating a UDP socket with `SOCK_DGRAM`
-- Using `SocketAddr` for addressing
-- Sending datagrams with `Socket::send()`
-- UDP is connectionless but `connect()` sets default destination
+- Creating a UDP socket from `SocketParams{AF_INET, SOCK_DGRAM, 0}`
+- Addressing with `SocketAddr("127.0.0.1:40000")` and `SocketAddr::toString()`
+- `connect()` on a UDP socket only sets the default destination for `send()`
+- Sending the datagram with `Socket::send()`
 
 ## Expected output
 
 ```
 Sending to 127.0.0.1:40000
-Sent 35 bytes: Hello from SocketsHpp UDP client!
+Sent 33 bytes: Hello from SocketsHpp UDP client!
 ```
 
-The server should receive:
+The listener prints:
+
 ```
 Hello from SocketsHpp UDP client!
 ```

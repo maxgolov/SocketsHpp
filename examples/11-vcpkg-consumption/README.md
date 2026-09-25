@@ -1,186 +1,106 @@
-# Example 11: vcpkg Consumption
+# Example 11: Consuming SocketsHpp with vcpkg
 
-This example demonstrates how to consume SocketsHpp in your own project using vcpkg.
+A stand-alone project that gets SocketsHpp from vcpkg, using the overlay port in
+[`ports/socketshpp`](../../ports/socketshpp/README.md), and uses it through
+`find_package(SocketsHpp CONFIG REQUIRED)` and the `SocketsHpp::SocketsHpp` target.
+
+`main.cpp` is a small HTTP server on port 9000 with these routes:
+
+| Route | Response |
+|-------|----------|
+| `/` (and any unknown path) | HTML page listing the endpoints |
+| `/info` | Server information as JSON |
+| `/echo?msg=...` | Echoes the `msg` query parameter |
+| `/json` | A sample JSON document |
+
+This example is not part of the top-level `BUILD_EXAMPLES` build; build it on its own.
 
 ## Prerequisites
 
-- CMake 3.15 or higher
-- C++17 compatible compiler (MSVC, GCC, Clang)
-- vcpkg installed and configured
+- CMake 3.15+ and a C++17 compiler
+- vcpkg, with `VCPKG_ROOT` pointing at it
 
-## Quick Start
+## Build and run
 
-### Option 1: Using vcpkg Overlay (Recommended for development)
+The project uses vcpkg **manifest mode** (`vcpkg.json` lists `socketshpp`). SocketsHpp
+is not in the official registry, so tell vcpkg where the port is with
+`VCPKG_OVERLAY_PORTS`:
 
-This allows you to use SocketsHpp directly from this repository without waiting for official vcpkg integration.
-
-#### Windows (PowerShell)
+```bash
+cd examples/11-vcpkg-consumption
+cmake -S . -B build \
+  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+  -DVCPKG_OVERLAY_PORTS="$PWD/../../ports"
+cmake --build build --config Release
+./build/vcpkg-consumer            # Windows: .\build\Release\vcpkg-consumer.exe
+```
 
 ```powershell
-# Clone this repository (if not already done)
-git clone https://github.com/maxgolov/SocketsHpp
-cd SocketsHpp/examples/11-vcpkg-consumption
-
-# Install SocketsHpp with overlay ports
-vcpkg install socketshpp --overlay-ports=../../ports
-
-# Configure and build
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+cd examples\11-vcpkg-consumption
+cmake -S . -B build `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  -DVCPKG_OVERLAY_PORTS="$PWD/../../ports"
 cmake --build build --config Release
-
-# Run the example
 .\build\Release\vcpkg-consumer.exe
 ```
 
-#### Linux / macOS (Bash)
+During configuration vcpkg builds the `socketshpp` port and its dependencies
+(`nlohmann-json`, `bshoshany-thread-pool`). The port downloads the SocketsHpp sources
+from GitHub at the revision pinned in `ports/socketshpp/portfile.cmake`, not from your
+local checkout.
+
+Then try:
 
 ```bash
-# Clone this repository (if not already done)
-git clone https://github.com/maxgolov/SocketsHpp
-cd SocketsHpp/examples/11-vcpkg-consumption
-
-# Install SocketsHpp with overlay ports
-vcpkg install socketshpp --overlay-ports=../../ports
-
-# Configure and build
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-cmake --build build --config Release
-
-# Run the example
-./build/vcpkg-consumer
+curl http://localhost:9000/
+curl http://localhost:9000/info
+curl "http://localhost:9000/echo?msg=HelloVcpkg"
+curl http://localhost:9000/json
 ```
 
-### Option 2: Using vcpkg from Git URL
+## Using it in your own project
 
-You can also install SocketsHpp directly from the GitHub repository using vcpkg's Git support:
+1. Make the port available: reference `SocketsHpp/ports` from `VCPKG_OVERLAY_PORTS`
+   (as above) or from `"overlay-ports"` in a `vcpkg-configuration.json`, or copy the
+   `ports/socketshpp` directory into your own overlay directory.
+2. Add `"socketshpp"` (or `{ "name": "socketshpp", "features": ["jwt"] }` for JWT
+   support in the MCP server) to the `dependencies` in your `vcpkg.json`.
+3. In `CMakeLists.txt`:
 
-#### Create a vcpkg-configuration.json in your project:
-
-```json
-{
-  "default-registry": {
-    "kind": "git",
-    "baseline": "latest",
-    "repository": "https://github.com/microsoft/vcpkg"
-  },
-  "registries": [
-    {
-      "kind": "git",
-      "repository": "https://github.com/maxgolov/SocketsHpp",
-      "baseline": "main",
-      "packages": ["socketshpp"]
-    }
-  ]
-}
-```
-
-Then install:
-
-```bash
-vcpkg install socketshpp
-```
-
-### Option 3: Using vcpkg Manifest Mode (Modern Approach)
-
-The example includes a `vcpkg.json` manifest file. Simply configure with the vcpkg toolchain:
-
-```bash
-# vcpkg will automatically install dependencies
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-cmake --build build
-```
-
-## What This Example Demonstrates
-
-1. **Minimal vcpkg integration**: Shows the smallest possible setup
-2. **Automatic dependency management**: vcpkg handles nlohmann-json and bshoshany-thread-pool (plus jwt-cpp with the optional `jwt` feature)
-3. **CMake configuration**: Proper `find_package()` usage
-4. **Header-only consumption**: No linking required, just include headers
-
-## Project Structure
-
-```
-11-vcpkg-consumption/
-├── CMakeLists.txt          # CMake configuration with find_package
-├── vcpkg.json              # vcpkg manifest (automatic dependency install)
-├── main.cpp                # Simple HTTP server using SocketsHpp
-├── setup-windows.ps1       # Windows setup script
-├── setup-linux.sh          # Linux/macOS setup script
-└── README.md               # This file
-```
-
-## Troubleshooting
-
-### vcpkg not found
-
-Set the `VCPKG_ROOT` environment variable:
-
-**Windows:**
-```powershell
-$env:VCPKG_ROOT = "C:\path\to\vcpkg"
-```
-
-**Linux/macOS:**
-```bash
-export VCPKG_ROOT=/path/to/vcpkg
-```
-
-### Overlay ports not working
-
-Make sure the overlay path is correct relative to your current directory:
-```bash
-vcpkg install socketshpp --overlay-ports=../../ports
-```
-
-### Dependencies not found
-
-Ensure vcpkg is bootstrapped:
-```bash
-# Windows
-.\vcpkg\bootstrap-vcpkg.bat
-
-# Linux/macOS
-./vcpkg/bootstrap-vcpkg.sh
-```
-
-## Integration into Your Own Project
-
-To use SocketsHpp in your own project:
-
-1. **Copy the port overlay** (for development):
-   ```bash
-   cp -r /path/to/SocketsHpp/ports /path/to/your-project/
-   ```
-
-2. **Create vcpkg.json** in your project root:
-   ```json
-   {
-     "name": "your-project",
-     "version": "1.0.0",
-     "dependencies": ["socketshpp"]
-   }
-   ```
-
-3. **Update CMakeLists.txt**:
    ```cmake
    find_package(SocketsHpp CONFIG REQUIRED)
    target_link_libraries(your-target PRIVATE SocketsHpp::SocketsHpp)
    ```
 
-4. **Build with vcpkg toolchain**:
-   ```bash
-   cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake --overlay-ports=./ports
-   ```
+   The target already carries threads, `ws2_32` on Windows and nlohmann/json, so the
+   extra `ws2_32` / `pthread` lines in this example's `CMakeLists.txt` are optional.
 
-## Notes
+## Files
 
-- SocketsHpp is **header-only**, so no runtime libraries are required
-- All dependencies are automatically handled by vcpkg
-- The overlay port allows using the latest development version
-- For production, wait for official vcpkg registry integration
+```
+11-vcpkg-consumption/
+├── CMakeLists.txt     # find_package(SocketsHpp) + one executable
+├── vcpkg.json         # manifest: depends on socketshpp
+├── main.cpp           # HTTP server on port 9000
+├── setup-linux.sh     # helper scripts (see note below)
+├── setup-windows.ps1
+└── README.md
+```
 
-## See Also
+Note: the setup scripts run `vcpkg install socketshpp --overlay-ports=...` and then
+configure without an overlay. Inside this directory vcpkg runs in manifest mode, where
+`vcpkg install` does not accept package names, so prefer the CMake commands above.
 
-- [vcpkg Documentation](https://vcpkg.io/)
-- [SocketsHpp GitHub](https://github.com/maxgolov/SocketsHpp)
-- [vcpkg Manifest Mode](https://learn.microsoft.com/en-us/vcpkg/users/manifests)
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `socketshpp` not found / "no port named socketshpp" | Pass `-DVCPKG_OVERLAY_PORTS=<path to SocketsHpp>/ports` (an absolute path is safest). |
+| `Could not find a package configuration file provided by "SocketsHpp"` | Configure with `-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake`; delete `build/` if it was first configured without it. |
+| vcpkg not found | Clone and bootstrap vcpkg (`bootstrap-vcpkg.sh` / `bootstrap-vcpkg.bat`) and set `VCPKG_ROOT`. |
+
+## See also
+
+- [ports/socketshpp/README.md](../../ports/socketshpp/README.md)
+- [docs/INTEGRATION.md](../../docs/INTEGRATION.md#vcpkg-overlay-port)
+- [vcpkg manifest mode](https://learn.microsoft.com/vcpkg/concepts/manifest-mode)
