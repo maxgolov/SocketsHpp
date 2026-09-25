@@ -196,3 +196,36 @@ jobs:
       # malformed (WARN_AS_ERROR = FAIL_ON_WARNINGS in docs/Doxyfile).
       - name: Check API documentation
         run: doxygen docs/Doxyfile
+
+  typescript-interop:
+    name: ubuntu-latest / MCP interop with the TypeScript SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: examples/10-typescript-interop/ts/package-lock.json
+
+      - name: Build the C++ interop programs
+        run: |
+          cmake -S . -B build -DBUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target cpp_server cpp_client --parallel
+
+      - name: Type-check the TypeScript programs
+        working-directory: examples/10-typescript-interop/ts
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+
+      - name: Audit the TypeScript dependencies
+        working-directory: examples/10-typescript-interop/ts
+        run: npm audit --audit-level=low
+
+      # TypeScript SDK client -> C++ MCPServer, then C++ MCPClient -> TypeScript SDK server.
+      - name: Run interop in both directions
+        run: examples/10-typescript-interop/run-interop.sh build/examples/10-typescript-interop
