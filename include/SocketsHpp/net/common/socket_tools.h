@@ -7,11 +7,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,6 +87,7 @@
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <sys/un.h>
 
@@ -121,6 +125,12 @@ namespace net
             /// </summary>
             void startThread(bool wait = true)
             {
+                if (m_thread.joinable())
+                {
+                    // Already started: assigning over a joinable std::thread
+                    // would call std::terminate.
+                    return;
+                }
                 m_terminate = false;
                 m_thread = std::thread([&]() { this->onThread(); });
                 if (wait)
@@ -148,7 +158,16 @@ namespace net
                 m_terminate = true;
                 if (m_thread.joinable())
                 {
-                    m_thread.join();
+                    if (m_thread.get_id() == std::this_thread::get_id())
+                    {
+                        // Called from the worker itself (e.g. stop() from a callback):
+                        // joining would deadlock, so let the thread finish on its own.
+                        m_thread.detach();
+                    }
+                    else
+                    {
+                        m_thread.join();
+                    }
                 }
             }
 
@@ -164,10 +183,11 @@ namespace net
             virtual void onThread() = 0;
 
             /// <summary>
-            /// Thread destructor
+            /// Thread destructor. Derived classes should call joinThread() in their
+            /// own destructor (before their members are destroyed); this is a last
+            /// resort so that destroying a running thread never calls std::terminate.
             /// </summary>
-            /// <returns></returns>
-            virtual ~Thread() noexcept {}
+            virtual ~Thread() noexcept { joinThread(); }
         };
 
     };  // namespace common
@@ -233,173 +253,202 @@ namespace net
 #endif
             }
 
-            SocketAddr(u_long addr, int port)
+            SocketAddr(u_long addr, int port) : SocketAddr()
             {
                 isUnixDomain = false;
-                sockaddr_in& inet4 = reinterpret_cast<sockaddr_in&>(m_data);
-                inet4.sin_family = AF_INET;
-                inet4.sin_port = htons(static_cast<unsigned short>(port));
-                inet4.sin_addr.s_addr = htonl(addr);
+                m_data_in.sin_family = AF_INET;
+                m_data_in.sin_port = htons(static_cast<unsigned short>(port));
+                m_data_in.sin_addr.s_addr = htonl(addr);
             }
 
+            /// <summary>
+            /// Construct from a host (IPv4 literal, IPv6 literal with or without
+            /// square brackets, or hostname) and a numeric port. An optional
+            /// "scheme://" prefix is ignored.
+            /// </summary>
             SocketAddr(const char* addr, int port) : SocketAddr()
             {
-                isUnixDomain = false;
-                std::string ipAddress = addr;
-                auto found = ipAddress.find("://");
-                if (found != std::string::npos)
+                if (addr == nullptr)
                 {
-                    // always strip scheme
-                    ipAddress.erase(0, found + 3);
+                    throw std::invalid_argument("SocketAddr: null address");
                 }
-
-                // Convert IPv4 or IPv6 address to binary form
-                size_t numColons = std::count(ipAddress.begin(), ipAddress.end(), ':');
-
-                if (numColons > 1)
+                std::string host = stripScheme(addr, nullptr);
+                size_t len = host.length();
+                if ((len >= 2) && (host[0] == '[') && (host[len - 1] == ']'))
                 {
-                    // IPv6 address
-                    sockaddr_in6& inet6 = m_data_in6;
-                    inet6.sin6_family = AF_INET6;
-                    inet6.sin6_port = htons(port);
-                    void* pAddrBuf = &inet6.sin6_addr;
-                    size_t len = ipAddress.length();
-                    if ((ipAddress[0] == '[') && (ipAddress[len - 1] == ']'))
-                    {
-                        // Remove square brackets
-                        ipAddress = ipAddress.substr(1, ipAddress.length() - 2);
-                    }
-                    if (::inet_pton(inet6.sin6_family, ipAddress.c_str(), pAddrBuf) != 1)
-                    {
-                        LOG_ERROR("Invalid IPv6 address: %s", addr);
-                        throw std::invalid_argument("Invalid IPv6 address: " + std::string(addr));
-                    }
+                    setIPv6(host.substr(1, len - 2), port, addr);
+                }
+                else if (std::count(host.begin(), host.end(), ':') > 1)
+                {
+                    setIPv6(host, port, addr);
                 }
                 else
                 {
-                    // IPv4 address or hostname
-                    sockaddr_in& inet = m_data_in;
-                    inet.sin_family = AF_INET;
-                    inet.sin_port = htons(port);
-                    void* pAddrBuf = &inet.sin_addr;
-
-                    // Try inet_pton first for IP addresses
-                    if (::inet_pton(inet.sin_family, ipAddress.c_str(), pAddrBuf) != 1)
-                    {
-                        // inet_pton failed, try getaddrinfo for hostname resolution
-                        struct addrinfo hints = {};
-                        struct addrinfo* result = nullptr;
-                        hints.ai_family = AF_INET;
-                        hints.ai_socktype = SOCK_STREAM;
-
-                        if (::getaddrinfo(ipAddress.c_str(), nullptr, &hints, &result) == 0 && result != nullptr)
-                        {
-                            sockaddr_in* resolved = reinterpret_cast<sockaddr_in*>(result->ai_addr);
-                            inet.sin_addr = resolved->sin_addr;
-                            ::freeaddrinfo(result);
-                        }
-                        else
-                        {
-                            LOG_ERROR("Invalid IPv4 address or hostname: %s", addr);
-                            throw std::invalid_argument("Invalid IPv4 address or hostname: " + std::string(addr));
-                        }
-                    }
+                    setIPv4(host, port, addr);
                 }
             }
 
+            /// <summary>
+            /// Parse "[scheme://]host[:port]" or a Unix domain socket path.
+            ///
+            /// Accepted forms (port defaults to 0 when omitted):
+            /// - IPv4 or hostname: "127.0.0.1", "127.0.0.1:8080", "localhost:80"
+            /// - IPv6: "[::1]:8080", "[::1]", or bare "::1" / "fe80::1" (no port)
+            /// - Unix domain (unixDomain == true, or "unix://" scheme): a filesystem path
+            ///
+            /// Throws std::invalid_argument on malformed addresses or ports.
+            /// </summary>
             SocketAddr(const char* addr, bool unixDomain = false) : SocketAddr()
             {
-                isUnixDomain = unixDomain;
-                std::string ipAddress = addr;
-                auto found = ipAddress.find("://");
-                if (found != std::string::npos)
+                if (addr == nullptr)
                 {
-                    // always strip scheme
-                    ipAddress.erase(0, found + 3);
+                    throw std::invalid_argument("SocketAddr: null address");
                 }
+                std::string scheme;
+                std::string ipAddress = stripScheme(addr, &scheme);
+                isUnixDomain = unixDomain || (scheme == "unix");
 
-#ifdef HAVE_UNIX_DOMAIN
                 if (isUnixDomain)
                 {
+#ifdef HAVE_UNIX_DOMAIN
                     m_data_un.sun_family = AF_UNIX;
-                    // Max length of Unix domain filename is up to 108 chars
-                    size_t pathLen = strlen(addr);
+                    // Max length of Unix domain filename is up to 108 chars (incl. terminator)
+                    size_t pathLen = ipAddress.length();
                     if (pathLen >= sizeof(m_data_un.sun_path))
                     {
                         throw std::invalid_argument("Unix socket path too long (max " +
                             std::to_string(sizeof(m_data_un.sun_path) - 1) + " chars): " + std::string(addr));
                     }
-                    // Use memcpy for safety and ensure null termination
-                    memset(m_data_un.sun_path, 0, sizeof(m_data_un.sun_path));
-                    memcpy(m_data_un.sun_path, addr, pathLen);
-                    m_data_un.sun_path[pathLen] = '\0';
+                    // sun_path is already zero-filled by the default constructor.
+                    memcpy(m_data_un.sun_path, ipAddress.data(), pathLen);
                     return;
-                }
+#else
+                    throw std::invalid_argument("Unix domain sockets are not supported: " + std::string(addr));
 #endif
-
-                // Convert {IPv4|IPv6}:{port} string to Network address and Port.
-                int port = 0;
-
-                // If numColons is more than 2, then it is IPv6 address
-                size_t numColons = std::count(ipAddress.begin(), ipAddress.end(), ':');
-                // Find last colon, which should indicate the port number
-                char const* lastColon = strrchr(addr, ':');
-                if (lastColon)
-                {
-                    port = atoi(lastColon + 1);
-                    // Erase port number
-                    ipAddress.erase(lastColon - addr);
                 }
-                // If there are more than two colons, it means the input is IPv6, e.g
-                // [fe80::c018:4a9b:3681:4e41]:3000
-                if (numColons > 1)
+
+                int port = 0;
+                if (!ipAddress.empty() && (ipAddress[0] == '['))
                 {
-                    sockaddr_in6& inet6 = m_data_in6;
-                    inet6.sin6_family = AF_INET6;
-                    inet6.sin6_port = htons(port);
-                    void* pAddrBuf = &inet6.sin6_addr;
-                    size_t len = ipAddress.length();
-                    if ((ipAddress[0] == '[') && (ipAddress[len - 1] == ']'))
+                    // Bracketed IPv6: "[addr]" or "[addr]:port"
+                    size_t close = ipAddress.find(']');
+                    if (close == std::string::npos)
                     {
-                        // Remove square brackets
-                        ipAddress = ipAddress.substr(1, ipAddress.length() - 2);
-                    }
-                    if (::inet_pton(inet6.sin6_family, ipAddress.c_str(), pAddrBuf) != 1)
-                    {
-                        LOG_ERROR("Invalid IPv6 address: %s", addr);
                         throw std::invalid_argument("Invalid IPv6 address: " + std::string(addr));
                     }
-                }
-                else
-                {
-                    sockaddr_in& inet = m_data_in;
-                    inet.sin_family = AF_INET;
-                    inet.sin_port = htons(port);
-                    void* pAddrBuf = &inet.sin_addr;
-
-                    // Try inet_pton first for IP addresses
-                    if (::inet_pton(inet.sin_family, ipAddress.c_str(), pAddrBuf) != 1)
+                    std::string rest = ipAddress.substr(close + 1);
+                    if (!rest.empty())
                     {
-                        // inet_pton failed, try getaddrinfo for hostname resolution
-                        struct addrinfo hints = {};
-                        struct addrinfo* result = nullptr;
-                        hints.ai_family = AF_INET;
-                        hints.ai_socktype = SOCK_STREAM;
-
-                        if (::getaddrinfo(ipAddress.c_str(), nullptr, &hints, &result) == 0 && result != nullptr)
+                        if (rest[0] != ':')
                         {
-                            sockaddr_in* resolved = reinterpret_cast<sockaddr_in*>(result->ai_addr);
-                            inet.sin_addr = resolved->sin_addr;
-                            ::freeaddrinfo(result);
+                            throw std::invalid_argument("Invalid IPv6 address: " + std::string(addr));
                         }
-                        else
-                        {
-                            LOG_ERROR("Invalid IPv4 address or hostname: %s", addr);
-                            throw std::invalid_argument("Invalid IPv4 address or hostname: " + std::string(addr));
-                        }
+                        port = parsePort(rest.substr(1), addr);
                     }
+                    setIPv6(ipAddress.substr(1, close - 1), port, addr);
+                    return;
+                }
+
+                size_t numColons = static_cast<size_t>(std::count(ipAddress.begin(), ipAddress.end(), ':'));
+                if (numColons > 1)
+                {
+                    // Bare IPv6 literal without brackets cannot carry a port.
+                    setIPv6(ipAddress, 0, addr);
+                    return;
+                }
+
+                if (numColons == 1)
+                {
+                    size_t colon = ipAddress.find(':');
+                    port = parsePort(ipAddress.substr(colon + 1), addr);
+                    ipAddress.erase(colon);
+                }
+                setIPv4(ipAddress, port, addr);
+            }
+
+            /// <summary>
+            /// Size of the address storage (the largest supported sockaddr type).
+            /// Use this as the in/out length for recvfrom/accept/getsockname.
+            /// </summary>
+            static constexpr size_t capacity()
+            {
+#ifdef HAVE_UNIX_DOMAIN
+                return (sizeof(sockaddr_un) > sizeof(sockaddr_in6)) ? sizeof(sockaddr_un) : sizeof(sockaddr_in6);
+#else
+                return sizeof(sockaddr_in6);
+#endif
+            }
+
+        private:
+            /// Remove an optional "scheme://" prefix; optionally return the scheme.
+            static std::string stripScheme(const char* addr, std::string* scheme)
+            {
+                std::string result = addr;
+                auto found = result.find("://");
+                if (found != std::string::npos)
+                {
+                    if (scheme != nullptr)
+                    {
+                        *scheme = result.substr(0, found);
+                    }
+                    result.erase(0, found + 3);
+                }
+                return result;
+            }
+
+            /// Parse a decimal port number in range [0..65535].
+            static int parsePort(const std::string& text, const char* addr)
+            {
+                if (text.empty() || (text.length() > 5) ||
+                    !std::all_of(text.begin(), text.end(), [](char c) { return (c >= '0') && (c <= '9'); }))
+                {
+                    throw std::invalid_argument("Invalid port in address: " + std::string(addr));
+                }
+                int port = std::stoi(text);
+                if (port > 65535)
+                {
+                    throw std::invalid_argument("Port out of range in address: " + std::string(addr));
+                }
+                return port;
+            }
+
+            void setIPv6(const std::string& host, int port, const char* addr)
+            {
+                m_data_in6.sin6_family = AF_INET6;
+                m_data_in6.sin6_port = htons(static_cast<unsigned short>(port));
+                if (::inet_pton(AF_INET6, host.c_str(), &m_data_in6.sin6_addr) != 1)
+                {
+                    LOG_ERROR("Invalid IPv6 address: %s", addr);
+                    throw std::invalid_argument("Invalid IPv6 address: " + std::string(addr));
                 }
             }
+
+            void setIPv4(const std::string& host, int port, const char* addr)
+            {
+                m_data_in.sin_family = AF_INET;
+                m_data_in.sin_port = htons(static_cast<unsigned short>(port));
+                // Try inet_pton first for IP addresses
+                if (::inet_pton(AF_INET, host.c_str(), &m_data_in.sin_addr) == 1)
+                {
+                    return;
+                }
+                // inet_pton failed, try getaddrinfo for hostname resolution
+                struct addrinfo hints = {};
+                struct addrinfo* result = nullptr;
+                hints.ai_family = AF_INET;
+                hints.ai_socktype = SOCK_STREAM;
+                if (!host.empty() && (::getaddrinfo(host.c_str(), nullptr, &hints, &result) == 0) && (result != nullptr))
+                {
+                    sockaddr_in* resolved = reinterpret_cast<sockaddr_in*>(result->ai_addr);
+                    m_data_in.sin_addr = resolved->sin_addr;
+                    ::freeaddrinfo(result);
+                    return;
+                }
+                LOG_ERROR("Invalid IPv4 address or hostname: %s", addr);
+                throw std::invalid_argument("Invalid IPv4 address or hostname: " + std::string(addr));
+            }
+
+        public:
 
             SocketAddr(SocketAddr const& other) = default;
 
@@ -557,6 +606,20 @@ namespace net
 #endif
                 }
                 suppressSigPipe();
+                setCloseOnExec();
+            }
+
+            /// @brief Do not leak the socket into child processes (POSIX FD_CLOEXEC).
+            /// No-op on Windows, where sockets are not inherited by default.
+            void setCloseOnExec() noexcept
+            {
+#if !defined(_WIN32) && defined(FD_CLOEXEC)
+                int fdflags = ::fcntl(m_sock, F_GETFD, 0);
+                if (fdflags >= 0)
+                {
+                    ::fcntl(m_sock, F_SETFD, fdflags | FD_CLOEXEC);
+                }
+#endif
             }
 
             /// @brief Suppress SIGPIPE for writes to a peer-closed socket.
@@ -662,10 +725,12 @@ namespace net
             int recvfrom(_Out_cap_(size) void* buffer, size_t size, int flags, SocketAddr& clientAddr)
             {
                 assert(m_sock != Invalid);
+                // Pass the full storage size: the peer may be of a different
+                // (larger) family than whatever clientAddr currently holds.
 #ifdef _WIN32
-                int len = clientAddr.size();
+                int len = static_cast<int>(SocketAddr::capacity());
 #else
-                socklen_t len = clientAddr.size();
+                socklen_t len = static_cast<socklen_t>(SocketAddr::capacity());
 #endif
                 return static_cast<int>(
                     ::recvfrom(m_sock, reinterpret_cast<char*>(buffer), size, flags, clientAddr, &len));
@@ -716,11 +781,21 @@ namespace net
                 return total_bytes_received;
             }
 
+            /// @brief Send as much of buffer as possible.
+            /// @param buffer Data to send.
+            /// @param lastError Optional out-parameter: 0 if everything was sent or
+            ///        sending stopped without an error; otherwise the socket error
+            ///        code of the failed send() (see isWouldBlock()).
+            /// @return Number of bytes sent.
             template <typename T>
-            size_t writeall(T& buffer)
+            size_t writeall(T& buffer, int* lastError = nullptr)
             {
                 size_t total_bytes_sent = 0;
                 int bytes_sent = 0;
+                if (lastError != nullptr)
+                {
+                    *lastError = 0;
+                }
                 // Write response fully
                 do
                 {
@@ -735,13 +810,34 @@ namespace net
                         // No more data to send or can't send anymore.
                         break;
                     }
-                    if (bytes_sent < 0)
+                    else
                     {
-                        // send() error occurred.
+                        // send() error occurred: would-block or a hard error.
+                        int err = error();
+#ifndef _WIN32
+                        if (err == EINTR)
+                        {
+                            continue;
+                        }
+#endif
+                        if (lastError != nullptr)
+                        {
+                            *lastError = err;
+                        }
                         break;
                     }
                 } while (total_bytes_sent < buffer.size());
                 return total_bytes_sent;
+            }
+
+            /// @brief True if err is a transient "try again later" socket error.
+            static bool isWouldBlock(int err) noexcept
+            {
+#ifdef _WIN32
+                return (err == WSAEWOULDBLOCK) || (err == WSAEINTR) || (err == WSAEINPROGRESS);
+#else
+                return (err == EAGAIN) || (err == EWOULDBLOCK) || (err == EINTR);
+#endif
             }
 
             int send(void const* buffer, size_t size)
@@ -780,9 +876,9 @@ namespace net
             {
                 assert(m_sock != Invalid);
 #ifdef _WIN32
-                int addrlen = sizeof(addr);
+                int addrlen = static_cast<int>(SocketAddr::capacity());
 #else
-                socklen_t addrlen = sizeof(addr);
+                socklen_t addrlen = static_cast<socklen_t>(SocketAddr::capacity());
 #endif
                 return (::getsockname(m_sock, addr, &addrlen) == 0);
             }
@@ -809,14 +905,15 @@ namespace net
             {
                 assert(m_sock != Invalid);
 #ifdef _WIN32
-                int addrlen = sizeof(caddr);
+                int addrlen = static_cast<int>(SocketAddr::capacity());
 #else
-                socklen_t addrlen = sizeof(caddr);
+                socklen_t addrlen = static_cast<socklen_t>(SocketAddr::capacity());
 #endif
                 csock = ::accept(m_sock, caddr, &addrlen);
                 if (!csock.invalid())
                 {
                     csock.suppressSigPipe();
+                    csock.setCloseOnExec();
                     return true;
                 }
                 return false;
@@ -995,12 +1092,12 @@ namespace net
 
 #ifdef __linux__
             /* use epoll on Linux */
-            int m_epollFd;
+            int m_epollFd{ -1 };
 #endif
 
 #ifdef TARGET_OS_MAC
             /* use kqueue on Mac */
-            int kq{ 0 };
+            int kq{ -1 };
             static constexpr int KQUEUE_SIZE = config::KQUEUE_DEFAULT_SIZE;
             struct kevent m_events[KQUEUE_SIZE];
 #endif
@@ -1009,26 +1106,60 @@ namespace net
             Reactor(SocketCallback& callback) : m_callback(callback)
             {
 #ifdef __linux__
-#  ifdef ANDROID
-                m_epollFd = ::epoll_create(0);
+#  if defined(ANDROID) || defined(__ANDROID__)
+                // epoll_create() requires size > 0 (it is otherwise ignored).
+                m_epollFd = ::epoll_create(1);
+                if (m_epollFd >= 0)
+                {
+                    ::fcntl(m_epollFd, F_SETFD, FD_CLOEXEC);
+                }
 #  else
-                m_epollFd = ::epoll_create1(0);
+                m_epollFd = ::epoll_create1(EPOLL_CLOEXEC);
 #  endif
+                if (m_epollFd < 0)
+                {
+                    LOG_ERROR("Reactor: epoll_create failed! errno=%d", errno);
+                }
 #endif
 
 #ifdef TARGET_OS_MAC
                 bzero(&m_events[0], sizeof(m_events));
                 kq = kqueue();
+                if (kq >= 0)
+                {
+                    ::fcntl(kq, F_SETFD, FD_CLOEXEC);
+                }
 #endif
             }
 
+            Reactor(Reactor const&) = delete;
+            Reactor& operator=(Reactor const&) = delete;
+
+            /// <summary>
+            /// Destructor. Stops the worker thread if the owner did not call stop().
+            /// Sockets are not closed here: they belong to the owner (see stop()).
+            /// </summary>
             ~Reactor()
             {
+                joinThread();
+#ifdef _WIN32
+                for (auto& hEvent : m_events)
+                {
+                    ::WSACloseEvent(hEvent);
+                }
+                m_events.clear();
+#endif
 #ifdef __linux__
-                ::close(m_epollFd);
+                if (m_epollFd >= 0)
+                {
+                    ::close(m_epollFd);
+                }
 #endif
 #ifdef TARGET_OS_MAC
-                ::close(kq);
+                if (kq >= 0)
+                {
+                    ::close(kq);
+                }
 #endif
             }
 
@@ -1075,15 +1206,6 @@ namespace net
                         {
                             LOG_ERROR("Reactor: epoll_ctl failed! errno=%d", errno);
                         }
-#endif
-#ifdef TARGET_OS_MAC
-                        struct kevent event;
-                        bzero(&event, sizeof(event));
-                        event.ident = socket.m_sock;
-                        EV_SET(&event, event.ident, EVFILT_READ, EV_ADD, 0, 0, NULL);
-                        kevent(kq, &event, 1, NULL, 0, NULL);
-                        EV_SET(&event, event.ident, EVFILT_WRITE, EV_ADD, 0, 0, NULL);
-                        kevent(kq, &event, 1, NULL, 0, NULL);
 #endif
                         m_sockets.push_back(SocketData());
                         m_sockets.back().socket = socket;
@@ -1143,7 +1265,7 @@ namespace net
                         }
 #endif
 #ifdef TARGET_OS_MAC
-                        // TODO: [MG] - Mac OS X socket doesn't currently support updating flags
+                        kqueueArm(socket, flags);
 #endif
                     }
                 }
@@ -1175,21 +1297,7 @@ namespace net
                         };
 #endif
 #ifdef TARGET_OS_MAC
-                        struct kevent event;
-                        bzero(&event, sizeof(event));
-                        event.ident = socket;
-                        EV_SET(&event, socket, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-                        if (-1 == kevent(kq, &event, 1, NULL, 0, NULL))
-                        {
-                            //// Already removed?
-                            LOG_ERROR("cannot delete fd=0x%x from kqueue!", event.ident);
-                        }
-                        EV_SET(&event, socket, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-                        if (-1 == kevent(kq, &event, 1, NULL, 0, NULL))
-                        {
-                            //// Already removed?
-                            LOG_ERROR("cannot delete fd=0x%x from kqueue!", event.ident);
-                        }
+                        kqueueDisarm(socket);
 #endif
                     }
                     m_sockets.erase(it);
@@ -1206,57 +1314,49 @@ namespace net
             }
 
             /// <summary>
-            /// Stop server
+            /// Stop the event loop, unregister all sockets and close the first
+            /// registered socket (the listening / bound server socket). Other
+            /// sockets are unregistered but not closed. Safe to call more than once.
             /// </summary>
             void stop()
             {
                 LOG_INFO("Reactor: Stopping...");
-                // If UDP server, then force-close it to stop.
-                if (!m_streaming)
-                {
-                    LOCKGUARD(m_sockets_mutex);
-                    if (m_sockets.size())
-                    {
-                        m_sockets[0].socket.close();
-                    }
-                }
+                // Signal and join the worker first. The UDP receive loop polls with a
+                // timeout and observes the terminate flag, so the socket is never
+                // closed underneath a thread that may still be reading from it.
                 joinThread();
 
                 // Only acquire the lock after the worker(s) have joined
                 LOCKGUARD(m_sockets_mutex);
+                if (m_streaming)
+                {
 #ifdef _WIN32
-                for (auto& hEvent : m_events)
-                {
-                    ::WSACloseEvent(hEvent);
-                }
-#else /* Linux and Mac */
-                for (auto& sd : m_sockets)
-                {
-#  ifdef __linux__
-                    if (::epoll_ctl(m_epollFd, EPOLL_CTL_DEL, sd.socket, nullptr) != 0)
+                    for (size_t i = 0; (i < m_sockets.size()) && (i < m_events.size()); i++)
                     {
-                        LOG_ERROR("Reactor: epoll_ctl failed! errno=%d", errno);
-                    };
+                        ::WSAEventSelect(m_sockets[i].socket, m_events[i], 0);
+                    }
+                    for (auto& hEvent : m_events)
+                    {
+                        ::WSACloseEvent(hEvent);
+                    }
+                    m_events.clear();
+#else /* Linux and Mac */
+                    for (auto& sd : m_sockets)
+                    {
+#  ifdef __linux__
+                        if (::epoll_ctl(m_epollFd, EPOLL_CTL_DEL, sd.socket, nullptr) != 0)
+                        {
+                            LOG_ERROR("Reactor: epoll_ctl failed! errno=%d", errno);
+                        };
 #  endif
 #  ifdef TARGET_OS_MAC
-                    struct kevent event;
-                    bzero(&event, sizeof(event));
-                    event.ident = sd.socket;
-                    EV_SET(&event, sd.socket, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-                    if (-1 == kevent(kq, &event, 1, NULL, 0, NULL))
-                    {
-                        LOG_ERROR("Reactor: cannot delete fd=0x%x from kqueue!", event.ident);
-                    }
-                    EV_SET(&event, sd.socket, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-                    if (-1 == kevent(kq, &event, 1, NULL, 0, NULL))
-                    {
-                        LOG_ERROR("Reactor: cannot delete fd=0x%x from kqueue!", event.ident);
-                    }
+                        kqueueDisarm(sd.socket);
 #  endif
-                }
+                    }
 #endif
+                }
                 // unbind
-                if (m_sockets.size())
+                if (m_sockets.size() && !m_sockets[0].socket.invalid())
                 {
                     m_sockets[0].socket.close();
                 }
@@ -1277,10 +1377,31 @@ namespace net
                     // This single-threaded implementation passes UDP buffers
                     // to onSocketReadable, that should decide what to do with
                     // the socket. Callback may implement its own thread pool.
-                    Socket socket = m_sockets[0].socket;
+                    Socket socket;
+                    {
+                        LOCKGUARD(m_sockets_mutex);
+                        if (m_sockets.empty())
+                        {
+                            return;
+                        }
+                        socket = m_sockets[0].socket;
+                    }
                     LOG_TRACE("Reactor: socket 0x%x receive loop started...", static_cast<int>(socket));
                     while (!shouldTerminate())
                     {
+                        // Wait (bounded) for a datagram instead of spinning on a
+                        // non-blocking recvfrom() that returns EWOULDBLOCK.
+                        int ready = waitReadable(socket, config::REACTOR_POLL_TIMEOUT_MS);
+                        if (ready == 0)
+                        {
+                            continue;
+                        }
+                        if (ready < 0)
+                        {
+                            // Unexpected wait error: back off rather than spin.
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            continue;
+                        }
                         m_callback.onSocketReadable(socket);
                     }
                     m_callback.onSocketClosed(socket);
@@ -1301,32 +1422,51 @@ namespace net
                     // - Mac:     use kqueue
                     //
 #ifdef _WIN32
-                    DWORD dwResult = ::WSAWaitForMultipleEvents(static_cast<DWORD>(m_events.size()),
+                    DWORD numEvents = static_cast<DWORD>(m_events.size());
+                    DWORD dwResult = ::WSAWaitForMultipleEvents(numEvents,
                         m_events.data(), FALSE, config::REACTOR_POLL_TIMEOUT_MS, FALSE);
                     if (dwResult == WSA_WAIT_TIMEOUT)
                     {
                         continue;
                     }
 
-                    if (dwResult > WSA_WAIT_EVENT_0 + m_events.size())
+                    if (dwResult == WSA_WAIT_FAILED)
+                    {
+                        // E.g. no events registered, or an event handle was closed
+                        // concurrently. Back off instead of busy-looping.
+                        LOG_WARN("Reactor: WSAWaitForMultipleEvents failed, error=%d", ::WSAGetLastError());
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        continue;
+                    }
+
+                    if (dwResult >= WSA_WAIT_EVENT_0 + numEvents)
                     {
                         LOG_WARN("Reactor: stale event on closed socket dwResult=%d", (int)dwResult);
                         continue;
                     }
 
-                    int index = dwResult - WSA_WAIT_EVENT_0;
+                    size_t index = static_cast<size_t>(dwResult - WSA_WAIT_EVENT_0);
 
-                    m_sockets_mutex.lock();
-                    Socket socket = m_sockets[index].socket;
-                    int flags = m_sockets[index].flags;
-                    m_sockets_mutex.unlock();
+                    Socket socket;
+                    int flags = 0;
+                    WSAEVENT hEvent = WSA_INVALID_EVENT;
+                    {
+                        LOCKGUARD(m_sockets_mutex);
+                        if ((index >= m_sockets.size()) || (index >= m_events.size()))
+                        {
+                            continue;
+                        }
+                        socket = m_sockets[index].socket;
+                        flags = m_sockets[index].flags;
+                        hEvent = m_events[index];
+                    }
 
-                    WSANETWORKEVENTS ne;
-                    ::WSAEnumNetworkEvents(socket, m_events[index], &ne);
+                    WSANETWORKEVENTS ne = {};
+                    ::WSAEnumNetworkEvents(socket, hEvent, &ne);
                     LOG_TRACE(
                         "Reactor: Handling socket 0x%x (index %d) with active flags 0x%x "
                         "(armed 0x%x)",
-                        static_cast<int>(socket), index, ne.lNetworkEvents, flags);
+                        static_cast<int>(socket), static_cast<int>(index), ne.lNetworkEvents, flags);
 
                     if ((flags & Readable) && (ne.lNetworkEvents & FD_READ))
                     {
@@ -1354,7 +1494,12 @@ namespace net
                             continue;
                         if (result < 0)
                         {
-                            LOG_ERROR("Reactor: got errno=%d!", errno);
+                            if (errno != EINTR)
+                            {
+                                LOG_ERROR("Reactor: got errno=%d!", errno);
+                                // Back off instead of busy-looping on a persistent error.
+                                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            }
                             continue;
                         };
                         assert(result >= 1 && static_cast<size_t>(result) <= sizeof(events) / sizeof(events[0]));
@@ -1414,14 +1559,22 @@ namespace net
                         timeout.tv_nsec = (waitms % 1000) * 1000 * 1000;
 
                         int nev = kevent(kq, NULL, 0, m_events, KQUEUE_SIZE, &timeout);
+                        if (nev < 0)
+                        {
+                            if (errno != EINTR)
+                            {
+                                LOG_ERROR("Reactor: kevent failed, errno=%d", errno);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            }
+                            continue;
+                        }
 
                         // Snapshot the ready sockets while holding m_sockets_mutex,
                         // then invoke the user callbacks after releasing the lock.
                         // Holding the lock across callbacks caused a lock inversion
                         // with m_connectionsMutex (a persistent SSE worker holding
-                        // m_connectionsMutex may call back into the reactor), and the
-                        // previous assert(it != m_sockets.end()) aborted the process
-                        // whenever a socket was concurrently removed.
+                        // m_connectionsMutex may call back into the reactor), and a
+                        // socket may be concurrently removed.
                         struct ReadyEvent
                         {
                             Socket socket;
@@ -1445,30 +1598,12 @@ namespace net
                                 if (it == m_sockets.end())
                                     continue;
 
-                                LOG_TRACE("Handling socket 0x%x active flags 0x%x (armed 0x%x)",
-                                    static_cast<int>(it->socket), event.flags, event.fflags);
+                                LOG_TRACE("Handling socket 0x%x filter %d flags 0x%x (armed 0x%x)",
+                                    static_cast<int>(it->socket), static_cast<int>(event.filter),
+                                    static_cast<unsigned>(event.flags), it->flags);
 
                                 ready.push_back(
                                     { it->socket, it->flags, event.filter, static_cast<unsigned>(event.flags) });
-
-                                // Perform close-related state cleanup under the lock;
-                                // the onSocketClosed callback itself is deferred below.
-                                if (event.filter != EVFILT_READ && event.filter != EVFILT_WRITE &&
-                                    ((event.flags & EV_EOF) || (event.flags & EV_ERROR)))
-                                {
-                                    it->flags = Closed;
-                                    struct kevent kevt;
-                                    EV_SET(&kevt, event.ident, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-                                    if (-1 == kevent(kq, &kevt, 1, NULL, 0, NULL))
-                                    {
-                                        LOG_ERROR("cannot delete fd=0x%x from kqueue!", event.ident);
-                                    }
-                                    EV_SET(&kevt, event.ident, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-                                    if (-1 == kevent(kq, &kevt, 1, NULL, 0, NULL))
-                                    {
-                                        LOG_ERROR("cannot delete fd=0x%x from kqueue!", event.ident);
-                                    }
-                                }
                             }
                         }
 
@@ -1476,6 +1611,9 @@ namespace net
                         {
                             Socket socket = readyEvent.socket;
                             int flags = readyEvent.flags;
+                            // EOF (peer closed) / error is reported on the read or write
+                            // filter itself via EV_EOF / EV_ERROR.
+                            bool eof = (readyEvent.evflags & (EV_EOF | EV_ERROR)) != 0;
 
                             if (readyEvent.filter == EVFILT_READ)
                             {
@@ -1485,7 +1623,13 @@ namespace net
                                 }
                                 if (flags & Readable)
                                 {
+                                    // Readable handler drains remaining data and
+                                    // observes EOF as a 0-byte read.
                                     m_callback.onSocketReadable(socket);
+                                }
+                                else if (eof && (flags & Closed))
+                                {
+                                    m_callback.onSocketClosed(socket);
                                 }
                                 continue;
                             }
@@ -1496,12 +1640,10 @@ namespace net
                                 {
                                     m_callback.onSocketWritable(socket);
                                 }
-                                continue;
-                            }
-
-                            if ((readyEvent.evflags & EV_EOF) || (readyEvent.evflags & EV_ERROR))
-                            {
-                                m_callback.onSocketClosed(socket);
+                                else if (eof && (flags & Closed))
+                                {
+                                    m_callback.onSocketClosed(socket);
+                                }
                                 continue;
                             }
                             LOG_ERROR("Reactor: unhandled kevent!");
@@ -1511,6 +1653,96 @@ namespace net
                 }
                 LOG_TRACE("Reactor: Thread done");
             }
+
+        private:
+            /// <summary>
+            /// Wait until socket is readable (or has a pending error).
+            /// </summary>
+            /// <returns>1 if ready, 0 on timeout, -1 on wait error.</returns>
+            static int waitReadable(const Socket& socket, unsigned timeoutMs)
+            {
+#ifdef _WIN32
+                fd_set readSet;
+                fd_set errorSet;
+                FD_ZERO(&readSet);
+                FD_ZERO(&errorSet);
+                FD_SET(socket.m_sock, &readSet);
+                FD_SET(socket.m_sock, &errorSet);
+                timeval tv;
+                tv.tv_sec = static_cast<long>(timeoutMs / 1000);
+                tv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
+                int rc = ::select(0, &readSet, nullptr, &errorSet, &tv);
+                if (rc == SOCKET_ERROR)
+                {
+                    return -1;
+                }
+                return (rc > 0) ? 1 : 0;
+#else
+                pollfd pfd = {};
+                pfd.fd = socket.m_sock;
+                pfd.events = POLLIN;
+                int rc = ::poll(&pfd, 1, static_cast<int>(timeoutMs));
+                if (rc < 0)
+                {
+                    return (errno == EINTR) ? 0 : -1;
+                }
+                if (rc == 0)
+                {
+                    return 0;
+                }
+                if (pfd.revents & POLLNVAL)
+                {
+                    // Socket is not open.
+                    return -1;
+                }
+                // POLLIN, or POLLERR (pending ICMP error that recvfrom() will clear).
+                return 1;
+#endif
+            }
+
+#ifdef TARGET_OS_MAC
+            /// <summary>
+            /// (Re)register kqueue filters for a socket according to armed flags.
+            /// kqueue filters are level-triggered, so EVFILT_WRITE is registered only
+            /// while Writable is armed (otherwise an idle socket spins the loop).
+            /// When only Closed is armed, EVFILT_READ is edge-triggered (EV_CLEAR) so
+            /// that unread data does not spin the loop while EV_EOF is still observed.
+            /// </summary>
+            void kqueueArm(const Socket& socket, int flags)
+            {
+                uintptr_t ident = static_cast<uintptr_t>(socket.m_sock);
+                struct kevent kev;
+                // Deleting may fail with ENOENT when the filter is absent - that is fine.
+                // Delete + add (rather than modify) so that EV_CLEAR is applied reliably.
+                EV_SET(&kev, ident, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+                (void)kevent(kq, &kev, 1, NULL, 0, NULL);
+                if (flags & (Readable | Acceptable))
+                {
+                    EV_SET(&kev, ident, EVFILT_READ, EV_ADD, 0, 0, NULL);
+                    (void)kevent(kq, &kev, 1, NULL, 0, NULL);
+                }
+                else if (flags & Closed)
+                {
+                    EV_SET(&kev, ident, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+                    (void)kevent(kq, &kev, 1, NULL, 0, NULL);
+                }
+                EV_SET(&kev, ident, EVFILT_WRITE, (flags & Writable) ? EV_ADD : EV_DELETE, 0, 0, NULL);
+                (void)kevent(kq, &kev, 1, NULL, 0, NULL);
+            }
+
+            /// <summary>
+            /// Remove all kqueue filters for a socket (missing filters are ignored).
+            /// </summary>
+            void kqueueDisarm(const Socket& socket)
+            {
+                uintptr_t ident = static_cast<uintptr_t>(socket.m_sock);
+                struct kevent kev;
+                EV_SET(&kev, ident, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+                (void)kevent(kq, &kev, 1, NULL, 0, NULL);
+                EV_SET(&kev, ident, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+                (void)kevent(kq, &kev, 1, NULL, 0, NULL);
+            }
+#endif
         };
 
     }
