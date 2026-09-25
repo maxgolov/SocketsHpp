@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+/// @file tcp.h
+/// @brief Minimal message-oriented TCP server (net::tcp::TcpServer).
+
 #include <SocketsHpp/config.h>
 #include <SocketsHpp/net/common/socket_server.h>
 
@@ -28,8 +31,12 @@ namespace net
          * Each chunk of bytes read from a client is passed to the message handler;
          * the string it returns (if non-empty) is sent back on the same connection.
          * Without a handler the server echoes what it receives. The handler runs on
-         * the reactor thread; it may insert Connection::Closing into conn.state to
-         * close the connection after the response has been sent.
+         * the reactor thread (with the connections mutex held), so it must not block;
+         * it may insert Connection::Closing into conn.state to close the connection
+         * after the response has been sent.
+         *
+         * @note A "message" is whatever one readable event delivered (up to 64 KiB);
+         *       TCP does not preserve message boundaries, so framing is up to the caller.
          *
          * @code
          *   net::tcp::TcpServer server(0);  // ephemeral port on 127.0.0.1
@@ -43,17 +50,22 @@ namespace net
         class TcpServer : public net::common::SocketServer
         {
         public:
-            using Connection = net::common::SocketServer::Connection;
-            using SocketAddr = net::common::SocketAddr;
-            using SocketParams = net::common::SocketParams;
+            using Connection = net::common::SocketServer::Connection;  ///< Per-client connection state.
+            using SocketAddr = net::common::SocketAddr;                ///< Socket address type.
+            using SocketParams = net::common::SocketParams;            ///< Socket parameters type.
 
-            /// Returns the response for a received message (empty: no response).
+            /// @brief Handler for a received chunk of bytes.
+            /// @return Bytes to send back on the same connection (empty: no response).
             using MessageHandler = std::function<std::string(const std::string& message, Connection& conn)>;
 
             /**
-             * @brief Bind to host:port (port 0 selects an ephemeral port).
+             * @brief Bind to host:port and listen (port 0 selects an ephemeral port; see port()).
+             * @param port TCP port in host byte order.
+             * @param host IPv4/IPv6 literal or hostname (hostnames resolve to IPv4 only).
+             * @param backlog listen() backlog.
              * @throws std::invalid_argument for a malformed host,
              *         std::runtime_error if the address cannot be bound.
+             * @note Does not start serving; call Start().
              */
             explicit TcpServer(int port = 0, const char* host = "127.0.0.1", int backlog = 10)
                 : TcpServer(SocketAddr(host, port), backlog)
@@ -61,8 +73,11 @@ namespace net
             }
 
             /**
-             * @brief Bind to an IPv4 or IPv6 address.
+             * @brief Bind to an IPv4 or IPv6 address and listen.
+             * @param addr Address to bind (port 0 selects an ephemeral port).
+             * @param backlog listen() backlog.
              * @throws std::runtime_error if the address cannot be bound.
+             * @note Does not start serving; call Start().
              */
             explicit TcpServer(const SocketAddr& addr, int backlog = 10)
                 : net::common::SocketServer(addr, SocketParams{addr.m_data.sa_family, SOCK_STREAM, 0}, backlog)
@@ -74,17 +89,18 @@ namespace net
                 onRequest = [this](Connection& conn) { handleRequest(conn); };
             }
 
-            /// Stop before members used by the reactor thread are destroyed.
+            /// @brief Calls Stop() before members used by the reactor thread are destroyed.
             ~TcpServer() override { Stop(); }
 
-            /// Set the message handler (thread-safe; may be changed while running).
+            /// @brief Set the message handler (thread-safe; may be changed while running).
+            /// @param handler New handler; an empty function restores echo behaviour.
             void onMessage(MessageHandler handler)
             {
                 std::lock_guard<std::mutex> lock(m_handlerMutex);
                 m_handler = std::move(handler);
             }
 
-            /// Bound port (useful when constructed with port 0).
+            /// @brief Actually bound port (useful when constructed with port 0).
             int port() const { return address().port(); }
 
         private:
