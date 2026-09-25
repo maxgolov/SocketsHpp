@@ -6,10 +6,16 @@
 #include <BS_thread_pool.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 
 SOCKETSHPP_NS_BEGIN
 namespace net
@@ -48,13 +54,14 @@ namespace net
             /// @param args Arguments to pass to callable
             /// @return Future for retrieving result
             template<typename F, typename... Args>
-            auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+            auto submit(F&& f, Args&&... args)
             {
                 if (!m_running.load(std::memory_order_acquire))
                 {
                     throw std::runtime_error("Thread pool is shutting down");
                 }
-                return m_pool.submit(std::forward<F>(f), std::forward<Args>(args)...);
+                // BS::thread_pool tasks take no arguments: bind them into a nullary callable.
+                return m_pool.submit_task(bind_args(std::forward<F>(f), std::forward<Args>(args)...));
             }
 
             /// @brief Submit detached task (fire-and-forget, no future returned)
@@ -69,7 +76,7 @@ namespace net
                 {
                     throw std::runtime_error("Thread pool is shutting down");
                 }
-                m_pool.detach_task(std::forward<F>(f), std::forward<Args>(args)...);
+                m_pool.detach_task(bind_args(std::forward<F>(f), std::forward<Args>(args)...));
             }
 
             /// @brief Get number of threads in pool
@@ -81,21 +88,21 @@ namespace net
 
             /// @brief Get number of tasks waiting in queue
             /// @return Queue size
-            size_t get_tasks_queued() const noexcept
+            size_t get_tasks_queued() const
             {
                 return m_pool.get_tasks_queued();
             }
 
             /// @brief Get number of tasks currently running
             /// @return Running task count
-            size_t get_tasks_running() const noexcept
+            size_t get_tasks_running() const
             {
                 return m_pool.get_tasks_running();
             }
 
             /// @brief Get total task count (queued + running)
             /// @return Total task count
-            size_t get_tasks_total() const noexcept
+            size_t get_tasks_total() const
             {
                 return m_pool.get_tasks_total();
             }
@@ -114,10 +121,13 @@ namespace net
             }
 
             /// @brief Purge all pending tasks from queue
-            /// @return Number of tasks purged
+            /// @return Number of tasks that were queued just before the purge
+            ///         (approximate if tasks are submitted concurrently)
             size_t purge_tasks()
             {
-                return m_pool.purge();
+                size_t queued = m_pool.get_tasks_queued();
+                m_pool.purge();
+                return queued;
             }
 
             /// @brief Gracefully shutdown thread pool
@@ -133,7 +143,17 @@ namespace net
             }
 
         private:
-            BS::thread_pool m_pool;
+            /// @brief Wrap a callable and its arguments into a nullary callable.
+            template<typename F, typename... Args>
+            static auto bind_args(F&& f, Args&&... args)
+            {
+                return [fn = std::forward<F>(f),
+                        tup = std::make_tuple(std::forward<Args>(args)...)]() mutable -> decltype(auto) {
+                    return std::apply(fn, std::move(tup));
+                };
+            }
+
+            BS::thread_pool<> m_pool;
             std::atomic<bool> m_running;
         };
 

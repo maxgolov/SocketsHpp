@@ -24,6 +24,7 @@ set(UNIT_TESTS
   proxy_aware_test
   authentication_test
   compression_test
+  thread_pool_server_test
 )
 
 # MCP unit tests (require nlohmann-json)
