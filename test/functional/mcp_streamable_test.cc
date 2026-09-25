@@ -208,28 +208,15 @@ class StreamableHttpTest : public ::testing::Test
 {
 protected:
     std::unique_ptr<MCPServer> server_;
-    std::thread                server_thread_;
     int                        port_{0};
     std::atomic<int>           initialized_count_{0};
 
     void SetUp() override
     {
-        // Find an ephemeral port
-        int probe = ::socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in a{};
-        a.sin_family      = AF_INET;
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        a.sin_port        = 0;
-        ::bind(probe, (sockaddr*)&a, sizeof(a));
-        socklen_t len = sizeof(a);
-        ::getsockname(probe, (sockaddr*)&a, &len);
-        port_ = ntohs(a.sin_port);
-        ::close(probe);
-
         ServerConfig cfg;
         cfg.transport        = TransportType::HTTP_STREAMABLE;
         cfg.host             = "127.0.0.1";
-        cfg.port             = port_;
+        cfg.port             = 0;  // ephemeral; read back after listen()
         cfg.allowNonLoopback = false;
 
         server_ = std::make_unique<MCPServer>(cfg);
@@ -274,28 +261,13 @@ protected:
             return json::object();
         });
 
-        server_thread_ = std::thread([this]() {
-            try { server_->listen(); } catch (...) {}
-        });
-
-        // Spin until the port is reachable
-        for (int i = 0; i < 100; ++i) {
-            int s = ::socket(AF_INET, SOCK_STREAM, 0);
-            sockaddr_in addr{};
-            addr.sin_family      = AF_INET;
-            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            addr.sin_port        = htons(port_);
-            bool ok = (::connect(s, (sockaddr*)&addr, sizeof(addr)) == 0);
-            ::close(s);
-            if (ok) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        }
+        server_->listen();  // non-blocking: the reactor runs on its own thread
+        port_ = server_->port();
     }
 
     void TearDown() override
     {
         if (server_) server_->stop();
-        if (server_thread_.joinable()) server_thread_.join();
     }
 
     // Convenience: initialize and return session id
@@ -676,63 +648,28 @@ TEST(StreamableHttpApiCompiles, CancellableHandlerExecutes)
 // Regression tests for protocol / security fixes
 // ══════════════════════════════════════════════════════════════════════════════
 
-static int pick_ephemeral_port()
-{
-    int probe = ::socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in a{};
-    a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port        = 0;
-    ::bind(probe, (sockaddr*)&a, sizeof(a));
-    socklen_t len = sizeof(a);
-    ::getsockname(probe, (sockaddr*)&a, &len);
-    int port = ntohs(a.sin_port);
-    ::close(probe);
-    return port;
-}
-
-static void wait_for_port(int port)
-{
-    for (int i = 0; i < 100; ++i) {
-        int s = ::socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in addr{};
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port        = htons(port);
-        bool ok = (::connect(s, (sockaddr*)&addr, sizeof(addr)) == 0);
-        ::close(s);
-        if (ok) return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    }
-}
-
 /// Runs an MCPServer with a caller-supplied config on an ephemeral loopback port.
 struct CustomServer
 {
     std::unique_ptr<MCPServer> server;
-    std::thread                thread;
     int                        port{0};
 
     explicit CustomServer(ServerConfig cfg,
                           const std::function<void(MCPServer&)>& setup = nullptr)
     {
-        port     = pick_ephemeral_port();
         cfg.host = "127.0.0.1";
-        cfg.port = port;
+        cfg.port = 0;  // ephemeral; read back after listen()
         if (cfg.transport == TransportType::STDIO)
             cfg.transport = TransportType::HTTP_STREAMABLE;
         server = std::make_unique<MCPServer>(cfg);
         if (setup) setup(*server);
-        thread = std::thread([this]() {
-            try { server->listen(); } catch (...) {}
-        });
-        wait_for_port(port);
+        server->listen();  // non-blocking: the reactor runs on its own thread
+        port = server->port();
     }
 
     ~CustomServer()
     {
         server->stop();
-        if (thread.joinable()) thread.join();
     }
 };
 

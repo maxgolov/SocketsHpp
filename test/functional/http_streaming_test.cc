@@ -23,16 +23,7 @@ protected:
         testPort = 0;  // Assigned from the server's ephemeral port in each test
     }
 
-    void TearDown() override
-    {
-        if (serverThread.joinable())
-        {
-            serverThread.join();
-        }
-    }
-
     int testPort;
-    std::thread serverThread;
 };
 
 // Test basic chunked encoding
@@ -64,10 +55,8 @@ TEST_F(HttpStreamingTest, ChunkedEncodingBasic)
     
     server["/chunked"] = chunkedHandler;
     
-    // Start server in background
-    serverThread = std::thread([&server]() {
-        server.start();
-    });
+    // start() is non-blocking: the reactor runs on its own thread
+    server.start();
     
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
@@ -113,9 +102,7 @@ TEST_F(HttpStreamingTest, SSEEvents)
     
     server["/events"] = sseHandler;
     
-    serverThread = std::thread([&server]() {
-        server.start();
-    });
+    server.start();  // non-blocking: the reactor runs on its own thread
     
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
@@ -163,9 +150,7 @@ TEST_F(HttpStreamingTest, ClientChunkedParsing)
     
     server["/test"] = handler;
     
-    serverThread = std::thread([&server]() {
-        server.start();
-    });
+    server.start();  // non-blocking: the reactor runs on its own thread
     
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
@@ -205,9 +190,7 @@ TEST_F(HttpStreamingTest, PostRequest)
     
     server["/echo"] = echoHandler;
     
-    serverThread = std::thread([&server]() {
-        server.start();
-    });
+    server.start();  // non-blocking: the reactor runs on its own thread
     
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     

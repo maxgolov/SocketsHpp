@@ -7,6 +7,7 @@
 #include <SocketsHpp/http/common/http_constants.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <functional>
@@ -919,7 +920,7 @@ namespace http
 
             SessionManager m_sessionManager;
             CorsConfig m_corsConfig;
-            bool m_stopped = false;
+            std::atomic<bool> m_stopped{false};
 
         public:
             void setKeepalive(bool keepAlive) { allowKeepalive = keepAlive; }
@@ -1159,11 +1160,10 @@ namespace http
             /// @brief Stop serving and join the reactor thread. Idempotent.
             void stop()
             {
-                if (m_stopped)
+                if (m_stopped.exchange(true))
                 {
                     return;
                 }
-                m_stopped = true;
                 m_reactor.stop();
                 // Reactor::stop() "unbinds" by closing the first socket registered with
                 // it, which is our first listening socket. Forget that descriptor so it
