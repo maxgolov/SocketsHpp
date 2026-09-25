@@ -482,7 +482,7 @@ namespace net
                 };
                 return os.str();
             }
-        };  // namespace utils
+        };  // struct SocketAddr
 
         static const char* kSchemeUDP = "udp";
         static const char* kSchemeTCP = "tcp";

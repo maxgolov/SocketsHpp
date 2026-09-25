@@ -27,6 +27,7 @@ namespace net
         using Socket = net::utils::Socket;
         using SocketAddr = net::utils::SocketAddr;
         using SocketParams = net::utils::SocketParams;
+        using ScopedSocket = net::utils::ScopedSocket;
 
         /**
          * @brief Common Server for TCP, UDP and Unix Domain.
@@ -140,7 +141,7 @@ namespace net
              */
             virtual void onSocketAcceptable(Socket socket) override
             {
-                LOG_TRACE("Server: accepting socket fd=0x%llx", socket.m_sock);
+                LOG_TRACE("Server: accepting socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
 
                 Socket csocket;
                 SocketAddr caddr;
@@ -232,7 +233,7 @@ namespace net
              */
             virtual void onSocketWritable(Socket socket) override
             {
-                LOG_TRACE("Server: writing socket fd=0x%llx", socket.m_sock);
+                LOG_TRACE("Server: writing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
                 LOCKGUARD(connections_mutex);
                 auto it = connections.find(socket);
                 if (it == connections.end())
@@ -251,7 +252,7 @@ namespace net
              */
             virtual void onSocketClosed(Socket socket) override
             {
-                LOG_TRACE("Server: closing socket fd=0x%llx", socket.m_sock);
+                LOG_TRACE("Server: closing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
                 LOCKGUARD(connections_mutex);
                 auto it = connections.find(socket);
                 if (it != connections.end())

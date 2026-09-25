@@ -4,6 +4,9 @@
 
 #include "./macros.h"
 
+#include <cstddef>
+#include <cstdio>
+
 #ifndef SOCKETSHPP_NS
 #define SOCKETSHPP_NS SocketsHpp
 #endif
@@ -21,7 +24,7 @@
 #ifdef HAVE_HTTP_DEBUG
 #  ifdef LOG_TRACE
 #    undef LOG_TRACE
-#    define LOG_TRACE(x, ...) printf(x "\n", __VA_ARGS__)
+#    define LOG_TRACE(...) (std::printf(__VA_ARGS__), std::printf("\n"))
 #  endif
 #endif
 

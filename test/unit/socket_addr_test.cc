@@ -80,7 +80,7 @@ namespace testing
         std::string result = addr.toString();
         // May be compressed to short form
         EXPECT_FALSE(result.empty());
-        EXPECT_TRUE(result.find(']:') != std::string::npos);
+        EXPECT_TRUE(result.find("]:") != std::string::npos);
     }
 
     TEST_F(SocketAddrTest, IPv6_LinkLocalAddress)
@@ -95,7 +95,7 @@ namespace testing
         SocketAddr addr("[2001:db8::1]:9000");
         std::string result = addr.toString();
         EXPECT_FALSE(result.empty());
-        EXPECT_TRUE(result.find(']:') != std::string::npos);
+        EXPECT_TRUE(result.find("]:") != std::string::npos);
     }
 
     TEST_F(SocketAddrTest, IPv6_AllZeros)

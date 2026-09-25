@@ -1023,7 +1023,7 @@ namespace http
         protected:
             virtual void onSocketAcceptable(Socket socket) override
             {
-                LOG_TRACE("HttpServer: accepting socket fd=0x%llx", socket.m_sock);
+                LOG_TRACE("HttpServer: accepting socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
                 assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) !=
                     m_listeningSockets.end());
 
@@ -1046,7 +1046,7 @@ namespace http
 
             virtual void onSocketReadable(Socket socket) override
             {
-                LOG_TRACE("HttpServer: reading socket fd=0x%llx", socket.m_sock);
+                LOG_TRACE("HttpServer: reading socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
                 assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
                     m_listeningSockets.end());
 
@@ -1073,7 +1073,7 @@ namespace http
 
             virtual void onSocketWritable(Socket socket) override
             {
-                LOG_TRACE("HttpServer: writing socket fd=0x%llx", socket.m_sock);
+                LOG_TRACE("HttpServer: writing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
 
                 assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
                     m_listeningSockets.end());
@@ -1094,7 +1094,7 @@ namespace http
 
             virtual void onSocketClosed(Socket socket) override
             {
-                LOG_TRACE("HttpServer: closing socket fd=0x%llx", socket.m_sock);
+                LOG_TRACE("HttpServer: closing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
                 assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
                     m_listeningSockets.end());
 
