@@ -1361,9 +1361,12 @@ namespace mcp
                 }
 
 #ifdef SOCKETSHPP_HAS_JWT_CPP
-                // JWT validation if secret provided and no custom validator
+                // JWT validation if secret provided and no custom validator. An empty
+                // HMAC key would let anyone mint valid tokens, so it counts as
+                // misconfigured (falls through to the 500 below).
                 if (m_config.auth.type == ServerConfig::AuthConfig::Type::BEARER &&
-                    m_config.auth.secretOrPublicKey.has_value())
+                    m_config.auth.secretOrPublicKey.has_value() &&
+                    !m_config.auth.secretOrPublicKey->empty())
                 {
                     try
                     {

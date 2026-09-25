@@ -724,6 +724,70 @@ TEST(McpAuthTest, ApiKeyFromEnvironment)
     EXPECT_EQ(bad.status, 401);
 }
 
+#ifdef SOCKETSHPP_HAS_JWT_CPP
+// JWT bearer validation (built only when jwt-cpp is available).
+static ServerConfig jwt_config(const std::string& secret)
+{
+    ServerConfig cfg;
+    cfg.auth.enabled           = true;
+    cfg.auth.type              = ServerConfig::AuthConfig::Type::BEARER;
+    cfg.auth.secretOrPublicKey = secret;
+    return cfg;
+}
+
+static std::string make_hs256(const std::string& secret,
+                              std::chrono::seconds expiresIn = std::chrono::seconds(300))
+{
+    return jwt::create()
+        .set_issuer("test")
+        .set_expires_at(std::chrono::system_clock::now() + expiresIn)
+        .sign(jwt::algorithm::hs256{secret});
+}
+
+TEST(McpJwtAuthTest, ValidTokenAccepted)
+{
+    CustomServer srv(jwt_config("jwt-secret"));
+    auto r = http_request(srv.port, "POST", kInitBody,
+                          json_headers({{"Authorization", "Bearer " + make_hs256("jwt-secret")}}));
+    EXPECT_EQ(r.status, 200);
+}
+
+TEST(McpJwtAuthTest, WrongSecretRejected)
+{
+    CustomServer srv(jwt_config("jwt-secret"));
+    auto r = http_request(srv.port, "POST", kInitBody,
+                          json_headers({{"Authorization", "Bearer " + make_hs256("other-secret")}}));
+    EXPECT_EQ(r.status, 401);
+}
+
+TEST(McpJwtAuthTest, ExpiredTokenRejected)
+{
+    CustomServer srv(jwt_config("jwt-secret"));
+    auto r = http_request(srv.port, "POST", kInitBody,
+                          json_headers({{"Authorization",
+                                         "Bearer " + make_hs256("jwt-secret", std::chrono::seconds(-60))}}));
+    EXPECT_EQ(r.status, 401);
+}
+
+TEST(McpJwtAuthTest, UnsignedTokenRejected)
+{
+    CustomServer srv(jwt_config("jwt-secret"));
+    auto none = jwt::create().set_issuer("test").sign(jwt::algorithm::none{});
+    auto r = http_request(srv.port, "POST", kInitBody,
+                          json_headers({{"Authorization", "Bearer " + none}}));
+    EXPECT_EQ(r.status, 401);
+}
+
+TEST(McpJwtAuthTest, EmptySecretFailsClosed)
+{
+    // An empty HMAC key would accept tokens anyone can mint.
+    CustomServer srv(jwt_config(""));
+    auto r = http_request(srv.port, "POST", kInitBody,
+                          json_headers({{"Authorization", "Bearer " + make_hs256("")}}));
+    EXPECT_EQ(r.status, 500);
+}
+#endif  // SOCKETSHPP_HAS_JWT_CPP
+
 TEST(McpAuthTest, CapabilityTokenValidated)
 {
     ServerConfig cfg;
