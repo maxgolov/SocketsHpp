@@ -1320,20 +1320,29 @@ namespace http
                     return false;
                 }
 
-                int sent = conn.socket.send(conn.sendBuffer.data(), conn.sendBuffer.size());
-                LOG_TRACE("HttpServer: [%s] sent %d", conn.request.client.c_str(), sent);
-                if (sent < 0)
+                // Keep sending until the buffer is drained or the socket would block.
+                // Stopping after a partial send is not enough: on Windows FD_WRITE is
+                // only signalled again after a send() fails with WSAEWOULDBLOCK.
+                size_t offset = 0;
+                while (offset < conn.sendBuffer.size())
                 {
+                    int sent = conn.socket.send(conn.sendBuffer.data() + offset, conn.sendBuffer.size() - offset);
+                    LOG_TRACE("HttpServer: [%s] sent %d", conn.request.client.c_str(), sent);
+                    if (sent > 0)
+                    {
+                        offset += static_cast<size_t>(sent);
+                        continue;
+                    }
                     const int err = conn.socket.error();
-                    if (!isTransientSocketError(err))
+                    if (sent < 0 && !isTransientSocketError(err))
                     {
                         LOG_WARN("HttpServer: [%s] send failed, error %d - closing", conn.request.client.c_str(), err);
                         conn.closeRequested = true;
                         return true;
                     }
-                    sent = 0;  // Socket buffer full - retry when writable
+                    break;  // Socket buffer full - retry when writable
                 }
-                conn.sendBuffer.erase(0, static_cast<size_t>(sent));
+                conn.sendBuffer.erase(0, offset);
 
                 if (!conn.sendBuffer.empty())
                 {
