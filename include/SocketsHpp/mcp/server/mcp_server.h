@@ -63,7 +63,9 @@
 #include <SocketsHpp/http/common/json_rpc.h>
 #include <SocketsHpp/mcp/common/mcp_config.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -72,6 +74,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -96,11 +99,14 @@ namespace mcp
         ///   - TransportType::HTTP               — HTTP + persistent SSE GET stream (MCP 2024-11-05)
         ///   - TransportType::HTTP_STREAMABLE    — Streamable HTTP POST (MCP 2025-03-26)
         ///
-        /// Auto-registered built-in methods (servers MUST NOT override these):
+        /// Auto-registered built-in methods:
         ///   - "ping"                     → {} (liveness check, required by spec)
         ///   - "notifications/initialized"→ no-op (client ACK after initialize)
-        ///   - "notifications/cancelled" → cancels pending in-flight request
+        ///   - "notifications/cancelled" → cancels a pending in-flight request (by JSON-RPC id)
         ///   - "logging/setLevel"        → sets minimum log level for notifications/message
+        ///
+        /// Thread safety: registerMethod()/registerCancellable() may be called at any
+        /// time, including after listen(); push_* helpers may be called from any thread.
         ///
         /// See file header comment for nginx integration guide.
         class MCPServer
@@ -122,7 +128,6 @@ namespace mcp
                 : m_config(config)
                 , m_httpServer(config.host, config.port)
                 , m_running(false)
-                , m_logLevel("warning")
             {
                 // Configure session manager
                 m_sessionManager.setSessionTimeout(std::chrono::seconds(config.session.sessionTimeoutSeconds));
@@ -140,32 +145,38 @@ namespace mcp
 
                 // ── Auto-register built-in MCP protocol methods ───────────────────────────
                 // ping — required by spec; clients poll for liveness
-                m_methods["ping"] = [](const json&) -> json { return json::object(); };
+                registerMethod("ping", [](const json&) -> json { return json::object(); });
 
                 // notifications/initialized — client ACK after initialize, no response needed
-                m_methods["notifications/initialized"] = [](const json&) -> json { return json::object(); };
+                registerMethod("notifications/initialized", [](const json&) -> json { return json::object(); });
 
                 // notifications/cancelled — client cancels an in-flight request by requestId
-                m_methods["notifications/cancelled"] = [this](const json& params) -> json {
-                    json req_id = params.value("requestId", json{});
-                    if (!req_id.is_null()) {
-                        std::lock_guard<std::mutex> lock(m_pendingMutex);
-                        auto it = m_pendingCancellations.find(req_id);
-                        if (it != m_pendingCancellations.end())
-                            it->second->store(true);
+                registerMethod("notifications/cancelled", [this](const json& params) -> json {
+                    if (params.is_object() && params.contains("requestId"))
+                    {
+                        JsonRpcId id;
+                        if (jsonRpcIdFromJson(params["requestId"], id))
+                        {
+                            std::lock_guard<std::mutex> lock(m_pendingMutex);
+                            auto it = m_pendingCancellations.find(jsonRpcIdToJson(id));
+                            if (it != m_pendingCancellations.end())
+                                it->second->store(true);
+                        }
                     }
                     return json::object();
-                };
+                });
 
                 // logging/setLevel — client requests minimum log severity for notifications/message
-                m_methods["logging/setLevel"] = [this](const json& params) -> json {
-                    std::string level = params.value("level", "warning");
-                    static const std::vector<std::string> valid =
-                        {"debug","info","notice","warning","error","critical","alert","emergency"};
-                    if (std::find(valid.begin(), valid.end(), level) != valid.end())
-                        m_logLevel = level;
+                registerMethod("logging/setLevel", [this](const json& params) -> json {
+                    std::string level = (params.is_object() && params.contains("level") &&
+                                         params["level"].is_string())
+                        ? params["level"].get<std::string>() : std::string();
+                    int idx = logLevelIndex(level);
+                    if (idx < 0)
+                        throw JsonRpcError::invalidParams("Invalid log level: " + level);
+                    m_minLogLevel.store(idx);
                     return json::object();
-                };
+                });
 
                 // Setup routes based on transport type
                 if (config.transport == TransportType::HTTP)
@@ -185,44 +196,23 @@ namespace mcp
             }
 
             /// @brief Register a method handler (simple — no cancellation)
-            /// @note Built-in methods (ping, notifications/initialized, notifications/cancelled,
-            ///       logging/setLevel) are pre-registered and cannot be overridden.
+            /// @note Registering a built-in name (ping, notifications/initialized,
+            ///       notifications/cancelled, logging/setLevel) replaces the built-in.
             void registerMethod(const std::string& method, MethodHandler handler)
             {
-                m_methods[method] = std::move(handler);
+                std::unique_lock<std::shared_mutex> lock(m_methodsMutex);
+                m_methods[method] = MethodEntry{std::move(handler), nullptr};
             }
 
             /// @brief Register a cancellable method handler.
             /// The handler receives a shared cancel_requested token. Poll it in long-running
             /// operations; when true, abort and throw std::runtime_error("cancelled").
-            /// The token is set by notifications/cancelled from the client.
+            /// The token is set by a notifications/cancelled whose params.requestId equals
+            /// the JSON-RPC id of the in-flight request.
             void registerCancellable(const std::string& method, CancellableMethodHandler handler)
             {
-                m_methods[method] = [this, method, handler](const json& params) -> json {
-                    auto token = std::make_shared<std::atomic<bool>>(false);
-                    // Register by using the request ID from the current in-flight context.
-                    // We store it temporarily so notifications/cancelled can find it.
-                    // Since JSON-RPC id is not in params, we use a UUID as a surrogate key.
-                    auto surrogate = json(method + "_" + std::to_string(
-                        std::chrono::steady_clock::now().time_since_epoch().count()));
-                    {
-                        std::lock_guard<std::mutex> lock(m_pendingMutex);
-                        m_pendingCancellations[surrogate] = token;
-                    }
-                    json result;
-                    try {
-                        result = handler(params, token);
-                    } catch (...) {
-                        std::lock_guard<std::mutex> lock(m_pendingMutex);
-                        m_pendingCancellations.erase(surrogate);
-                        throw;
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(m_pendingMutex);
-                        m_pendingCancellations.erase(surrogate);
-                    }
-                    return result;
-                };
+                std::unique_lock<std::shared_mutex> lock(m_methodsMutex);
+                m_methods[method] = MethodEntry{nullptr, std::move(handler)};
             }
 
             /// @brief Push a progress notification to a session's SSE stream.
@@ -265,15 +255,9 @@ namespace mcp
                           const std::string& logger,
                           const json&        data)
             {
-                static const std::map<std::string, int> LEVEL_ORDER = {
-                    {"debug",0},{"info",1},{"notice",2},{"warning",3},
-                    {"error",4},{"critical",5},{"alert",6},{"emergency",7}
-                };
                 // Suppress if below the requested log level
-                auto it_min = LEVEL_ORDER.find(m_logLevel);
-                auto it_cur = LEVEL_ORDER.find(level);
-                if (it_min != LEVEL_ORDER.end() && it_cur != LEVEL_ORDER.end() &&
-                    it_cur->second < it_min->second)
+                int cur = logLevelIndex(level);
+                if (cur >= 0 && cur < m_minLogLevel.load())
                     return false;
 
                 json event_body = {
@@ -286,7 +270,9 @@ namespace mcp
             }
 
             /// @brief Get the capabilities object the client advertised in its initialize call.
-            /// Returns null JSON if the session has not completed initialize, or sessionId is empty.
+            /// For HTTP transports pass the session id; for the STDIO transport
+            /// (processMessage) pass an empty string.
+            /// Returns null JSON if no initialize has completed for that session.
             json get_client_capabilities(const std::string& sessionId) const
             {
                 std::lock_guard<std::mutex> lock(m_clientCapsMutex);
@@ -384,10 +370,10 @@ namespace mcp
                 // Signal all SSE streams to close
                 {
                     std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
-                    for (auto& [sid, q] : m_sseQueues)
+                    for (auto& entry : m_sseQueues)
                     {
-                        q->closed.store(true);
-                        q->cv.notify_all();
+                        entry.second->closed.store(true);
+                        entry.second->cv.notify_all();
                     }
                     m_sseQueues.clear();
                 }
@@ -395,39 +381,47 @@ namespace mcp
                 m_httpServer.stop();
             }
 
-            /// @brief Process JSON-RPC message (STDIO mode)
-            /// @param jsonRpcMessage JSON-RPC message string
-            /// @return JSON-RPC response string (empty for notifications)
+            /// @brief Process a JSON-RPC message or batch (STDIO mode)
+            /// @param jsonRpcMessage JSON-RPC message (or batch array) string
+            /// @return JSON-RPC response string; empty when no response is due
+            ///         (notifications, or a batch made only of notifications)
             std::string processMessage(const std::string& jsonRpcMessage)
             {
+                json body;
                 try
                 {
-                    json j = json::parse(jsonRpcMessage);
-
-                    // Check if it's a notification (no ID)
-                    if (!j.contains("id"))
-                    {
-                        auto notif = JsonRpcNotification::parse(jsonRpcMessage);
-                        handleNotification(notif);
-                        return ""; // Notifications don't get responses
-                    }
-
-                    // Parse as request
-                    auto request = JsonRpcRequest::parse(jsonRpcMessage);
-                    auto response = handleRequest(request);
-                    return response.serialize();
+                    body = json::parse(jsonRpcMessage);
                 }
                 catch (const json::parse_error& e)
                 {
-                    auto error = JsonRpcError::parseError(e.what());
-                    auto response = JsonRpcResponse::failure(nullptr, error);
-                    return response.serialize();
+                    return JsonRpcResponse::failure(nullptr, JsonRpcError::parseError(e.what())).serialize();
+                }
+
+                try
+                {
+                    if (body.is_array())
+                    {
+                        if (body.empty())
+                            return invalidRequestResponse(nullptr, "Empty batch").dump();
+                        json out = json::array();
+                        for (const auto& item : body)
+                        {
+                            auto outcome = processOne(item, nullptr);
+                            if (outcome.response)
+                                out.push_back(std::move(*outcome.response));
+                        }
+                        return out.empty() ? std::string() : out.dump();
+                    }
+
+                    InitOutcome init;
+                    auto outcome = processOne(body, &init);
+                    if (init.succeeded)
+                        storeClientCapabilities("", init.clientCaps);
+                    return outcome.response ? outcome.response->dump() : std::string();
                 }
                 catch (const std::exception& e)
                 {
-                    auto error = JsonRpcError::internalError(e.what());
-                    auto response = JsonRpcResponse::failure(nullptr, error);
-                    return response.serialize();
+                    return JsonRpcResponse::failure(nullptr, JsonRpcError::internalError(e.what())).serialize();
                 }
             }
 
@@ -450,7 +444,7 @@ namespace mcp
             };
 
             // ----------------------------------------------------------------
-            // Per-IP rate limiting (backport: token bucket)
+            // Per-client rate limiting (fixed one-minute window)
             // ----------------------------------------------------------------
             struct RateLimitEntry
             {
@@ -458,10 +452,33 @@ namespace mcp
                 std::chrono::steady_clock::time_point windowStart{std::chrono::steady_clock::now()};
             };
 
+            // Registered method: exactly one of the two handlers is set
+            struct MethodEntry
+            {
+                MethodHandler simple;
+                CancellableMethodHandler cancellable;
+            };
+
+            // Result of processing an initialize request. Each call carries its own
+            // client capabilities back to the transport (no shared staging state).
+            struct InitOutcome
+            {
+                bool succeeded = false;
+                json clientCaps;
+            };
+
+            // Result of processing one JSON-RPC message
+            struct MessageOutcome
+            {
+                std::optional<json> response;  // nullopt → notification, no response
+                bool invalid = false;          // message was rejected as -32600 Invalid Request
+            };
+
             ServerConfig m_config;
             HttpServer m_httpServer;
             SessionManager m_sessionManager;
-            std::map<std::string, MethodHandler> m_methods;
+            std::map<std::string, MethodEntry> m_methods;
+            mutable std::shared_mutex m_methodsMutex;
             std::atomic<bool> m_running{false};
 
             // SSE queues: sessionId → queue (push_event writes here, GET handler reads)
@@ -470,36 +487,195 @@ namespace mcp
 
             // Rate limiting
             std::map<std::string, RateLimitEntry> m_rateLimitMap;
+            std::chrono::steady_clock::time_point m_rateLimitLastPrune{std::chrono::steady_clock::now()};
             std::mutex m_rateLimitMutex;
 
-            // Cancellation tokens: requestId → cancel flag (set by notifications/cancelled)
+            // Cancellation tokens: JSON-RPC request id → cancel flag (set by notifications/cancelled)
             std::map<json, std::shared_ptr<std::atomic<bool>>> m_pendingCancellations;
             mutable std::mutex m_pendingMutex;
 
-            // Client capabilities per session (stored on initialize)
+            // Client capabilities per session (stored on initialize; "" = STDIO)
             std::map<std::string, json> m_clientCapabilities;
             mutable std::mutex m_clientCapsMutex;
-            json m_pendingClientCaps;  // temporary staging during initialize before session ID is known
 
-            // Current minimum log level for notifications/message (set by logging/setLevel)
-            std::string m_logLevel;
+            // Current minimum log level index for notifications/message (set by logging/setLevel)
+            std::atomic<int> m_minLogLevel{3};  // "warning"
 
             // ----------------------------------------------------------------
-            // SSRF / rate helpers
+            // Small helpers
             // ----------------------------------------------------------------
 
-            /// @brief Per-IP token-bucket check.  Returns false and sets 429 if limit exceeded.
-            bool checkRateLimit(const std::string& clientIp, HttpResponse& res)
+            /// @brief Index of an MCP log level (RFC 5424 order), or -1 if unknown.
+            static int logLevelIndex(const std::string& level)
+            {
+                static const char* const LEVELS[] = {
+                    "debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"
+                };
+                for (int i = 0; i < 8; ++i)
+                {
+                    if (level == LEVELS[i])
+                        return i;
+                }
+                return -1;
+            }
+
+            static bool iequals(const std::string& a, const std::string& b)
+            {
+                if (a.size() != b.size())
+                    return false;
+                for (size_t i = 0; i < a.size(); ++i)
+                {
+                    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                        std::tolower(static_cast<unsigned char>(b[i])))
+                        return false;
+                }
+                return true;
+            }
+
+            /// @brief Case-insensitive request header lookup (HTTP field names are
+            /// case-insensitive; the server may store them in a normalized form).
+            static const std::string* findHeader(const HttpRequest& req, const std::string& name)
+            {
+                auto it = req.headers.find(name);
+                if (it != req.headers.end())
+                    return &it->second;
+                for (const auto& kv : req.headers)
+                {
+                    if (iequals(kv.first, name))
+                        return &kv.second;
+                }
+                return nullptr;
+            }
+
+            static std::string headerValue(const HttpRequest& req, const std::string& name)
+            {
+                const std::string* v = findHeader(req, name);
+                return v ? *v : std::string();
+            }
+
+            /// @brief Compare secrets without an early exit on the first mismatch.
+            static bool constantTimeEquals(const std::string& a, const std::string& b)
+            {
+                const size_t n = (std::max)(a.size(), b.size());
+                size_t diff = a.size() ^ b.size();
+                for (size_t i = 0; i < n; ++i)
+                {
+                    unsigned char ca = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+                    unsigned char cb = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+                    diff |= static_cast<size_t>(ca ^ cb);
+                }
+                return diff == 0;
+            }
+
+            static json invalidRequestResponse(const JsonRpcId& id, const std::string& message)
+            {
+                return JsonRpcResponse::failure(id, JsonRpcError::invalidRequest(message)).toJson();
+            }
+
+            static void sendJson(HttpResponse& res, int status, const json& body)
+            {
+                res.set_status(status);
+                res.set_header("Content-Type", "application/json");
+                res.send(body.dump());
+            }
+
+            static bool isInitializeRequest(const json& msg)
+            {
+                if (!msg.is_object() || !msg.contains("id"))
+                    return false;
+                auto it = msg.find("method");
+                return it != msg.end() && it->is_string() && it->get<std::string>() == "initialize";
+            }
+
+            std::optional<MethodEntry> findMethod(const std::string& method) const
+            {
+                std::shared_lock<std::shared_mutex> lock(m_methodsMutex);
+                auto it = m_methods.find(method);
+                if (it == m_methods.end())
+                    return std::nullopt;
+                return it->second;
+            }
+
+            void storeClientCapabilities(const std::string& sessionId, const json& caps)
+            {
+                std::lock_guard<std::mutex> lock(m_clientCapsMutex);
+                m_clientCapabilities[sessionId] = caps;
+            }
+
+            /// @brief Drop all per-session state kept by the MCP layer (SSE queue, caps).
+            void dropSessionState(const std::string& sessionId)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
+                    auto it = m_sseQueues.find(sessionId);
+                    if (it != m_sseQueues.end())
+                    {
+                        it->second->closed.store(true);
+                        it->second->cv.notify_all();
+                        m_sseQueues.erase(it);
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_clientCapsMutex);
+                    m_clientCapabilities.erase(sessionId);
+                }
+            }
+
+            /// @brief Rate-limit key for a request: the TCP peer address, or — only when
+            /// ServerConfig::trustProxyHeaders is set — the last X-Forwarded-For hop.
+            std::string clientKey(const HttpRequest& req) const
+            {
+                if (m_config.trustProxyHeaders)
+                {
+                    std::string xff = headerValue(req, "X-Forwarded-For");
+                    auto comma = xff.rfind(',');
+                    std::string last = comma == std::string::npos ? xff : xff.substr(comma + 1);
+                    auto b = last.find_first_not_of(" \t");
+                    auto e = last.find_last_not_of(" \t");
+                    if (b != std::string::npos)
+                        return last.substr(b, e - b + 1);
+                }
+
+                // req.client is "a.b.c.d:port" or "[v6]:port" — strip the port
+                const std::string& c = req.client;
+                if (c.empty())
+                    return "unknown";
+                if (c[0] == '[')
+                {
+                    auto close = c.find(']');
+                    return close == std::string::npos ? c : c.substr(1, close - 1);
+                }
+                auto colon = c.rfind(':');
+                if (colon != std::string::npos && c.find(':') == colon)
+                    return c.substr(0, colon);
+                return c;
+            }
+
+            /// @brief Per-client window check.  Returns false and sets 429 if limit exceeded.
+            bool checkRateLimit(const HttpRequest& req, HttpResponse& res)
             {
                 if (m_config.maxRequestsPerMinute <= 0)
                     return true; // rate limiting disabled
 
+                const std::string key = clientKey(req);
                 auto now = std::chrono::steady_clock::now();
                 std::lock_guard<std::mutex> lock(m_rateLimitMutex);
-                auto& entry = m_rateLimitMap[clientIp];
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    now - entry.windowStart).count();
-                if (elapsed >= 60)
+
+                // Prune expired windows at most once a minute so the map cannot grow unbounded
+                if (now - m_rateLimitLastPrune >= std::chrono::seconds(60))
+                {
+                    for (auto it = m_rateLimitMap.begin(); it != m_rateLimitMap.end(); )
+                    {
+                        if (now - it->second.windowStart >= std::chrono::seconds(60))
+                            it = m_rateLimitMap.erase(it);
+                        else
+                            ++it;
+                    }
+                    m_rateLimitLastPrune = now;
+                }
+
+                auto& entry = m_rateLimitMap[key];
+                if (now - entry.windowStart >= std::chrono::seconds(60))
                 {
                     entry.count = 0;
                     entry.windowStart = now;
@@ -514,6 +690,52 @@ namespace mcp
                 return true;
             }
 
+            /// @brief Validate the session id of a non-initialize request.
+            /// @param required  true → a missing header is rejected with HTTP 400
+            ///                  (Streamable HTTP, MCP 2025-03-26)
+            /// @return false if a response has been sent
+            bool checkSession(const HttpRequest& req, HttpResponse& res, bool required)
+            {
+                if (!m_config.session.enabled)
+                    return true;
+
+                std::string sessionId = getSessionId(req);
+                if (sessionId.empty())
+                {
+                    if (!required)
+                        return true;
+                    sendJson(res, 400, invalidRequestResponse(nullptr,
+                        "Missing " + m_config.session.headerName + " header"));
+                    return false;
+                }
+                if (!m_sessionManager.validateSession(sessionId))
+                {
+                    dropSessionState(sessionId);
+                    auto error = JsonRpcError::serverError(-32001, "Invalid or expired session");
+                    sendJson(res, 404, JsonRpcResponse::failure(nullptr, error).toJson());
+                    return false;
+                }
+                return true;
+            }
+
+            /// @brief Create a session for a successful initialize and attach its id
+            /// to the response. Returns the new session id ("" if none was created).
+            std::string commitInitialize(const InitOutcome& init, HttpResponse& res, bool createQueue)
+            {
+                if (!init.succeeded || !m_config.session.enabled)
+                    return "";
+                std::string sessionId = m_sessionManager.createSession();
+                if (createQueue)
+                {
+                    // Pre-create SSE queue so events pushed before the GET stream opens are kept
+                    std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
+                    m_sseQueues[sessionId] = std::make_shared<SSESessionQueue>();
+                }
+                storeClientCapabilities(sessionId, init.clientCaps);
+                res.set_header(m_config.session.headerName, sessionId);
+                return sessionId;
+            }
+
             // ── MCP Streamable HTTP transport (2025-03-26) ────────────────────────────
             //
             // Unified POST endpoint:
@@ -524,6 +746,8 @@ namespace mcp
             //   - Otherwise → server responds with application/json (single) or
             //     application/json array (batch)
             //   - Notifications (no id) → 202 Accepted, empty body
+            //   - Every request except initialize must carry Mcp-Session-Id once
+            //     sessions are enabled (missing → 400, unknown/expired → 404)
             //
             // Optional GET endpoint (same URL):
             //   - Opens a long-lived SSE notification stream for server-initiated messages
@@ -551,7 +775,7 @@ namespace mcp
                     }
                     else if (req.method == "OPTIONS")
                     {
-                        handleHttpOptions(req, res);
+                        handleHttpOptions(res);
                     }
                     else
                     {
@@ -562,7 +786,12 @@ namespace mcp
                     return 0;
                 });
 
-                // GET / → health / discovery JSON (also used by nginx upstream health checks)
+                setupHealthRoute();
+            }
+
+            /// @brief GET /health → health / discovery JSON (nginx upstream health checks)
+            void setupHealthRoute()
+            {
                 m_httpServer.route("/health", [this](const HttpRequest& req, HttpResponse& res) -> int {
                     if (req.method == "GET")
                     {
@@ -593,24 +822,15 @@ namespace mcp
             {
                 applyCorsHeaders(res);
 
-                // Rate limit
-                std::string clientIp = req.headers.count("X-Forwarded-For")
-                    ? req.headers.at("X-Forwarded-For") : "unknown";
-                if (!checkRateLimit(clientIp, res)) return;
-
-                // Authenticate
+                if (!checkRateLimit(req, res)) return;
                 if (!authenticate(req, res)) return;
 
                 // Negotiate response format
-                bool wantsSSE = false;
-                {
-                    auto it = req.headers.find("Accept");
-                    if (it != req.headers.end())
-                        wantsSSE = it->second.find("text/event-stream") != std::string::npos;
-                }
+                const bool wantsSSE =
+                    headerValue(req, "Accept").find("text/event-stream") != std::string::npos;
 
-                // Helper: send a set of serialised responses either as SSE or JSON
-                auto sendResponses = [&](const std::vector<std::string>& resps)
+                // Helper: send a set of responses either as SSE or JSON
+                auto sendResponses = [&](const std::vector<json>& resps, bool isBatch)
                 {
                     if (resps.empty())
                     {
@@ -625,142 +845,84 @@ namespace mcp
                         res.set_header("Cache-Control", "no-cache");
                         std::string body;
                         for (auto& r : resps)
-                            body += "data: " + r + "\n\n";
+                            body += "data: " + r.dump() + "\n\n";
                         res.send(body);
                     }
-                    else if (resps.size() == 1)
+                    else if (!isBatch)
                     {
-                        res.set_status(200);
-                        res.set_header("Content-Type", "application/json");
-                        res.send(resps[0]);
+                        sendJson(res, 200, resps[0]);
                     }
                     else
                     {
-                        // Batch: return JSON array
-                        std::string arr = "[";
-                        for (size_t i = 0; i < resps.size(); ++i)
-                        {
-                            if (i) arr += ",";
-                            arr += resps[i];
-                        }
-                        arr += "]";
-                        res.set_status(200);
-                        res.set_header("Content-Type", "application/json");
-                        res.send(arr);
+                        sendJson(res, 200, json(resps));
                     }
                 };
 
+                json body;
                 try
                 {
-                    json body = json::parse(req.content);
-                    bool isBatch = body.is_array();
-
-                    if (!isBatch)
-                    {
-                        // Notification (no id) → 202, no response body
-                        if (!body.contains("id"))
-                        {
-                            auto notif = JsonRpcNotification::parse(req.content);
-                            handleNotification(notif);
-                            res.set_status(202);
-                            res.send("");
-                            return;
-                        }
-
-                        // initialize → create session, echo session header
-                        if (body.value("method", "") == "initialize")
-                        {
-                            std::string sessionId = m_sessionManager.createSession();
-                            // Pre-create SSE queue so the session's GET stream works immediately
-                            {
-                                std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
-                                m_sseQueues[sessionId] = std::make_shared<SSESessionQueue>();
-                            }
-                            res.set_header(m_config.session.headerName, sessionId);
-
-                            auto request  = JsonRpcRequest::parse(req.content);
-                            auto response = handleRequest(request);
-
-                            // Commit pending client capabilities to this session
-                            {
-                                std::lock_guard<std::mutex> lock(m_clientCapsMutex);
-                                if (!m_pendingClientCaps.is_null())
-                                {
-                                    m_clientCapabilities[sessionId] = m_pendingClientCaps;
-                                    m_pendingClientCaps = json{};
-                                }
-                            }
-
-                            sendResponses({response.serialize()});
-                            return;
-                        }
-
-                        // All other requests: validate session (optional but recommended)
-                        std::string sessionId = getSessionId(req);
-                        if (!sessionId.empty() && !m_sessionManager.validateSession(sessionId))
-                        {
-                            auto error    = JsonRpcError::serverError(-32001, "Invalid or expired session");
-                            auto response = JsonRpcResponse::failure(nullptr, error);
-                            res.set_status(404);
-                            res.set_header("Content-Type", "application/json");
-                            res.send(response.serialize());
-                            return;
-                        }
-
-                        auto request  = JsonRpcRequest::parse(req.content);
-                        auto response = handleRequest(request);
-                        sendResponses({response.serialize()});
-                    }
-                    else
-                    {
-                        // Batch: validate session for the whole batch
-                        std::string sessionId = getSessionId(req);
-                        if (!sessionId.empty() && !m_sessionManager.validateSession(sessionId))
-                        {
-                            auto error    = JsonRpcError::serverError(-32001, "Invalid or expired session");
-                            auto response = JsonRpcResponse::failure(nullptr, error);
-                            res.set_status(404);
-                            res.set_header("Content-Type", "application/json");
-                            res.send(response.serialize());
-                            return;
-                        }
-
-                        std::vector<std::string> serialised;
-                        for (auto& item : body)
-                        {
-                            if (!item.contains("id"))
-                            {
-                                // Notification within batch — handle, no response
-                                try
-                                {
-                                    auto notif = JsonRpcNotification::parse(item.dump());
-                                    handleNotification(notif);
-                                }
-                                catch (...) {}
-                                continue;
-                            }
-                            auto request  = JsonRpcRequest::parse(item.dump());
-                            auto response = handleRequest(request);
-                            serialised.push_back(response.serialize());
-                        }
-                        sendResponses(serialised);
-                    }
+                    body = json::parse(req.content);
                 }
                 catch (const json::parse_error& e)
                 {
-                    auto error    = JsonRpcError::parseError(e.what());
-                    auto response = JsonRpcResponse::failure(nullptr, error);
-                    res.set_status(400);
-                    res.set_header("Content-Type", "application/json");
-                    res.send(response.serialize());
+                    sendJson(res, 400, JsonRpcResponse::failure(nullptr,
+                        JsonRpcError::parseError(e.what())).toJson());
+                    return;
+                }
+
+                try
+                {
+                    if (body.is_array())
+                    {
+                        if (body.empty())
+                        {
+                            sendJson(res, 400, invalidRequestResponse(nullptr, "Empty batch"));
+                            return;
+                        }
+                        if (!checkSession(req, res, true)) return;
+
+                        std::vector<json> responses;
+                        for (const auto& item : body)
+                        {
+                            auto outcome = processOne(item, nullptr);
+                            if (outcome.response)
+                                responses.push_back(std::move(*outcome.response));
+                        }
+                        sendResponses(responses, true);
+                        return;
+                    }
+
+                    if (!body.is_object())
+                    {
+                        sendJson(res, 400, invalidRequestResponse(nullptr,
+                            "Request must be a JSON object or array"));
+                        return;
+                    }
+
+                    const bool isInit = isInitializeRequest(body);
+                    if (!isInit && !checkSession(req, res, true)) return;
+
+                    InitOutcome init;
+                    auto outcome = processOne(body, isInit ? &init : nullptr);
+                    if (!outcome.response)
+                    {
+                        res.set_status(202);
+                        res.send("");
+                        return;
+                    }
+                    if (outcome.invalid)
+                    {
+                        sendJson(res, 400, *outcome.response);
+                        return;
+                    }
+                    // The session exists only once initialize has succeeded
+                    commitInitialize(init, res, true);
+                    sendResponses({*outcome.response}, false);
                 }
                 catch (const std::exception& e)
                 {
-                    auto error    = JsonRpcError::internalError(e.what());
-                    auto response = JsonRpcResponse::failure(nullptr, error);
-                    res.set_status(500);
-                    res.set_header("Content-Type", "application/json");
-                    res.send(response.serialize());
+                    sendJson(res, 500, JsonRpcResponse::failure(nullptr,
+                        JsonRpcError::internalError(e.what())).toJson());
                 }
             }
 
@@ -769,22 +931,7 @@ namespace mcp
             {
                 std::string endpoint = m_config.endpoint;
 
-                // GET / → health / discovery JSON (nginx upstream health checks)
-                m_httpServer.route("/health", [this](const HttpRequest& req, HttpResponse& res) -> int {
-                    if (req.method == "GET")
-                    {
-                        applyCorsHeaders(res);
-                        res.set_status(200);
-                        res.set_header("Content-Type", "application/json");
-                        res.send(server_info().dump());
-                    }
-                    else
-                    {
-                        res.set_status(405);
-                        res.send("");
-                    }
-                    return 0;
-                });
+                setupHealthRoute();
 
                 // POST: Handle JSON-RPC requests
                 m_httpServer.route(endpoint, [this](const HttpRequest& req, HttpResponse& res) -> int {
@@ -802,7 +949,7 @@ namespace mcp
                     }
                     else if (req.method == "OPTIONS")
                     {
-                        handleHttpOptions(req, res);
+                        handleHttpOptions(res);
                     }
                     else
                     {
@@ -814,197 +961,167 @@ namespace mcp
                 });
             }
 
-            /// @brief Handle HTTP POST request (JSON-RPC)
+            /// @brief Handle HTTP POST request (JSON-RPC, HTTP+SSE transport).
+            /// The session header is optional here (validated only when present).
             void handleHttpPost(const HttpRequest& req, HttpResponse& res)
             {
-                // Apply CORS headers
                 applyCorsHeaders(res);
 
-                // Rate limit
-                std::string clientIp = req.headers.count("X-Forwarded-For")
-                    ? req.headers.at("X-Forwarded-For") : "unknown";
-                if (!checkRateLimit(clientIp, res))
-                    return;
-
-                // Authenticate if required
-                if (!authenticate(req, res))
-                {
-                    return;
-                }
+                if (!checkRateLimit(req, res)) return;
+                if (!authenticate(req, res)) return;
 
                 // Check Content-Type
-                auto contentType = req.headers.find("Content-Type");
-                if (contentType == req.headers.end() || contentType->second.find("application/json") == std::string::npos)
+                if (headerValue(req, "Content-Type").find("application/json") == std::string::npos)
                 {
-                    auto error = JsonRpcError::invalidRequest("Content-Type must be application/json");
-                    auto response = JsonRpcResponse::failure(nullptr, error);
-                    res.set_status(400);
-                    res.set_header("Content-Type", "application/json");
-                    res.send(response.serialize());
+                    sendJson(res, 400, invalidRequestResponse(nullptr,
+                        "Content-Type must be application/json"));
                     return;
                 }
 
-                // Parse and handle request
+                json body;
                 try
                 {
-                    // Pre-parse JSON to check if this is a notification (no "id")
-                    json j = json::parse(req.content);
-                    if (!j.contains("id"))
+                    body = json::parse(req.content);
+                }
+                catch (const json::parse_error& e)
+                {
+                    sendJson(res, 400, JsonRpcResponse::failure(nullptr,
+                        JsonRpcError::parseError(e.what())).toJson());
+                    return;
+                }
+
+                try
+                {
+                    if (body.is_array())
                     {
-                        // JSON-RPC notification — handle it and respond 202 Accepted (no body)
-                        auto notif = JsonRpcNotification::parse(req.content);
-                        handleNotification(notif);
+                        if (body.empty())
+                        {
+                            sendJson(res, 400, invalidRequestResponse(nullptr, "Empty batch"));
+                            return;
+                        }
+                        if (!checkSession(req, res, false)) return;
+
+                        json responses = json::array();
+                        for (const auto& item : body)
+                        {
+                            auto outcome = processOne(item, nullptr);
+                            if (outcome.response)
+                                responses.push_back(std::move(*outcome.response));
+                        }
+                        if (responses.empty())
+                        {
+                            res.set_status(202);
+                            res.send("");
+                            return;
+                        }
+                        sendJson(res, 200, responses);
+                        return;
+                    }
+
+                    if (!body.is_object())
+                    {
+                        sendJson(res, 400, invalidRequestResponse(nullptr,
+                            "Request must be a JSON object or array"));
+                        return;
+                    }
+
+                    const bool isInit = isInitializeRequest(body);
+                    if (!isInit && !checkSession(req, res, false)) return;
+
+                    InitOutcome init;
+                    auto outcome = processOne(body, isInit ? &init : nullptr);
+                    if (!outcome.response)
+                    {
+                        // JSON-RPC notification — 202 Accepted (no body)
                         res.set_status(202);
                         res.send("");
                         return;
                     }
-
-                    auto request = JsonRpcRequest::parse(req.content);
-                    
-                    // Special handling for initialize - create session
-                    if (request.method == "initialize")
+                    if (outcome.invalid)
                     {
-                        std::string sessionId = m_sessionManager.createSession();
-                        auto response = handleRequest(request);
-
-                        // Commit pending client capabilities to this session
-                        {
-                            std::lock_guard<std::mutex> lock(m_clientCapsMutex);
-                            if (!m_pendingClientCaps.is_null())
-                            {
-                                m_clientCapabilities[sessionId] = m_pendingClientCaps;
-                                m_pendingClientCaps = json{};
-                            }
-                        }
-                        
-                        res.set_header(m_config.session.headerName, sessionId);
-                        
-                        // Check if client wants SSE stream or batch response
-                        auto acceptHeader = req.headers.find("Accept");
-                        bool wantsSSE = (acceptHeader != req.headers.end() && 
-                                        acceptHeader->second.find("text/event-stream") != std::string::npos);
-
-                        if (wantsSSE && m_config.responseMode == ServerConfig::ResponseMode::STREAM)
-                        {
-                            // Send response via SSE
-                            res.set_header("Content-Type", "text/event-stream");
-                            res.set_header("Cache-Control", "no-cache");
-                            res.set_header("Connection", "keep-alive");
-                            
-                            SSEEvent event;
-                            event.id = "init-1";
-                            event.data = response.serialize();
-                            
-                            if (m_config.resumability.enabled)
-                            {
-                                m_sessionManager.addEvent(sessionId, event.id, event.format());
-                            }
-                            
-                            res.send_chunk(event.format());
-                            res.send_chunk(""); // End stream
-                        }
-                        else
-                        {
-                            // Send JSON response
-                            res.set_status(200);
-                            res.set_header("Content-Type", "application/json");
-                            res.send(response.serialize());
-                        }
+                        sendJson(res, 400, *outcome.response);
+                        return;
                     }
-                    else
+
+                    std::string sessionId = commitInitialize(init, res, false);
+
+                    const bool wantsSSE =
+                        headerValue(req, "Accept").find("text/event-stream") != std::string::npos;
+                    if (isInit && wantsSSE && m_config.responseMode == ServerConfig::ResponseMode::STREAM)
                     {
-                        // Validate session for non-initialize requests
-                        std::string sessionId = getSessionId(req);
-                        if (!sessionId.empty() && !m_sessionManager.validateSession(sessionId))
+                        // Send response via SSE
+                        res.set_header("Content-Type", "text/event-stream");
+                        res.set_header("Cache-Control", "no-cache");
+                        res.set_header("Connection", "keep-alive");
+
+                        SSEEvent event;
+                        event.id = "init-1";
+                        event.data = outcome.response->dump();
+
+                        if (m_config.resumability.enabled && !sessionId.empty())
                         {
-                            auto error = JsonRpcError::serverError(-32001, "Invalid or expired session");
-                            auto response = JsonRpcResponse::failure(request.id, error);
-                            res.set_status(404);
-                            res.set_header("Content-Type", "application/json");
-                            res.send(response.serialize());
-                            return;
+                            m_sessionManager.addEvent(sessionId, event.id, event.format());
                         }
 
-                        auto response = handleRequest(request);
-                        res.set_status(200);
-                        res.set_header("Content-Type", "application/json");
-                        res.send(response.serialize());
+                        res.send_chunk(event.format());
+                        res.send_chunk(""); // End stream
+                        return;
                     }
-                }
-                catch (const json::parse_error& e)
-                {
-                    auto error = JsonRpcError::parseError(e.what());
-                    auto response = JsonRpcResponse::failure(nullptr, error);
-                    res.set_status(400);
-                    res.set_header("Content-Type", "application/json");
-                    res.send(response.serialize());
+
+                    sendJson(res, 200, *outcome.response);
                 }
                 catch (const std::exception& e)
                 {
-                    auto error = JsonRpcError::internalError(e.what());
-                    auto response = JsonRpcResponse::failure(nullptr, error);
-                    res.set_status(500);
-                    res.set_header("Content-Type", "application/json");
-                    res.send(response.serialize());
+                    sendJson(res, 500, JsonRpcResponse::failure(nullptr,
+                        JsonRpcError::internalError(e.what())).toJson());
                 }
             }
 
             /// @brief Handle HTTP GET request — real SSE push stream (backport from FMcpNativeTransport)
             ///
-            /// Creates a per-session blocking event queue shared with push_event().
+            /// Uses the per-session blocking event queue shared with push_event().
             /// The send_chunk_stream callback blocks on the queue (up to writeDeadlineSeconds),
             /// returning "" to terminate the stream if the session is closed or idle too long.
             void handleHttpGet(const HttpRequest& req, HttpResponse& res)
             {
-                // Apply CORS headers
                 applyCorsHeaders(res);
 
-                // Authenticate if required
-                if (!authenticate(req, res))
-                {
-                    return;
-                }
-
-                // Rate limit by client IP (best-effort: use peer address if available)
-                std::string clientIp = req.headers.count("X-Forwarded-For")
-                    ? req.headers.at("X-Forwarded-For") : "unknown";
-                if (!checkRateLimit(clientIp, res))
-                    return;
+                if (!authenticate(req, res)) return;
+                if (!checkRateLimit(req, res)) return;
 
                 // Get session ID: prefer Mcp-Session-Id header (2025-03-26 spec),
                 // fall back to ?session= query param for compatibility.
-                std::string sessionId;
-                auto sessionHeaderIt = req.headers.find("Mcp-Session-Id");
-                if (sessionHeaderIt != req.headers.end())
+                std::string sessionId = getSessionId(req);
+                if (sessionId.empty())
                 {
-                    sessionId = sessionHeaderIt->second;
-                }
-                else
-                {
-                    auto params = req.parse_query();
+                    std::map<std::string, std::string> params;
+                    try
+                    {
+                        params = req.parse_query();
+                    }
+                    catch (const std::exception&)
+                    {
+                        // malformed query → treated as missing session
+                    }
                     auto sessionIt = params.find("session");
-                    if (sessionIt == params.end())
+                    if (sessionIt == params.end() || sessionIt->second.empty())
                     {
                         res.set_status(400);
-                        res.send("Missing Mcp-Session-Id header");
+                        res.send("Missing " + m_config.session.headerName + " header");
                         return;
                     }
                     sessionId = sessionIt->second;
                 }
                 if (!m_sessionManager.validateSession(sessionId))
                 {
+                    dropSessionState(sessionId);
                     res.set_status(404);
                     res.send("Invalid or expired session");
                     return;
                 }
 
                 // Check for Last-Event-ID (resumability)
-                std::string lastEventId;
-                auto lastEventIdHeader = req.headers.find("Last-Event-Id");
-                if (lastEventIdHeader != req.headers.end())
-                {
-                    lastEventId = lastEventIdHeader->second;
-                }
+                std::string lastEventId = headerValue(req, "Last-Event-ID");
 
                 // Setup SSE stream headers
                 res.set_status(200);
@@ -1013,16 +1130,24 @@ namespace mcp
                 res.set_header("Connection", "keep-alive");
                 res.set_header(m_config.session.headerName, sessionId);
 
-                // Create or replace per-session queue
+                // Install a fresh queue for this stream. Events already queued for the
+                // session (e.g. pushed between initialize and this GET) are carried over,
+                // and any previous stream for the session is told to close.
                 auto queue = std::make_shared<SSESessionQueue>();
                 {
                     std::lock_guard<std::mutex> lock(m_sseQueuesMutex);
-                    // Close any pre-existing stream for this session
                     auto existing = m_sseQueues.find(sessionId);
                     if (existing != m_sseQueues.end())
                     {
-                        existing->second->closed.store(true);
-                        existing->second->cv.notify_all();
+                        auto& old = existing->second;
+                        std::lock_guard<std::mutex> qlock(old->mutex);
+                        while (!old->events.empty())
+                        {
+                            queue->events.push(std::move(old->events.front()));
+                            old->events.pop();
+                        }
+                        old->closed.store(true);
+                        old->cv.notify_all();
                     }
                     m_sseQueues[sessionId] = queue;
                 }
@@ -1046,11 +1171,8 @@ namespace mcp
                 // send_chunk_stream callback — called by HTTP server for each chunk.
                 // Returns "" to signal end-of-stream.
                 //
-                // IMPORTANT: this callback runs on the reactor's single I/O thread.
-                // We must not block for more than ~200 ms or other connections (e.g.
-                // tools/list) cannot be accepted/processed while the SSE stream is open.
                 // We use a short poll interval and send a minimal SSE comment each time
-                // so the reactor yields between keepalive cycles.
+                // so the executing thread yields between keepalive cycles.
                 auto weakQueue = std::weak_ptr<SSESessionQueue>(queue);
                 auto lastKeepalive = std::make_shared<std::chrono::steady_clock::time_point>(
                     std::chrono::steady_clock::now());
@@ -1061,7 +1183,7 @@ namespace mcp
                         return ""; // queue destroyed — close stream
 
                     std::unique_lock<std::mutex> lock(q->mutex);
-                    // Short poll so the reactor thread is never blocked > 200 ms.
+                    // Short poll so the thread is never blocked > 200 ms.
                     bool signalled = q->cv.wait_for(
                         lock,
                         std::chrono::milliseconds(200),
@@ -1072,10 +1194,6 @@ namespace mcp
 
                     if (!signalled)
                     {
-                        // No event arrived within 200 ms.  Only send an SSE keepalive
-                        // comment when writeDeadlineSeconds have elapsed so we don't
-                        // flood clients; otherwise return a silent SSE comment that
-                        // every compliant client ignores (line starting with ':').
                         auto now = std::chrono::steady_clock::now();
                         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                             now - *lastKeepalive).count();
@@ -1085,7 +1203,7 @@ namespace mcp
                             q->lastActivity = now;
                             return ": keepalive\n\n";
                         }
-                        return ": \n\n"; // silent SSE comment — reactor yields, client ignores
+                        return ": \n\n"; // silent SSE comment — client ignores
                     }
 
                     // Dequeue next event
@@ -1099,12 +1217,13 @@ namespace mcp
             /// @brief Handle HTTP DELETE request (terminate session)
             void handleHttpDelete(const HttpRequest& req, HttpResponse& res)
             {
-                // Apply CORS headers
                 applyCorsHeaders(res);
+
+                if (!authenticate(req, res)) return;
 
                 if (!m_config.session.allowClientTermination)
                 {
-                    res.set_status(403);
+                    res.set_status(405);
                     res.send("Client session termination not allowed");
                     return;
                 }
@@ -1117,7 +1236,9 @@ namespace mcp
                     return;
                 }
 
-                if (m_sessionManager.terminateSession(sessionId))
+                const bool existed = m_sessionManager.terminateSession(sessionId);
+                dropSessionState(sessionId);
+                if (existed)
                 {
                     res.set_status(204); // No Content
                     res.send("");
@@ -1130,7 +1251,7 @@ namespace mcp
             }
 
             /// @brief Handle HTTP OPTIONS request (CORS preflight)
-            void handleHttpOptions(const HttpRequest& req, HttpResponse& res)
+            void handleHttpOptions(HttpResponse& res)
             {
                 applyCorsHeaders(res);
                 res.set_status(204);
@@ -1149,6 +1270,8 @@ namespace mcp
 
             /// @brief Authenticate request.
             /// Supports Bearer, API_KEY, and CAPABILITY_TOKEN (X-MCP-Capability-Token header).
+            /// Header names are matched case-insensitively. Fails closed: when auth is
+            /// enabled but no validator/secret is configured, requests get 500.
             /// @return true if authenticated or auth not required, false otherwise
             bool authenticate(const HttpRequest& req, HttpResponse& res)
             {
@@ -1158,19 +1281,33 @@ namespace mcp
                 }
 
                 // Capability token check (backport from FMcpNativeTransport).
-                // When a capability token is configured, check X-MCP-Capability-Token first.
                 if (m_config.auth.type == ServerConfig::AuthConfig::Type::CAPABILITY_TOKEN)
                 {
-                    auto capIt = req.headers.find("X-MCP-Capability-Token");
-                    if (capIt == req.headers.end() || capIt->second.empty())
+                    const std::string* cap = findHeader(req, "X-MCP-Capability-Token");
+                    if (cap == nullptr || cap->empty())
                     {
                         res.set_status(401);
                         res.set_header("WWW-Authenticate", "MCP-Capability-Token");
                         res.send("X-MCP-Capability-Token required");
                         return false;
                     }
-                    if (m_config.auth.secretOrPublicKey.has_value() &&
-                        capIt->second != m_config.auth.secretOrPublicKey.value())
+                    bool ok = false;
+                    if (m_config.auth.validator)
+                    {
+                        ok = m_config.auth.validator(*cap);
+                    }
+                    else if (m_config.auth.secretOrPublicKey.has_value() &&
+                             !m_config.auth.secretOrPublicKey->empty())
+                    {
+                        ok = constantTimeEquals(*cap, *m_config.auth.secretOrPublicKey);
+                    }
+                    else
+                    {
+                        res.set_status(500);
+                        res.send("Server authentication misconfigured");
+                        return false;
+                    }
+                    if (!ok)
                     {
                         res.set_status(401);
                         res.send("Invalid capability token");
@@ -1179,8 +1316,8 @@ namespace mcp
                     return true;
                 }
 
-                auto authHeader = req.headers.find(m_config.auth.headerName);
-                if (authHeader == req.headers.end())
+                const std::string* authHeader = findHeader(req, m_config.auth.headerName);
+                if (authHeader == nullptr)
                 {
                     res.set_status(401);
                     res.set_header("WWW-Authenticate", "Bearer");
@@ -1188,12 +1325,12 @@ namespace mcp
                     return false;
                 }
 
-                std::string token = authHeader->second;
+                std::string token = *authHeader;
 
-                // Strip "Bearer " prefix if present
+                // Strip "Bearer " prefix if present (auth scheme is case-insensitive)
                 if (m_config.auth.type == ServerConfig::AuthConfig::Type::BEARER)
                 {
-                    if (token.find("Bearer ") == 0)
+                    if (token.size() >= 7 && iequals(token.substr(0, 7), "Bearer "))
                     {
                         token = token.substr(7);
                     }
@@ -1213,7 +1350,7 @@ namespace mcp
 
 #ifdef SOCKETSHPP_HAS_JWT_CPP
                 // JWT validation if secret provided and no custom validator
-                if (m_config.auth.type == ServerConfig::AuthConfig::Type::BEARER && 
+                if (m_config.auth.type == ServerConfig::AuthConfig::Type::BEARER &&
                     m_config.auth.secretOrPublicKey.has_value())
                 {
                     try
@@ -1233,11 +1370,12 @@ namespace mcp
                 }
 #endif
 
-                // Simple secret comparison for API key type
+                // Secret comparison for API key type
                 if (m_config.auth.type == ServerConfig::AuthConfig::Type::API_KEY &&
-                    m_config.auth.secretOrPublicKey.has_value())
+                    m_config.auth.secretOrPublicKey.has_value() &&
+                    !m_config.auth.secretOrPublicKey->empty())
                 {
-                    if (token != m_config.auth.secretOrPublicKey.value())
+                    if (!constantTimeEquals(token, m_config.auth.secretOrPublicKey.value()))
                     {
                         res.set_status(401);
                         res.send("Invalid API key");
@@ -1252,124 +1390,215 @@ namespace mcp
                 return false;
             }
 
-            /// @brief Get session ID from request headers
-            std::string getSessionId(const HttpRequest& req)
+            /// @brief Get session ID from request headers (case-insensitive)
+            std::string getSessionId(const HttpRequest& req) const
             {
-                auto it = req.headers.find(m_config.session.headerName);
-                if (it != req.headers.end())
-                {
-                    return it->second;
-                }
-                return "";
+                return headerValue(req, m_config.session.headerName);
             }
 
-            /// @brief Handle JSON-RPC request
-            JsonRpcResponse handleRequest(const JsonRpcRequest& request)
+            /// @brief Validate and dispatch one JSON-RPC message.
+            /// @param init  non-null only where an initialize request is allowed
+            ///              (a single, non-batched message); receives its outcome.
+            MessageOutcome processOne(const json& msg, InitOutcome* init)
             {
-                // ── Protocol version negotiation for initialize ─────────────────────────
-                // Per MCP spec: server responds with the highest supported version that is
-                // ≤ the client's requested version.  If no common version → -32002 error.
-                if (request.method == "initialize")
+                MessageOutcome out;
+                auto invalid = [&out](const JsonRpcId& id, const std::string& why) {
+                    out.response = invalidRequestResponse(id, why);
+                    out.invalid = true;
+                    return out;
+                };
+
+                if (!msg.is_object())
+                    return invalid(nullptr, "Request must be a JSON object");
+
+                JsonRpcId id;  // monostate → notification
+                auto idIt = msg.find("id");
+                if (idIt != msg.end() && !jsonRpcIdFromJson(*idIt, id))
+                    return invalid(nullptr, "Invalid id: must be a string, integer or null");
+
+                // Invalid messages without a usable id are answered with id null
+                const JsonRpcId replyId = jsonRpcIdPresent(id) ? id : JsonRpcId{nullptr};
+
+                auto verIt = msg.find("jsonrpc");
+                if (verIt != msg.end() && !(verIt->is_string() && verIt->get<std::string>() == "2.0"))
+                    return invalid(replyId, "jsonrpc must be \"2.0\"");
+
+                auto methodIt = msg.find("method");
+                if (methodIt == msg.end() || !methodIt->is_string())
+                    return invalid(replyId, "Missing or invalid method");
+                const std::string method = methodIt->get<std::string>();
+
+                json params = json::object();
+                auto paramsIt = msg.find("params");
+                if (paramsIt != msg.end())
                 {
-                    json params = request.params.value_or(json::object());
-                    std::string client_ver = params.value("protocolVersion", "");
-
-                    std::string negotiated;
-                    for (auto& v : SUPPORTED_VERSIONS)
-                    {
-                        if (v <= client_ver || client_ver.empty()) { negotiated = v; break; }
-                    }
-                    if (negotiated.empty())
-                    {
-                        auto error = JsonRpcError::serverError(-32002,
-                            "Unsupported protocol version: " + client_ver +
-                            ". Supported: 2025-03-26, 2024-11-05");
-                        return JsonRpcResponse::failure(request.id, error);
-                    }
-
-                    // Store client capabilities for this session (session is set in outer handler)
-                    // We stash them under a per-request key; the caller sets the real session header.
-                    json caps = params.value("capabilities", json::object());
-                    // Stored keyed by clientInfo.name+version as a best-effort before session is known.
-                    // The full session storage happens in setupStreamableRoutes/setupHttpRoutes
-                    // where the sessionId is available.  See m_pendingClientCaps below.
-                    {
-                        std::lock_guard<std::mutex> lock(m_clientCapsMutex);
-                        m_pendingClientCaps = caps;
-                    }
-
-                    // Delegate to user's initialize handler if registered, otherwise use built-in
-                    auto it = m_methods.find("initialize");
-                    if (it != m_methods.end())
-                    {
-                        try {
-                            json result = it->second(params);
-                            // Patch protocolVersion to the negotiated value
-                            result["protocolVersion"] = negotiated;
-                            return JsonRpcResponse::success(request.id, result);
-                        }
-                        catch (const JsonRpcError& err) { return JsonRpcResponse::failure(request.id, err); }
-                        catch (const std::exception& e) {
-                            return JsonRpcResponse::failure(request.id, JsonRpcError::internalError(e.what()));
-                        }
-                    }
-                    // No user handler: return a minimal valid initialize response
-                    return JsonRpcResponse::success(request.id, {
-                        {"protocolVersion", negotiated},
-                        {"capabilities",    json::object()},
-                        {"serverInfo",      server_info()}
-                    });
+                    if (!paramsIt->is_object() && !paramsIt->is_array())
+                        return invalid(replyId, "params must be an object or array");
+                    params = *paramsIt;
                 }
 
-                // Find method handler
-                auto it = m_methods.find(request.method);
-                if (it == m_methods.end())
+                if (!jsonRpcIdPresent(id))
                 {
-                    auto error = JsonRpcError::methodNotFound(request.method);
-                    return JsonRpcResponse::failure(request.id, error);
+                    handleNotification(method, params);
+                    return out;  // notifications never get a response
+                }
+
+                out.response = handleRequest(method, id, params, init).toJson();
+                return out;
+            }
+
+            /// @brief Choose the protocol version to answer an initialize with.
+            /// Per MCP spec: the client's version if supported, otherwise the latest
+            /// version this server supports (the client decides whether to proceed).
+            static std::string negotiateVersion(const std::string& clientVersion)
+            {
+                for (const auto& v : SUPPORTED_VERSIONS)
+                {
+                    if (v == clientVersion)
+                        return v;
+                }
+                return SUPPORTED_VERSIONS.front();
+            }
+
+            /// @brief Handle a JSON-RPC request (a message with an id)
+            JsonRpcResponse handleRequest(const std::string& method, const JsonRpcId& id,
+                                          const json& params, InitOutcome* init)
+            {
+                if (method == "initialize")
+                {
+                    if (init == nullptr)
+                    {
+                        return JsonRpcResponse::failure(id, JsonRpcError::invalidRequest(
+                            "initialize must not be part of a JSON-RPC batch"));
+                    }
+
+                    std::string clientVer;
+                    if (params.is_object() && params.contains("protocolVersion") &&
+                        params["protocolVersion"].is_string())
+                    {
+                        clientVer = params["protocolVersion"].get<std::string>();
+                    }
+                    const std::string negotiated = negotiateVersion(clientVer);
+
+                    json caps = json::object();
+                    if (params.is_object() && params.contains("capabilities"))
+                        caps = params["capabilities"];
+
+                    JsonRpcResponse response;
+                    auto entry = findMethod("initialize");
+                    if (entry && entry->simple)
+                    {
+                        try
+                        {
+                            json result = entry->simple(params);
+                            if (!result.is_object())
+                                result = json::object();
+                            // Patch protocolVersion to the negotiated value
+                            result["protocolVersion"] = negotiated;
+                            response = JsonRpcResponse::success(id, result);
+                        }
+                        catch (const JsonRpcError& err)
+                        {
+                            return JsonRpcResponse::failure(id, err);
+                        }
+                        catch (const std::exception& e)
+                        {
+                            return JsonRpcResponse::failure(id, JsonRpcError::internalError(e.what()));
+                        }
+                    }
+                    else
+                    {
+                        // No user handler: return a minimal valid initialize response
+                        response = JsonRpcResponse::success(id, {
+                            {"protocolVersion", negotiated},
+                            {"capabilities",    json::object()},
+                            {"serverInfo",      server_info()}
+                        });
+                    }
+                    init->succeeded = true;
+                    init->clientCaps = std::move(caps);
+                    return response;
+                }
+
+                auto entry = findMethod(method);
+                if (!entry)
+                {
+                    return JsonRpcResponse::failure(id, JsonRpcError::methodNotFound(method));
                 }
 
                 try
                 {
-                    // Extract params (default to empty object if not provided)
-                    json params = request.params.value_or(json::object());
-                    
-                    // Call handler
-                    json result = it->second(params);
-                    
-                    return JsonRpcResponse::success(request.id, result);
+                    json result = entry->cancellable
+                        ? invokeCancellable(entry->cancellable, id, params)
+                        : entry->simple(params);
+                    return JsonRpcResponse::success(id, result);
                 }
                 catch (const JsonRpcError& error)
                 {
-                    return JsonRpcResponse::failure(request.id, error);
+                    return JsonRpcResponse::failure(id, error);
                 }
                 catch (const std::exception& e)
                 {
-                    auto error = JsonRpcError::internalError(e.what());
-                    return JsonRpcResponse::failure(request.id, error);
+                    return JsonRpcResponse::failure(id, JsonRpcError::internalError(e.what()));
                 }
             }
 
-            /// @brief Handle JSON-RPC notification
-            void handleNotification(const JsonRpcNotification& notification)
+            /// @brief Run a cancellable handler with its token registered under the
+            /// request's JSON-RPC id, so notifications/cancelled{requestId} can find it.
+            json invokeCancellable(const CancellableMethodHandler& handler, const JsonRpcId& id,
+                                   const json& params)
             {
-                // Find method handler
-                auto it = m_methods.find(notification.method);
-                if (it == m_methods.end())
+                auto token = std::make_shared<std::atomic<bool>>(false);
+                const json key = jsonRpcIdToJson(id);
                 {
-                    LOG_WARN("MCPServer: Unknown notification method: %s", notification.method.c_str());
+                    std::lock_guard<std::mutex> lock(m_pendingMutex);
+                    m_pendingCancellations[key] = token;
+                }
+
+                struct Unregister
+                {
+                    MCPServer* self;
+                    const json& key;
+                    const std::shared_ptr<std::atomic<bool>>& token;
+                    ~Unregister()
+                    {
+                        std::lock_guard<std::mutex> lock(self->m_pendingMutex);
+                        auto it = self->m_pendingCancellations.find(key);
+                        if (it != self->m_pendingCancellations.end() && it->second == token)
+                            self->m_pendingCancellations.erase(it);
+                    }
+                } unregister{this, key, token};
+
+                return handler(params, token);
+            }
+
+            /// @brief Handle JSON-RPC notification
+            void handleNotification(const std::string& method, const json& params)
+            {
+                auto entry = findMethod(method);
+                if (!entry)
+                {
+                    LOG_WARN("MCPServer: Unknown notification method: %s", method.c_str());
                     return;
                 }
 
                 try
                 {
-                    json params = notification.params.value_or(json::object());
-                    it->second(params); // Notifications don't return values
+                    // Notifications don't return values
+                    if (entry->cancellable)
+                        entry->cancellable(params, std::make_shared<std::atomic<bool>>(false));
+                    else
+                        entry->simple(params);
                 }
                 catch (const std::exception& e)
                 {
-                    LOG_ERROR("MCPServer: Error handling notification %s: %s", 
-                             notification.method.c_str(), e.what());
+                    LOG_ERROR("MCPServer: Error handling notification %s: %s",
+                             method.c_str(), e.what());
+                    (void)e;
+                }
+                catch (...)
+                {
+                    LOG_ERROR("MCPServer: Error handling notification %s", method.c_str());
                 }
             }
         };
