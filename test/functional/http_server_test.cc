@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 #include "sockets.hpp"
+#include "SocketsHpp/http/server/authentication.h"
 #include "../common/test_utils.h"
 
 #include <atomic>
@@ -215,6 +216,44 @@ namespace testing
         EXPECT_EQ(res.body, "root");
         ASSERT_TRUE(client.get(base + "/declines", res));  // falls through to "/"
         EXPECT_EQ(res.body, "root");
+        server.stop();
+    }
+
+    // AuthenticationMiddleware used from a real route handler (const request):
+    // failures answer 401 with a challenge, successes reach the handler body.
+    TEST_P(HttpServerEndToEndTest, AuthenticationMiddlewareInHandler)
+    {
+        const bool useThreadPool = GetParam();
+        HttpServer server("127.0.0.1", 0);
+        if (useThreadPool)
+            server.enableThreadPool(2);
+        auto auth = std::make_shared<AuthenticationMiddleware<HttpRequest, HttpResponse>>();
+        auth->addStrategy(std::make_shared<BearerTokenAuth<HttpRequest>>([](const std::string& token) {
+            return token == "s3cret" ? AuthResult::success("alice") : AuthResult::failure("bad token");
+        }));
+        server.route("/secure", [auth](const HttpRequest& req, HttpResponse& res) {
+            AuthResult who;
+            if (!auth->authenticate(req, res, &who))
+                return 0;  // 401 already set by the middleware
+            res.set_content("hello " + who.userId);
+            return 200;
+        });
+        server.start();
+        const std::string url = "http://127.0.0.1:" + std::to_string(server.getListeningPort()) + "/secure";
+
+        SOCKETSHPP_NS::http::client::HttpClient client;
+        SOCKETSHPP_NS::http::client::HttpClientResponse res;
+        ASSERT_TRUE(client.get(url, res));
+        EXPECT_EQ(res.code, 401);
+        EXPECT_NE(res.getHeader("WWW-Authenticate").find("Bearer"), std::string::npos);
+
+        SOCKETSHPP_NS::http::client::HttpClientRequest req;
+        req.method = "GET";
+        req.uri = url;
+        req.setHeader("Authorization", "Bearer s3cret");
+        ASSERT_TRUE(client.send(req, res));
+        EXPECT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "hello alice");
         server.stop();
     }
 

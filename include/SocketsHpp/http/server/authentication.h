@@ -343,6 +343,30 @@ namespace http
             }
         };
 
+        namespace detail
+        {
+            /// Set the status on a response type that has set_status(int)...
+            template <typename R>
+            auto setStatus(R& res, int code, int) -> decltype(res.set_status(code), void())
+            {
+                res.set_status(code);
+            }
+
+            /// ...or else a public `code` member.
+            template <typename R>
+            auto setStatus(R& res, int code, long) -> decltype(res.code = code, void())
+            {
+                res.code = code;
+            }
+
+            /// Set the HTTP status on @p res if its type supports it.
+            template <typename R>
+            void setStatus(R& res, int code)
+            {
+                setStatus(res, code, 0);
+            }
+        }  // namespace detail
+
         /**
          * @brief Authentication middleware with multiple strategy support.
          * 
@@ -407,67 +431,82 @@ namespace http
              * @brief Authenticate a request.
              *
              * Strategies are tried in order; the first success invokes the
-             * authenticated callback and returns true. If all fail and auth is
-             * required, a combined WWW-Authenticate header (all challenges) and a JSON
-             * error body are set on @p res.
-             * @param req HTTP request
+             * authenticated callback (see setAuthenticatedCallback()) and returns true.
+             * If all fail and auth is required, the response gets status 401, a
+             * combined WWW-Authenticate header (all challenges) and a JSON error body.
+             * @param req HTTP request (mutable so the callback can annotate it)
              * @param res HTTP response (modified if auth fails)
              * @return true if authenticated (or auth not required), false otherwise
-             * @warning The status code is not set. With HttpServer, a handler that sets
-             *          this body and returns 0 answers 200, so return 401 on false.
-             *          With no strategies and auth required, false is returned without
-             *          touching @p res.
              */
             bool authenticate(RequestType& req, ResponseType& res)
             {
-                if (m_strategies.empty())
-                {
-                    return !m_requireAuth; // Pass through if no strategies
-                }
-
                 AuthResult result;
+                const bool ok = authenticate(static_cast<const RequestType&>(req), res, &result);
+                if (ok && result.authenticated && m_onAuthenticated)
+                {
+                    m_onAuthenticated(req, result);
+                }
+                return ok;
+            }
+
+            /**
+             * @brief Authenticate a request received as const (e.g. inside an HttpServer
+             *        route handler). Same as the non-const overload, except that the
+             *        authenticated callback is not invoked; use @p result instead.
+             * @param req HTTP request
+             * @param res HTTP response (status 401, WWW-Authenticate and a JSON body are
+             *        set if authentication fails and is required)
+             * @param result Optional; receives the outcome of the successful strategy
+             *        (user id, claims) or of the last failed one.
+             * @return true if authenticated (or auth not required), false otherwise
+             */
+            bool authenticate(const RequestType& req, ResponseType& res, AuthResult* result)
+            {
+                AuthResult last;
                 std::vector<std::string> challenges;
 
-                // Try each strategy
                 for (const auto& strategy : m_strategies)
                 {
-                    result = strategy->authenticate(req);
-                    if (result.authenticated)
+                    last = strategy->authenticate(req);
+                    if (last.authenticated)
                     {
-                        // Success! Invoke callback
-                        if (m_onAuthenticated)
+                        if (result)
                         {
-                            m_onAuthenticated(req, result);
+                            *result = last;
                         }
                         return true;
                     }
-                    
-                    // Collect challenge for 401 response
                     challenges.push_back(strategy->getChallenge());
                 }
-
-                // All strategies failed
-                if (m_requireAuth)
+                if (result)
                 {
-                    // Response headers are a single-valued map, so emit all challenges
-                    // in one WWW-Authenticate field as a comma-separated list, which
-                    // RFC 9110 (11.6.1) defines as equivalent to repeated fields.
-                    std::string combined;
-                    for (const auto& challenge : challenges)
-                    {
-                        if (!combined.empty())
-                        {
-                            combined += ", ";
-                        }
-                        combined += challenge;
-                    }
-                    res.set_header("WWW-Authenticate", combined);
-                    res.set_content(R"({"error": "Unauthorized"})", "application/json");
-                    
-                    return false;
+                    *result = last;
                 }
 
-                return true; // Auth not required
+                if (!m_requireAuth)
+                {
+                    return true;  // auth optional: let the request through
+                }
+
+                // Response headers are a single-valued map, so emit all challenges
+                // in one WWW-Authenticate field as a comma-separated list, which
+                // RFC 9110 (11.6.1) defines as equivalent to repeated fields.
+                std::string combined;
+                for (const auto& challenge : challenges)
+                {
+                    if (!combined.empty())
+                    {
+                        combined += ", ";
+                    }
+                    combined += challenge;
+                }
+                if (!combined.empty())
+                {
+                    res.set_header("WWW-Authenticate", combined);
+                }
+                detail::setStatus(res, 401);
+                res.set_content(R"({"error": "Unauthorized"})", "application/json");
+                return false;
             }
 
             /**
