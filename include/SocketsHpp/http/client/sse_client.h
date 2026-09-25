@@ -5,8 +5,14 @@
 #include <SocketsHpp/config.h>
 #include <SocketsHpp/http/client/http_client.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
-#include <sstream>
+#include <limits>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -19,21 +25,32 @@ namespace http
         struct SSEEvent
         {
             std::string id;
-            std::string event;      // Event type (default: "message")
-            std::string data;       // Event data (multi-line concatenated)
+            std::string event;      // Event type (empty means the default, "message")
+            std::string data;       // Event data (multi-line joined with '\n')
             int retry = -1;         // Reconnection time in ms (-1 = not set)
             bool hasData = false;   // True if a data field was present (even if empty)
+            bool hasId = false;     // True if an id field was present (an empty id resets Last-Event-ID)
 
             /// @brief Check if event is valid (has data)
             bool isValid() const { return hasData; }
 
             /// @brief Check if this is a comment event
-            bool isComment() const { return !hasData && event.empty() && id.empty() && retry < 0; }
+            bool isComment() const { return !hasData && event.empty() && !hasId && retry < 0; }
         };
 
         /// @brief SSE Event Parser
-        /// Parses Server-Sent Events according to WHATWG spec
+        /// Parses Server-Sent Events according to the WHATWG spec
         /// https://html.spec.whatwg.org/multipage/server-sent-events.html
+        ///
+        /// Lines may end in CRLF, LF or a lone CR (also split across chunks). A leading
+        /// UTF-8 BOM at the start of the stream is ignored.
+        ///
+        /// parseChunk() returns one SSEEvent per blank-line-terminated block that set a
+        /// data, id or retry field. Only events with hasData (isValid()) are meant to be
+        /// dispatched to applications; blocks with only id/retry are still returned so
+        /// that callers can track Last-Event-ID and the reconnection time. Each event
+        /// carries only the id set in its own block (Last-Event-ID tracking across
+        /// events is left to the caller, e.g. SSEClient).
         class SSEParser
         {
         public:
@@ -43,265 +60,249 @@ namespace http
             std::vector<SSEEvent> parseChunk(const std::string& chunk)
             {
                 std::vector<SSEEvent> events;
-                
-                // Append to buffer
-                m_buffer += chunk;
-                
-                // Process complete events (terminated by \n\n or \r\n\r\n)
                 size_t pos = 0;
-                while (true)
+                const size_t n = chunk.size();
+
+                if (!m_bomChecked)
                 {
-                    // Look for event terminator
-                    size_t eventEnd = findEventEnd(m_buffer, pos);
-                    if (eventEnd == std::string::npos)
+                    // Strip a UTF-8 BOM (EF BB BF) at the very start of the stream.
+                    static const char kBom[] = "\xEF\xBB\xBF";
+                    while (pos < n && m_bomMatched < 3)
                     {
-                        break; // No complete event
+                        if (chunk[pos] != kBom[m_bomMatched])
+                        {
+                            // Not a BOM: replay any partially matched bytes as content.
+                            m_line.append(kBom, m_bomMatched);
+                            m_bomMatched = 3;
+                            break;
+                        }
+                        ++m_bomMatched;
+                        ++pos;
                     }
-                    
-                    // Extract event block
-                    std::string eventBlock = m_buffer.substr(pos, eventEnd - pos);
-                    
-                    // Parse event
-                    SSEEvent event = parseEvent(eventBlock);
-                    // Dispatch event if it has data field, id, or retry
-                    // Per SSE spec, events should be dispatched unless they're pure comments
-                    if (event.hasData || !event.id.empty() || event.retry >= 0)
+                    if (m_bomMatched < 3)
                     {
-                        events.push_back(event);
+                        return events;  // need more bytes to decide
                     }
-                    
-                    // Move past event terminator
-                    pos = eventEnd;
-                    while (pos < m_buffer.size() && (m_buffer[pos] == '\n' || m_buffer[pos] == '\r'))
-                    {
-                        pos++;
-                    }
+                    m_bomChecked = true;
                 }
-                
-                // Remove processed events from buffer
-                m_buffer.erase(0, pos);
-                
+
+                while (pos < n)
+                {
+                    if (m_skipLF)
+                    {
+                        // Previous line ended in CR (possibly at the end of the previous
+                        // chunk); an immediately following LF belongs to that CRLF.
+                        m_skipLF = false;
+                        if (chunk[pos] == '\n')
+                        {
+                            ++pos;
+                            continue;
+                        }
+                    }
+
+                    const size_t eol = chunk.find_first_of("\r\n", pos);
+                    if (eol == std::string::npos)
+                    {
+                        m_line.append(chunk, pos, n - pos);
+                        break;
+                    }
+                    m_line.append(chunk, pos, eol - pos);
+                    m_skipLF = (chunk[eol] == '\r');
+                    pos = eol + 1;
+                    processLine(events);
+                    m_line.clear();
+                }
+
                 return events;
             }
 
-            /// @brief Reset parser state
+            /// @brief Reset parser state (e.g. before reconnecting)
             void reset()
             {
-                m_buffer.clear();
+                m_line.clear();
+                m_skipLF = false;
+                m_bomChecked = false;
+                m_bomMatched = 0;
+                resetEvent();
             }
 
-            /// @brief Get current buffer size (for debugging)
-            size_t getBufferSize() const { return m_buffer.size(); }
+            /// @brief Get size of buffered, not yet terminated line data (for debugging)
+            size_t getBufferSize() const { return m_line.size(); }
 
         private:
-            std::string m_buffer;
+            std::string m_line;          // current (incomplete) line
+            bool m_skipLF = false;       // last line ended with CR; swallow a following LF
+            bool m_bomChecked = false;
+            size_t m_bomMatched = 0;
 
-            /// @brief Find end of current event (\n\n or \r\n\r\n)
-            size_t findEventEnd(const std::string& str, size_t start) const
+            // Event being accumulated
+            std::string m_data;
+            std::string m_eventType;
+            std::string m_id;
+            bool m_hasData = false;
+            bool m_hasId = false;
+            int m_retry = -1;
+
+            void resetEvent()
             {
-                size_t pos = start;
-                bool prevNewline = false;
-                
-                while (pos < str.size())
-                {
-                    char c = str[pos];
-                    
-                    if (c == '\n')
-                    {
-                        if (prevNewline)
-                        {
-                            return pos - 1; // Found \n\n
-                        }
-                        prevNewline = true;
-                    }
-                    else if (c != '\r')
-                    {
-                        prevNewline = false;
-                    }
-                    
-                    pos++;
-                }
-                
-                return std::string::npos;
+                m_data.clear();
+                m_eventType.clear();
+                m_id.clear();
+                m_hasData = false;
+                m_hasId = false;
+                m_retry = -1;
             }
 
-            /// @brief Parse single event from event block
-            SSEEvent parseEvent(const std::string& eventBlock)
+            void processLine(std::vector<SSEEvent>& events)
             {
-                SSEEvent event;
-                std::string dataLines;
-                bool hasDataField = false;
-                
-                std::istringstream iss(eventBlock);
-                std::string line;
-                
-                while (std::getline(iss, line))
+                if (m_line.empty())
                 {
-                    // Remove \r if present
-                    if (!line.empty() && line.back() == '\r')
-                    {
-                        line.pop_back();
-                    }
-                    
-                    // Skip empty lines
-                    if (line.empty())
-                    {
-                        continue;
-                    }
-                    
-                    // Comment line (starts with :)
-                    if (line[0] == ':')
-                    {
-                        continue;
-                    }
-                    
-                    // Parse field: value
-                    size_t colonPos = line.find(':');
-                    if (colonPos == std::string::npos)
-                    {
-                        // Field with no value
-                        std::string field = line;
-                        if (field == "data") hasDataField = true;
-                        processField(field, "", event, dataLines);
-                    }
-                    else
-                    {
-                        std::string field = line.substr(0, colonPos);
-                        std::string value = line.substr(colonPos + 1);
-                        
-                        // Remove leading space from value (spec requirement)
-                        if (!value.empty() && value[0] == ' ')
-                        {
-                            value = value.substr(1);
-                        }
-                        
-                        if (field == "data") hasDataField = true;
-                        processField(field, value, event, dataLines);
-                    }
+                    dispatch(events);
+                    return;
                 }
-                
-                // Finalize data (remove trailing newline if present)
-                if (!dataLines.empty() && dataLines.back() == '\n')
+                if (m_line[0] == ':')
                 {
-                    dataLines.pop_back();
+                    return;  // comment
                 }
-                event.data = dataLines;
-                
-                // Store whether a data field was present
-                // (needed to differentiate between no data field vs empty data field)
-                event.hasData = hasDataField;
-                
-                return event;
+
+                const size_t colon = m_line.find(':');
+                if (colon == std::string::npos)
+                {
+                    processField(m_line, std::string());
+                    return;
+                }
+                size_t valueStart = colon + 1;
+                if (valueStart < m_line.size() && m_line[valueStart] == ' ')
+                {
+                    ++valueStart;  // strip exactly one leading space
+                }
+                processField(m_line.substr(0, colon), m_line.substr(valueStart));
             }
 
-            /// @brief Process individual field
-            void processField(const std::string& field, const std::string& value, 
-                            SSEEvent& event, std::string& dataLines)
+            void processField(const std::string& field, const std::string& value)
             {
-                if (field == "id")
+                if (field == "data")
                 {
-                    event.id = value;
+                    m_data += value;
+                    m_data += '\n';
+                    m_hasData = true;
                 }
                 else if (field == "event")
                 {
-                    event.event = value;
+                    m_eventType = value;
                 }
-                else if (field == "data")
+                else if (field == "id")
                 {
-                    dataLines += value;
-                    dataLines += '\n';
+                    // Ignore ids containing NULL (spec)
+                    if (value.find('\0') == std::string::npos)
+                    {
+                        m_id = value;
+                        m_hasId = true;
+                    }
                 }
                 else if (field == "retry")
                 {
-                    // Parse retry as integer
-                    try
+                    // Only ASCII digits are accepted; anything else is ignored.
+                    if (value.empty())
                     {
-                        event.retry = std::stoi(value);
+                        return;
                     }
-                    catch (...)
+                    int64_t ms = 0;
+                    for (char c : value)
                     {
-                        // Invalid retry value, ignore
+                        if (c < '0' || c > '9')
+                        {
+                            return;
+                        }
+                        ms = ms * 10 + (c - '0');
+                        if (ms > std::numeric_limits<int>::max())
+                        {
+                            return;  // out of range: ignore
+                        }
                     }
+                    m_retry = static_cast<int>(ms);
                 }
                 // Unknown fields are ignored per spec
+            }
+
+            void dispatch(std::vector<SSEEvent>& events)
+            {
+                if (m_hasData || m_hasId || m_retry >= 0)
+                {
+                    SSEEvent event;
+                    event.id = m_id;
+                    event.hasId = m_hasId;
+                    event.event = m_eventType;
+                    event.retry = m_retry;
+                    event.hasData = m_hasData;
+                    event.data = m_data;
+                    if (!event.data.empty() && event.data.back() == '\n')
+                    {
+                        event.data.pop_back();
+                    }
+                    events.push_back(std::move(event));
+                }
+                resetEvent();
             }
         };
 
         /// @brief SSE Client for consuming Server-Sent Events streams
+        ///
+        /// connect() blocks the calling thread for the lifetime of the stream (including
+        /// automatic reconnects). close() may be called from any thread (or from inside a
+        /// callback) and makes connect() return promptly.
+        ///
+        /// Unlike HttpClient, the read timeout defaults to 0 (none) so that idle streams
+        /// are not dropped; call setReadTimeout() to enable one.
         class SSEClient : public HttpClient
         {
         public:
             /// @brief Event callback type
             using EventCallback = std::function<void(const SSEEvent&)>;
-            
+
             /// @brief Error callback type
             using ErrorCallback = std::function<void(const std::string&)>;
 
-            /// @brief Connect to SSE endpoint and start receiving events
+            SSEClient() { m_readTimeoutMs = 0; }
+
+            /// @brief Connect to SSE endpoint and receive events until the stream ends
+            /// (or, with auto-reconnect enabled, until close() is called or the server
+            /// answers with a non-200 status).
             /// @param url SSE endpoint URL
             /// @param onEvent Callback for each event
             /// @param onError Optional error callback
-            /// @return true if connection successful
+            /// @return true if the last connection attempt succeeded (status 200), or if the
+            ///         stream was stopped by close() after connecting at least once.
             bool connect(const std::string& url, EventCallback onEvent, ErrorCallback onError = nullptr)
             {
                 m_eventCallback = onEvent;
                 m_errorCallback = onError;
                 m_url = url;
-                
-                return reconnect();
+                m_closed = false;
+                clearCancel();
+                return run();
             }
 
-            /// @brief Reconnect with Last-Event-ID
-            /// @return true if reconnection successful
+            /// @brief Reconnect with Last-Event-ID (same semantics as connect()).
             bool reconnect()
             {
-                HttpClientRequest request;
-                request.method = METHOD_GET;
-                request.uri = m_url;
-                request.setAccept("text/event-stream");
-                
-                // Add Last-Event-ID header if available
-                if (!m_lastEventId.empty())
+                if (m_closed)
                 {
-                    request.setHeader("Last-Event-Id", m_lastEventId);
+                    return false;
                 }
-                
-                HttpClientResponse response;
-                
-                // Setup chunk callback to parse SSE events
-                response.chunkCallback = [this](const std::string& chunk) {
-                    handleChunk(chunk);
-                };
-                
-                response.onComplete = [this]() {
-                    // Stream ended
-                    if (m_autoReconnect)
-                    {
-                        // Auto-reconnect with exponential backoff
-                        std::this_thread::sleep_for(std::chrono::milliseconds(m_reconnectDelay));
-                        reconnect();
-                    }
-                };
-                
-                // Send request (blocking until stream completes)
-                bool success = send(request, response);
-                
-                if (!success && m_errorCallback)
-                {
-                    m_errorCallback("Failed to connect to SSE endpoint");
-                }
-                
-                return success;
+                return run();
             }
 
             /// @brief Set Last-Event-ID for resumable streams
-            /// @param id Last event ID received
             void setLastEventId(const std::string& id)
             {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
                 m_lastEventId = id;
             }
 
             /// @brief Get current Last-Event-ID
+            /// @note The returned reference is only stable while the stream is not running,
+            ///       or when called from the event callback.
             const std::string& getLastEventId() const
             {
                 return m_lastEventId;
@@ -309,18 +310,27 @@ namespace http
 
             /// @brief Enable/disable automatic reconnection
             /// @param enable Enable auto-reconnect
-            /// @param delay Reconnection delay in milliseconds
+            /// @param delay Reconnection delay in milliseconds (overridden by server "retry:")
             void setAutoReconnect(bool enable, int delay = 3000)
             {
                 m_autoReconnect = enable;
                 m_reconnectDelay = delay;
             }
 
-            /// @brief Close SSE connection
+            /// @brief Set maximum reconnection delay used by the exponential backoff after
+            /// consecutive connection failures (milliseconds).
+            void setMaxReconnectDelay(int delay) { m_maxReconnectDelay = delay; }
+
+            /// @brief Close SSE connection. Thread-safe; unblocks a connect() in progress.
             void close()
             {
                 m_autoReconnect = false;
-                // Connection will close when current stream ends
+                m_closed = true;
+                shutdownActiveSocket(true);
+                {
+                    std::lock_guard<std::mutex> lock(m_waitMutex);
+                }
+                m_waitCv.notify_all();
             }
 
         private:
@@ -328,32 +338,146 @@ namespace http
             std::string m_lastEventId;
             EventCallback m_eventCallback;
             ErrorCallback m_errorCallback;
-            bool m_autoReconnect = false;
-            int m_reconnectDelay = 3000;  // ms
+            std::atomic<bool> m_autoReconnect{false};
+            std::atomic<bool> m_closed{false};
+            std::atomic<int> m_reconnectDelay{3000};  // ms
+            std::atomic<int> m_maxReconnectDelay{60000};  // ms
             SSEParser m_parser;
+            std::mutex m_stateMutex;
+            std::mutex m_waitMutex;
+            std::condition_variable m_waitCv;
+
+            void reportError(const std::string& message)
+            {
+                if (m_errorCallback && !m_closed)
+                {
+                    m_errorCallback(message);
+                }
+            }
+
+            /// Wait for `ms` milliseconds or until close() is called. Returns false if closed.
+            bool waitBeforeReconnect(int ms)
+            {
+                std::unique_lock<std::mutex> lock(m_waitMutex);
+                m_waitCv.wait_for(lock, std::chrono::milliseconds(std::max(0, ms)), [this] { return m_closed.load(); });
+                return !m_closed;
+            }
+
+            bool run()
+            {
+                bool everConnected = false;
+                bool lastOk = false;
+                int consecutiveFailures = 0;
+
+                while (!m_closed)
+                {
+                    m_parser.reset();
+
+                    HttpClientRequest request;
+                    request.method = METHOD_GET;
+                    request.uri = m_url;
+                    request.setAccept("text/event-stream");
+                    request.setHeader("Cache-Control", "no-cache");
+                    {
+                        std::lock_guard<std::mutex> lock(m_stateMutex);
+                        if (!m_lastEventId.empty())
+                        {
+                            request.setHeader("Last-Event-ID", m_lastEventId);
+                        }
+                    }
+
+                    HttpClientResponse response;
+                    bool streaming = false;
+                    response.chunkCallback = [this, &response, &streaming](const std::string& chunk) {
+                        if (!streaming)
+                        {
+                            // Only feed the parser for a successful event stream.
+                            if (response.code != 200)
+                            {
+                                return;
+                            }
+                            streaming = true;
+                        }
+                        handleChunk(chunk);
+                    };
+
+                    const bool ok = send(request, response);
+                    if (m_closed)
+                    {
+                        return everConnected || (ok && response.code == 200);
+                    }
+
+                    if (ok && response.code == 200)
+                    {
+                        everConnected = true;
+                        lastOk = true;
+                        consecutiveFailures = 0;
+                    }
+                    else if (ok)
+                    {
+                        // Per spec, a non-200 response fails the connection without reconnecting.
+                        reportError("SSE endpoint returned HTTP status " + std::to_string(response.code));
+                        return false;
+                    }
+                    else
+                    {
+                        lastOk = false;
+                        ++consecutiveFailures;
+                        reportError(response.code == 200 ? "SSE stream interrupted"
+                                                         : "Failed to connect to SSE endpoint");
+                        if (response.code == 200)
+                        {
+                            everConnected = true;
+                            consecutiveFailures = 0;  // stream was up; retry at the base delay
+                        }
+                    }
+
+                    if (!m_autoReconnect)
+                    {
+                        return lastOk;
+                    }
+
+                    // Base delay honors the server's retry: field; back off exponentially
+                    // on consecutive connection failures.
+                    int64_t delay = std::max(0, m_reconnectDelay.load());
+                    for (int i = 1; i < consecutiveFailures && delay < m_maxReconnectDelay; ++i)
+                    {
+                        delay *= 2;
+                    }
+                    delay = std::min<int64_t>(delay, std::max(m_reconnectDelay.load(), m_maxReconnectDelay.load()));
+                    if (!waitBeforeReconnect(static_cast<int>(delay)))
+                    {
+                        break;
+                    }
+                }
+                return everConnected || lastOk;
+            }
 
             /// @brief Handle incoming chunk
             void handleChunk(const std::string& chunk)
             {
-                // Parse chunk for events
                 auto events = m_parser.parseChunk(chunk);
-                
-                // Process each event
+
                 for (const auto& event : events)
                 {
-                    // Update Last-Event-ID
-                    if (!event.id.empty())
+                    if (m_closed)
                     {
+                        return;
+                    }
+                    // Update Last-Event-ID (an empty id resets it)
+                    if (event.hasId)
+                    {
+                        std::lock_guard<std::mutex> lock(m_stateMutex);
                         m_lastEventId = event.id;
                     }
-                    
+
                     // Update retry delay if specified
                     if (event.retry >= 0)
                     {
                         m_reconnectDelay = event.retry;
                     }
-                    
-                    // Invoke callback
+
+                    // Dispatch only events with data (empty data buffer => no dispatch)
                     if (m_eventCallback && event.isValid())
                     {
                         m_eventCallback(event);
