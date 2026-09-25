@@ -141,7 +141,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes cmake ninja-build googletest \
-            g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix wine64
+            g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix wine64 xvfb
+
+      # First Wine invocation bootstraps a prefix (registry, fake explorer.exe, ...).
+      # Doing that here, outside any test run, keeps that one-time cost off the
+      # 5s default gtest_discover_tests timeout for whichever test happens to run first.
+      - name: Warm up Wine prefix
+        run: xvfb-run -a wine64 wineboot --init
 
       - name: Build GoogleTest for MinGW
         run: |
@@ -169,7 +175,9 @@ jobs:
       - name: Test
         env:
           WINEDEBUG: -all
-        run: ctest --test-dir build --output-on-failure --timeout 120
+        # A virtual display lets Wine's window/COM plumbing succeed instead of
+        # hanging (and blowing gtest_discover_tests's timeout) with no driver.
+        run: xvfb-run -a ctest --test-dir build --output-on-failure --timeout 120
 
   docs:
     name: ubuntu-latest / API documentation (Doxygen)
@@ -183,7 +191,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes doxygen
 
-      # Fails if any public or protected API is undocumented or a doc comment is
-      # malformed (WARN_AS_ERROR = FAIL_ON_WARNINGS in docs/Doxyfile).
+      # docs/Doxyfile's OUTPUT_DIRECTORY (build/docs) is created by the CMake
+      # configure step in other jobs; this job never runs CMake, so Doxygen's
+      # own directory creation is left with a missing parent and gives up.
       - name: Check API documentation
-        run: doxygen docs/Doxyfile
+        run: |
+          mkdir -p build/docs
+          doxygen docs/Doxyfile
