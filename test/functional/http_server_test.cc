@@ -22,7 +22,7 @@ namespace testing
     TEST_F(HttpServerTest, BasicServerCreation)
     {
         SocketParams params{AF_INET, SOCK_STREAM, 0};
-        SocketAddr destination("127.0.0.1:8888");
+        SocketAddr destination("127.0.0.1:0");
         SocketServer server(destination, params);
         EXPECT_TRUE(true);  // Server created successfully
     }
@@ -30,17 +30,19 @@ namespace testing
     TEST_F(HttpServerTest, ServerAddressBinding)
     {
         SocketParams params{AF_INET, SOCK_STREAM, 0};
-        SocketAddr destination("127.0.0.1:8889");
+        SocketAddr destination("127.0.0.1:0");
         SocketServer server(destination, params);
         
         // Verify the server address matches
-        EXPECT_EQ(server.address().toString(), "127.0.0.1:8889");
+        // Binding to port 0 picks an ephemeral port; address() reports it.
+        EXPECT_GT(server.address().port(), 0);
+        EXPECT_EQ(server.address().toString(), "127.0.0.1:" + std::to_string(server.address().port()));
     }
 
     TEST_F(HttpServerTest, ServerStartStop)
     {
         SocketParams params{AF_INET, SOCK_STREAM, 0};
-        SocketAddr destination("127.0.0.1:8890");
+        SocketAddr destination("127.0.0.1:0");
         SocketServer server(destination, params);
         
         server.Start();
@@ -53,7 +55,7 @@ namespace testing
     TEST_F(HttpServerTest, MultipleStartStop)
     {
         SocketParams params{AF_INET, SOCK_STREAM, 0};
-        SocketAddr destination("127.0.0.1:8891");
+        SocketAddr destination("127.0.0.1:0");
         SocketServer server(destination, params);
         
         // Start and stop multiple times

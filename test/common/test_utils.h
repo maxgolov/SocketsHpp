@@ -9,7 +9,12 @@
 #include <Windows.h>
 #endif
 
+#include <atomic>
 #include <cstdlib>
+#include <random>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 /**
  * @brief Obtain path to temporary directory
@@ -85,7 +90,16 @@ static inline int GetRandomEphemeralPort()
 static inline std::string GetUniqueSocketName(const std::string& prefix = "test")
 {
     auto temp_dir = GetTempDirectory();
-    auto unique_id = std::to_string(rand());
+    // rand() is unseeded and would yield the same name in every test process,
+    // so combine the process id, a per-process counter and random_device.
+    static std::atomic<unsigned> counter{0};
+#ifdef _WIN32
+    auto pid = static_cast<unsigned long>(::GetCurrentProcessId());
+#else
+    auto pid = static_cast<unsigned long>(::getpid());
+#endif
+    auto unique_id = std::to_string(pid) + "_" + std::to_string(counter++) + "_" +
+        std::to_string(std::random_device{}() & 0xFFFF);
     return temp_dir + prefix + "_" + unique_id + ".sock";
 }
 

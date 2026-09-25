@@ -33,6 +33,7 @@ namespace http
         using Reactor = net::utils::Reactor;
         using Socket = net::utils::Socket;
         using SocketAddr = net::utils::SocketAddr;
+        using ScopedSocket = net::utils::ScopedSocket;
         using SocketParams = net::utils::SocketParams;
 
         // Case-insensitive string comparator for HTTP headers
@@ -1037,17 +1038,37 @@ namespace http
 
             /// @brief Listen on an additional port (0 = ephemeral).
             /// @return The port actually bound.
+            /// @brief Listen on all IPv4 interfaces (INADDR_ANY).
+            /// @param port Port to listen on; 0 picks an ephemeral port
+            /// @return The bound port
             int addListeningPort(int port)
             {
-                Socket socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                return addListeningSocket(SocketAddr(static_cast<u_long>(0), port));
+            }
+
+            /// @brief Listen on a specific local address, e.g. "127.0.0.1", "::1",
+            /// "[::1]" or "localhost" (resolved to IPv4).
+            /// @param host Local address or hostname to bind to
+            /// @param port Port to listen on; 0 picks an ephemeral port
+            /// @return The bound port
+            int addListeningPort(const std::string& host, int port)
+            {
+                return addListeningSocket(SocketAddr(host.c_str(), port));
+            }
+
+        private:
+            int addListeningSocket(SocketAddr addr)
+            {
+                const int port = addr.port();
+                ScopedSocket scoped(addr.m_data.sa_family, SOCK_STREAM, IPPROTO_TCP);
+                Socket& socket = scoped.get();
                 socket.setNonBlocking();
                 socket.setReuseAddr();
 
-                SocketAddr addr(static_cast<u_long>(0), port);
                 if (socket.bind(addr) != 0)
                 {
                     int err = socket.error();
-                    throw std::runtime_error("Failed to bind to port " + std::to_string(port) +
+                    throw std::runtime_error("Failed to bind to " + addr.toString() +
                         ", error: " + std::to_string(err));
                 }
 
@@ -1063,14 +1084,16 @@ namespace http
                         ", error: " + std::to_string(err));
                 }
 
-                m_listeningSockets.push_back(socket);
+                // Success: the server owns the socket from here on.
+                Socket owned = scoped.release();
+                m_listeningSockets.push_back(owned);
                 m_listeningPorts.push_back(addr.port());
-                m_reactor.addSocket(socket, Reactor::Acceptable);
+                m_reactor.addSocket(owned, Reactor::Acceptable);
                 LOG_INFO("HttpServer: Listening on %s", addr.toString().c_str());
-
                 return addr.port();
             }
 
+        public:
             /// @brief Port bound by the first addListeningPort() call (useful with port 0).
             /// @return The port, or -1 if the server is not listening.
             int getListeningPort() const

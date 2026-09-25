@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -1335,3 +1336,94 @@ int main(int argc, char** argv)
     return RUN_ALL_TESTS();
 }
 
+// ── Binding behaviour ────────────────────────────────────────────────────────
+
+// A STDIO server must never open a network port, even if config.port is taken.
+TEST(McpBindingTest, StdioServerDoesNotBindPort)
+{
+    int holder = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port        = 0;
+    ASSERT_EQ(::bind(holder, (sockaddr*)&a, sizeof(a)), 0);
+    ASSERT_EQ(::listen(holder, 1), 0);
+    socklen_t len = sizeof(a);
+    ::getsockname(holder, (sockaddr*)&a, &len);
+
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    cfg.port      = ntohs(a.sin_port);  // already in use
+    EXPECT_NO_THROW({
+        MCPServer srv(cfg);
+        EXPECT_EQ(srv.port(), -1);
+    });
+    ::close(holder);
+}
+
+// The HTTP transport binds only in listen(), only to config.host, and the
+// loopback guard runs before anything is bound.
+TEST(McpBindingTest, ListenBindsConfiguredHostOnly)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    cfg.host      = "127.0.0.1";
+    cfg.port      = 0;
+    MCPServer srv(cfg);
+    EXPECT_EQ(srv.port(), -1) << "nothing may be bound before listen()";
+    srv.listen();
+    ASSERT_GT(srv.port(), 0);
+
+    int client = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in c{};
+    c.sin_family      = AF_INET;
+    c.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    c.sin_port        = htons(static_cast<uint16_t>(srv.port()));
+    ASSERT_EQ(::connect(client, (sockaddr*)&c, sizeof(c)), 0);
+    ::close(client);
+
+    // The same port must not be reachable via a non-loopback local address.
+    in_addr external{};
+    bool haveExternal = false;
+    ifaddrs* ifs = nullptr;
+    if (::getifaddrs(&ifs) == 0)
+    {
+        for (ifaddrs* i = ifs; i; i = i->ifa_next)
+        {
+            if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET)
+            {
+                auto* in = reinterpret_cast<sockaddr_in*>(i->ifa_addr);
+                if ((ntohl(in->sin_addr.s_addr) >> 24) != 127)
+                {
+                    external = in->sin_addr;
+                    haveExternal = true;
+                    break;
+                }
+            }
+        }
+        ::freeifaddrs(ifs);
+    }
+    if (haveExternal)
+    {
+        int ext = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in x{};
+        x.sin_family = AF_INET;
+        x.sin_addr   = external;
+        x.sin_port   = htons(static_cast<uint16_t>(srv.port()));
+        EXPECT_NE(::connect(ext, (sockaddr*)&x, sizeof(x)), 0)
+            << "server must not listen on non-loopback interfaces";
+        ::close(ext);
+    }
+    srv.stop();
+}
+
+TEST(McpBindingTest, NonLoopbackRefusedBeforeBinding)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    cfg.host      = "0.0.0.0";
+    cfg.port      = 0;
+    MCPServer srv(cfg);
+    EXPECT_THROW(srv.listen(), std::runtime_error);
+    EXPECT_EQ(srv.port(), -1) << "the SSRF guard must reject before binding";
+}

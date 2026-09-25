@@ -126,7 +126,8 @@ namespace mcp
             /// @param config Server configuration
             explicit MCPServer(const ServerConfig& config)
                 : m_config(config)
-                , m_httpServer(config.host, config.port)
+                // Default-constructed: nothing is bound until listen(), so STDIO
+                // servers never open a port and the loopback guard runs first.
                 , m_running(false)
             {
                 // Configure session manager
@@ -356,10 +357,21 @@ namespace mcp
                         "'. Set ServerConfig::allowNonLoopback = true to override.");
                 }
 
+                if (m_running.load())
+                    return;
+
+                // Bind to the configured host only (never INADDR_ANY implicitly).
+                m_httpServer.setServerName(m_config.host + ":" + std::to_string(m_config.port));
+                m_httpServer.addListeningPort(m_config.host, m_config.port);
+
                 m_running = true;
                 m_httpServer.enableThreadPool(4);  // SSE callbacks run on pool; reactor stays free
                 m_httpServer.start();
             }
+
+            /// @brief Port the server is listening on (useful with config.port = 0).
+            /// @return The port, or -1 before listen().
+            int port() const { return m_httpServer.getListeningPort(); }
 
             /// @brief Stop server — closes all pending SSE queues before stopping.
             void stop()
