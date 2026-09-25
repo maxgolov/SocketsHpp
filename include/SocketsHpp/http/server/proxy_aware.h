@@ -19,15 +19,19 @@ namespace http
          * When running behind a reverse proxy (nginx, Apache, load balancer),
          * the server loses visibility of the original client connection details.
          * This class helps configure which proxies to trust for forwarded headers.
+         * @note Trusted proxies are matched by exact IP string (no CIDR ranges, no
+         *       IPv6 canonicalization). Not synchronized: configure before use; the
+         *       const members are safe to call concurrently afterwards.
          */
         class TrustProxyConfig
         {
         public:
+            /// @brief Which peers are trusted to supply forwarded headers.
             enum class TrustMode
             {
-                None,           // Don't trust any proxy headers
-                TrustAll,       // Trust all proxy headers (use with caution!)
-                TrustSpecific   // Trust only specific proxy IPs
+                None,           ///< Don't trust any proxy headers
+                TrustAll,       ///< Trust all proxy headers (use with caution: clients can then spoof them)
+                TrustSpecific   ///< Trust only specific proxy IPs
             };
 
         private:
@@ -35,10 +39,14 @@ namespace http
             std::vector<std::string> m_trustedProxies;
 
         public:
+            /// @brief Trust nobody (TrustMode::None).
             TrustProxyConfig() : m_mode(TrustMode::None) {}
 
+            /// @brief Use @p mode with an empty proxy list.
             explicit TrustProxyConfig(TrustMode mode) : m_mode(mode) {}
 
+            /// @brief Trust only @p proxies (TrustMode::TrustSpecific). Entries may
+            ///        carry a port, which is ignored.
             TrustProxyConfig(const std::vector<std::string>& proxies)
                 : m_mode(TrustMode::TrustSpecific), m_trustedProxies(proxies) {}
 
@@ -106,13 +114,16 @@ namespace http
                 return false;
             }
 
+            /// @brief Set the trust mode (the proxy list is kept).
             void setMode(TrustMode mode) { m_mode = mode; }
+            /// @brief Add a trusted proxy address and switch to TrustMode::TrustSpecific.
             void addTrustedProxy(const std::string& proxy) 
             { 
                 m_trustedProxies.push_back(proxy);
                 m_mode = TrustMode::TrustSpecific;
             }
 
+            /// @brief Get the trusted proxy addresses as added.
             const std::vector<std::string>& getTrustedProxies() const 
             { 
                 return m_trustedProxies; 
@@ -124,12 +135,21 @@ namespace http
          * 
          * These utilities help extract original client information from
          * proxy-forwarded headers like X-Forwarded-Proto, X-Forwarded-For, etc.
+         * Forwarded headers are only consulted when the direct peer (remoteAddr) is
+         * trusted. HeaderMap is any map from header name to value, e.g.
+         * HttpRequest::headers; names are matched case-insensitively. Pass
+         * HttpRequest::client as remoteAddr (its port is ignored).
          */
         class ProxyAwareHelpers
         {
         public:
             /**
              * @brief Extract the original protocol (http or https) from request.
+             *
+             * Checks, in order, X-Forwarded-Proto and X-Forwarded-Protocol (values
+             * other than http/https are skipped), X-Forwarded-Ssl (if present it
+             * decides: "on" = https, anything else = http), and the first proto=
+             * parameter of Forwarded.
              * @param headers Map of HTTP headers
              * @param remoteAddr Direct connection IP address
              * @param trustConfig Trust proxy configuration
@@ -188,10 +208,18 @@ namespace http
 
             /**
              * @brief Extract the original client IP address from request.
+             *
+             * Uses X-Forwarded-For, then X-Real-IP, then the for= parameters of
+             * Forwarded. For the list headers the hops are walked right to left and
+             * the first address that is not a trusted proxy is returned (if all are
+             * trusted, the left-most one).
              * @param headers Map of HTTP headers
-             * @param remoteAddr Direct connection IP address
+             * @param remoteAddr Direct connection address ("ip:port" accepted)
              * @param trustConfig Trust proxy configuration
-             * @return Original client IP or direct connection IP if not trusted
+             * @return Original client IP (port stripped), or the direct connection IP
+             *         if the peer is not trusted or no forwarded address is present
+             * @warning With TrustMode::TrustAll every hop is trusted, so the result is
+             *          the left-most, client-controlled X-Forwarded-For entry.
              */
             template<typename HeaderMap>
             static std::string getClientIP(
@@ -258,10 +286,12 @@ namespace http
             /**
              * @brief Extract the original host from request.
              * @param headers Map of HTTP headers
-             * @param remoteAddr Direct connection IP address
+             * @param remoteAddr Direct connection address ("ip:port" accepted)
              * @param trustConfig Trust proxy configuration
              * @param fallbackHost Fallback host if not found
-             * @return Original host header value
+             * @return For a trusted peer, X-Forwarded-Host (verbatim) or the first
+             *         host= parameter of Forwarded; otherwise the Host header; else
+             *         @p fallbackHost. May include a port.
              */
             template<typename HeaderMap>
             static std::string getHost(
@@ -303,6 +333,7 @@ namespace http
 
             /**
              * @brief Check if the request was made over HTTPS.
+             * @return true if getProtocol() returns "https".
              */
             template<typename HeaderMap>
             static bool isSecure(

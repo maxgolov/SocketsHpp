@@ -28,6 +28,8 @@ class SimpleRLE
 public:
     /**
      * @brief Compress using Run-Length Encoding.
+     * @param input Data to compress
+     * @return RLE pairs (up to twice the input size); empty for empty input
      */
     static std::vector<uint8_t> compress(const std::vector<uint8_t>& input, int /*level*/)
     {
@@ -64,7 +66,8 @@ public:
     }
 
     /**
-     * @brief Decompress RLE data.
+     * @brief Decompress RLE data without an output size limit.
+     * @throws std::runtime_error if @p input is empty or has odd length
      */
     static std::vector<uint8_t> decompress(const std::vector<uint8_t>& input)
     {
@@ -73,6 +76,8 @@ public:
 
     /**
      * @brief Decompress RLE data, refusing to produce more than maxOutputSize bytes.
+     * @throws std::runtime_error if @p input is empty or has odd length (so the
+     *         empty output of compress() for empty input does not round-trip)
      * @throws std::length_error if the output would exceed maxOutputSize
      */
     static std::vector<uint8_t> decompress(const std::vector<uint8_t>& input, size_t maxOutputSize)
@@ -111,11 +116,13 @@ public:
 class IdentityCompression
 {
 public:
+    /// @brief Return @p input unchanged (the level is ignored).
     static std::vector<uint8_t> compress(const std::vector<uint8_t>& input, int /*level*/)
     {
         return input; // No compression
     }
 
+    /// @brief Return @p input unchanged.
     static std::vector<uint8_t> decompress(const std::vector<uint8_t>& input)
     {
         return input; // No decompression
@@ -123,7 +130,10 @@ public:
 };
 
 /**
- * @brief Register simple compression strategies for testing.
+ * @brief Register simple compression strategies for testing: "rle" (SimpleRLE,
+ *        with a bounded decompressor) and "identity" (IdentityCompression) in
+ *        CompressionRegistry::instance(), replacing existing entries of those names.
+ * @note Not thread-safe (see CompressionRegistry).
  */
 inline void registerSimpleCompression()
 {

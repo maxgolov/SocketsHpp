@@ -37,9 +37,13 @@ namespace http
         using ScopedSocket = net::utils::ScopedSocket;
         using SocketParams = net::utils::SocketParams;
 
-        // Case-insensitive string comparator for HTTP headers
+        /// @brief Case-insensitive (ASCII) "less than" comparator for header names.
+        /// @note Usable as the Compare argument of std::map; HttpRequest::headers
+        ///       does not use it (it stores Title-Case-normalized names instead).
         struct CaseInsensitiveCompare
         {
+            /// @brief Compare two strings lexicographically, ignoring ASCII case.
+            /// @return true if @p lhs orders before @p rhs.
             bool operator()(const std::string& lhs, const std::string& rhs) const
             {
                 return std::lexicographical_compare(
@@ -66,7 +70,13 @@ namespace http
         using constants::ACCESS_CONTROL_EXPOSE_HEADERS;
         using constants::ACCESS_CONTROL_MAX_AGE;
 
-        // Session management with event history for Last-Event-ID support
+        /// @brief Thread-safe registry of session IDs with idle expiry and an optional
+        ///        per-session event history for SSE Last-Event-ID resumption.
+        /// @note All public members lock an internal mutex and may be called from
+        ///       any thread. Sessions expire after setSessionTimeout() of inactivity
+        ///       (validateSession() refreshes the timer); expired sessions are purged
+        ///       lazily by validateSession(), cleanupExpiredSessions(), or when
+        ///       createSession() hits the session limit.
         class SessionManager
         {
         private:
@@ -86,6 +96,12 @@ namespace http
             bool m_resumabilityEnabled = false;
             
         public:
+            /// @brief Turn event history recording (addEvent()/getEventsSince()) on or off.
+            /// @param enabled When false, addEvent() is a no-op and getEventsSince()
+            ///        returns nothing.
+            /// @param historyDuration Stored, but not currently used to expire events.
+            /// @param maxHistorySize Events kept per session (oldest dropped first).
+            ///        Applies only to sessions created after this call.
             void enableResumability(bool enabled, std::chrono::milliseconds historyDuration = std::chrono::milliseconds(300000), size_t maxHistorySize = 1000)
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -94,6 +110,10 @@ namespace http
                 m_maxHistorySize = maxHistorySize;
             }
             
+            /// @brief Create a new session with a fresh random ID (see generateSessionId()).
+            /// @return The new session ID.
+            /// @throws std::runtime_error if the session limit (setMaxSessions()) is
+            ///         still reached after purging expired sessions.
             std::string createSession()
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -126,6 +146,11 @@ namespace http
                 return sessionId;
             }
             
+            /// @brief Check that a session exists and has not expired, and refresh
+            ///        its last-access time.
+            /// @param sessionId Session identifier.
+            /// @return true if the session is valid; false if unknown or expired
+            ///         (an expired session is removed).
             bool validateSession(const std::string& sessionId)
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -148,12 +173,17 @@ namespace http
                 return true;
             }
             
+            /// @brief Remove a session and its event history.
+            /// @param sessionId Session identifier.
+            /// @return true if the session existed.
             bool terminateSession(const std::string& sessionId)
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 return m_sessions.erase(sessionId) > 0;
             }
             
+            /// @brief Set the idle time after which a session expires.
+            /// @param timeout Inactivity timeout; applies to existing sessions too.
             void setSessionTimeout(std::chrono::seconds timeout)
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -180,7 +210,9 @@ namespace http
                 return id;
             }
             
-            /// @brief Add event to session history for Last-Event-ID support
+            /// @brief Append an event to a session's history for Last-Event-ID support.
+            /// @note No-op if resumability is disabled or the session does not exist.
+            ///       The oldest events are dropped beyond the session's history limit.
             /// @param sessionId Session identifier
             /// @param eventId Event identifier
             /// @param eventData Event data (SSE formatted)
@@ -207,10 +239,13 @@ namespace http
                 }
             }
             
-            /// @brief Get events since a specific event ID
+            /// @brief Get the stored events recorded after a given event ID.
             /// @param sessionId Session identifier
-            /// @param lastEventId Last event ID received by client
-            /// @return Vector of events that occurred after lastEventId
+            /// @param lastEventId Last event ID received by the client; empty returns
+            ///        the whole stored history.
+            /// @return Event data (as passed to addEvent()) after @p lastEventId, oldest
+            ///         first. Empty if resumability is disabled, the session is unknown,
+            ///         or @p lastEventId is no longer (or never was) in the history.
             std::vector<std::string> getEventsSince(const std::string& sessionId, const std::string& lastEventId)
             {
                 std::vector<std::string> events;
@@ -255,20 +290,23 @@ namespace http
                 return events;
             }
             
+            /// @brief Remove all sessions idle for longer than the session timeout.
             void cleanupExpiredSessions()
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 cleanupExpiredSessionsLocked();
             }
 
-            /// @brief Set maximum number of sessions allowed
+            /// @brief Set the maximum number of live sessions; createSession() throws
+            ///        beyond it.
             void setMaxSessions(size_t maxSessions)
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_maxSessions = maxSessions;
             }
 
-            /// @brief Get current session count
+            /// @brief Get the current number of stored sessions (expired but not yet
+            ///        purged sessions included).
             size_t getSessionCount() const
             {
                 std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_mutex));
@@ -295,26 +333,30 @@ namespace http
             }
         };
         
-        // CORS configuration
+        /// @brief CORS settings applied by HttpServer to every response when enabled.
         struct CorsConfig
         {
-            bool enabled = false;
-            std::string allowOrigin = constants::CORS_ALLOW_ORIGIN_ALL;
-            std::string allowMethods = constants::CORS_DEFAULT_METHODS;
-            std::string allowHeaders = constants::CORS_DEFAULT_ALLOW_HEADERS;
-            std::string exposeHeaders = constants::CORS_DEFAULT_EXPOSE_HEADERS;
-            std::string maxAge = constants::CORS_DEFAULT_MAX_AGE;
+            bool enabled = false;  ///< Add Access-Control-* headers and answer unhandled OPTIONS with 204.
+            std::string allowOrigin = constants::CORS_ALLOW_ORIGIN_ALL;             ///< Access-Control-Allow-Origin value.
+            std::string allowMethods = constants::CORS_DEFAULT_METHODS;             ///< Access-Control-Allow-Methods value.
+            std::string allowHeaders = constants::CORS_DEFAULT_ALLOW_HEADERS;       ///< Access-Control-Allow-Headers value.
+            std::string exposeHeaders = constants::CORS_DEFAULT_EXPOSE_HEADERS;     ///< Access-Control-Expose-Headers value.
+            std::string maxAge = constants::CORS_DEFAULT_MAX_AGE;                   ///< Access-Control-Max-Age value (OPTIONS responses only).
         };
 
-        // SSE (Server-Sent Events) helper class
+        /// @brief A single Server-Sent Event, serialized with format().
         class SSEEvent
         {
         public:
-            std::string event;
-            std::string data;
-            std::string id;
-            int retry = -1;  // -1 means not set
+            std::string event;  ///< Event type ("event:" field); omitted when empty.
+            std::string data;   ///< Payload; each line becomes its own "data:" field; omitted when empty.
+            std::string id;     ///< Event ID ("id:" field); omitted when empty.
+            int retry = -1;     ///< Reconnection time in ms ("retry:" field); negative = not sent.
 
+            /// @brief Serialize to the text/event-stream wire format.
+            /// @return The event fields followed by the terminating blank line.
+            /// @note CR and LF are stripped from @ref id and @ref event so they cannot
+            ///       inject fields; @ref data is split on CRLF, CR and LF.
             std::string format() const
             {
                 std::ostringstream oss;
@@ -372,6 +414,9 @@ namespace http
 
         public:
 
+            /// @brief Create an unnamed ("message") event.
+            /// @param data Event payload.
+            /// @param id Optional event ID.
             static SSEEvent message(const std::string& data, const std::string& id = "")
             {
                 SSEEvent evt;
@@ -380,6 +425,10 @@ namespace http
                 return evt;
             }
 
+            /// @brief Create an event with an explicit event type.
+            /// @param event Event type ("event:" field).
+            /// @param data Event payload.
+            /// @param id Optional event ID.
             static SSEEvent custom(const std::string& event, const std::string& data, const std::string& id = "")
             {
                 SSEEvent evt;
@@ -390,7 +439,9 @@ namespace http
             }
         };
 
-        /// @brief Securely decode URL-encoded string
+        /// @brief Decode a URL-encoded (application/x-www-form-urlencoded) string.
+        /// @note '+' decodes to a space. %00 and escaped ASCII control characters
+        ///       are rejected; bytes >= 0x80 are accepted.
         /// @param encoded URL-encoded string
         /// @param maxLength Maximum allowed length after decoding
         /// @return Decoded string
@@ -459,18 +510,23 @@ namespace http
             return decoded;
         }
 
+        /// @brief A parsed HTTP request as passed to request handlers.
         struct HttpRequest
         {
-            std::string client;
-            std::string method;
-            std::string uri;
-            std::string protocol;
+            std::string client;    ///< Peer address as "ip:port".
+            std::string method;    ///< Request method, e.g. "GET". Handlers see "GET" for HEAD requests.
+            std::string uri;       ///< Request target exactly as received (path plus any query string), not decoded.
+            std::string protocol;  ///< "HTTP/1.0" or "HTTP/1.1".
+            /// @brief Header fields keyed by Title-Case name (see normalize_header_name()).
+            ///        Repeated fields are joined with ", ". Look up with has_header() /
+            ///        get_header_value() to avoid case mismatches.
             std::map<std::string, std::string> headers;
-            std::string content;
+            std::string content;   ///< Request body; a chunked body is already decoded (Content-Length is then set).
 
             // Convenience methods for header access
 
-            /// @brief Normalize header name to Title-Case format
+            /// @brief Normalize a header name to Title-Case (each '-'-separated word
+            ///        capitalized, the rest lower-cased), e.g. "x-api-KEY" -> "X-Api-Key".
             /// @param name Header name in any case
             /// @return Normalized header name
             static std::string normalize_header_name(const std::string& name)
@@ -513,10 +569,15 @@ namespace http
                 return (it != headers.end()) ? it->second : "";
             }
             
-            /// @brief Parse query parameters from URI with security validation
-            /// @return Map of query parameter key-value pairs
-            /// @throws std::invalid_argument on invalid encoding or exceeded limits
-            /// @note Performs URL decoding and validates all inputs
+            /// @brief Parse the query string of #uri (a fragment, if any, is ignored).
+            /// @return Map of key to URL-decoded value; a bare "key" maps to "".
+            ///         For duplicate keys the last value wins.
+            /// @throws std::invalid_argument on invalid percent-encoding, an empty
+            ///         parameter ("a&&b"), an empty key, a key with characters other
+            ///         than alphanumerics, '_', '-' or '.', or when the count/length
+            ///         limits in config (MAX_QUERY_PARAMS, MAX_QUERY_KEY_LENGTH,
+            ///         MAX_QUERY_VALUE_LENGTH) are exceeded.
+            /// @note Keys are not URL-decoded. The query is re-parsed on every call.
             std::map<std::string, std::string> parse_query() const
             {
                 std::map<std::string, std::string> params;
@@ -611,8 +672,9 @@ namespace http
                 return params;
             }
             
-            /// @brief Get accepted MIME types from Accept header
-            /// @return Vector of MIME types sorted by quality factor
+            /// @brief List the media ranges in the Accept header.
+            /// @return Media ranges in header order with parameters (including ";q=")
+            ///         removed; not sorted by quality. Empty if there is no Accept header.
             std::vector<std::string> get_accepted_types() const
             {
                 std::vector<std::string> types;
@@ -658,9 +720,13 @@ namespace http
                 return types;
             }
             
-            /// @brief Check if request accepts a specific MIME type
+            /// @brief Check whether the Accept header admits a media type.
             /// @param mime_type The MIME type to check (e.g., "application/json")
-            /// @return true if the type is accepted or no Accept header present
+            /// @return true if there is no Accept header, or it contains "*/*",
+            ///         @p mime_type, or "type/*" for its type.
+            /// @note This is a substring search: quality values (including q=0) are
+            ///       ignored, and "application/json" also matches e.g.
+            ///       "application/json-seq".
             bool accepts(const std::string& mime_type) const
             {
                 auto it = headers.find("Accept");
@@ -698,24 +764,38 @@ namespace http
             }
         };
 
+        /// @brief The response a request handler fills in.
+        ///
+        /// A handler either sets a status (set_status() or its return value) and/or
+        /// a body (set_content(), send(), send_chunk()), or starts a stream with
+        /// send_chunk_stream(). The server then adds Server, Connection, Date,
+        /// Content-Length (or Transfer-Encoding: chunked) and, if enabled, CORS headers.
         struct HttpResponse
         {
-            int code = 0;
-            std::string message;
+            int code = 0;         ///< Status code; 0 = not set (see HttpServer request dispatch).
+            std::string message;  ///< Reason phrase; filled from the status code when empty.
+            /// @brief Response header fields. set_header() stores Title-Case names; when
+            ///        writing this map directly, use the same form so server-managed
+            ///        headers (e.g. Content-Length) are replaced rather than duplicated.
             std::map<std::string, std::string> headers;
-            std::string body;
+            std::string body;     ///< Buffered response body (ignored for streaming responses).
 
             // Streaming support
-            bool streaming = false;
-            bool useChunkedEncoding = false;
-            std::function<std::string()> streamCallback;  // Returns chunk data, empty string = end
-            std::function<void()> onStreamEnd;            // Called when stream completes
+            bool streaming = false;           ///< Streaming response; set by send_chunk_stream().
+            bool useChunkedEncoding = false;  ///< Use chunked transfer coding; set by send_chunk_stream().
+            /// @brief Produces the next chunk of a streaming response; returning an empty
+            ///        string ends the stream. Set by send_chunk_stream().
+            std::function<std::string()> streamCallback;
+            /// @brief Invoked once after the stream callback returns "".
+            /// @note Runs with the server's internal connection lock held; keep it short.
+            std::function<void()> onStreamEnd;
 
             // Convenience methods for API consistency
 
-            /// @brief Set HTTP status code
+            /// @brief Set the HTTP status code, which also marks the request as handled.
             /// @param statusCode HTTP status code (e.g., 200, 404, 500)
-            /// @param statusMessage Optional custom message (defaults to standard message)
+            /// @param statusMessage Optional reason phrase; empty selects the standard
+            ///        one (HttpServer::getDefaultResponseMessage()).
             void set_status(int statusCode, const std::string& statusMessage = "")
             {
                 code = statusCode;
@@ -730,25 +810,35 @@ namespace http
                 headers[HttpRequest::normalize_header_name(name)] = value;
             }
 
-            /// @brief Set response content with optional content type
+            /// @brief Replace the body and set the Content-Type header.
             /// @param content Response body content
-            /// @param contentType MIME type (defaults to text/plain)
+            /// @param contentType MIME type (defaults to CONTENT_TYPE_TEXT)
             void set_content(const std::string& content, const std::string& contentType = CONTENT_TYPE_TEXT)
             {
                 body = content;
                 headers[constants::CONTENT_TYPE] = contentType;
             }
 
-            /// @brief Send response body (convenience alias for set_content)
+            /// @brief Replace the response body. Unlike set_content(), Content-Type is
+            ///        left unchanged.
+            /// @note Nothing is sent until the handler returns.
             /// @param content Response body content
             void send(const std::string& content)
             {
                 body = content;
             }
 
-            /// @brief Setup streaming response with chunked encoding
+            /// @brief Make this a streaming response sent with chunked transfer coding.
+            ///
+            /// After the headers are sent the server calls @p callback repeatedly and
+            /// sends each returned string as one chunk immediately; returning "" ends
+            /// the stream, after which @p callback is not called again and @p onEnd runs.
+            /// @note Without a thread pool the callback runs on the reactor thread and
+            ///       blocks every other connection while it waits; with
+            ///       HttpServer::enableThreadPool() each call runs on a worker thread.
+            ///       The callback may be copied, but all copies share one state.
             /// @param callback Function that returns chunk data (empty string = end of stream)
-            /// @param onEnd Optional callback when stream completes
+            /// @param onEnd Optional callback invoked once when the stream ends
             void send_chunk_stream(std::function<std::string()> callback, std::function<void()> onEnd = nullptr)
             {
                 streaming = true;
@@ -769,32 +859,49 @@ namespace http
             }
         };
 
+        /// @brief Request handler signature.
+        ///
+        /// Return a non-zero HTTP status to handle the request with that status, -1 to
+        /// close the connection without a response, or 0 to leave the status to the
+        /// response: the request still counts as handled if the handler called
+        /// set_status() or set a body / stream (status then defaults to 200). Returning
+        /// 0 without touching the response declines, and the next matching route runs.
         using CallbackFunction = std::function<int(HttpRequest const& request, HttpResponse& response)>;
 
+        /// @brief Polymorphic request handler: wraps a CallbackFunction, or override
+        ///        onHttpRequest() in a subclass.
         class HttpRequestCallback
         {
         protected:
-            CallbackFunction callback = nullptr;
+            CallbackFunction callback = nullptr;  ///< Wrapped function; may be empty.
 
         public:
+            /// @brief Create a handler with no function (declines every request).
             HttpRequestCallback() {};
 
             virtual ~HttpRequestCallback() = default;
 
+            /// @brief Copy the wrapped function from @p other.
             HttpRequestCallback& operator=(HttpRequestCallback other)
             {
                 callback = other.callback;
                 return *this;
             };
 
+            /// @brief Wrap @p func.
             HttpRequestCallback(CallbackFunction func) : callback(func) {};
 
+            /// @brief Replace the wrapped function.
             HttpRequestCallback& operator=(CallbackFunction func)
             {
                 callback = func;
                 return (*this);
             }
 
+            /// @brief Handle a request. The default calls the wrapped function.
+            /// @param request The parsed request.
+            /// @param response Response to fill in.
+            /// @return See CallbackFunction; 0 if no function is set.
             virtual int onHttpRequest(HttpRequest const& request, HttpResponse& response)
             {
                 if (callback != nullptr)
@@ -805,88 +912,120 @@ namespace http
             };
         };
 
-        // Simple HTTP server
-        // Goals:
-        //   - Support enough of HTTP to be used as a mock
-        //   - Be flexible to allow creating various test scenarios
-        // Out of scope:
-        //   - Performance
-        //   - Full support of RFC 7230-7237
+        /// @brief Small embeddable HTTP/1.x server driven by a single reactor thread.
+        ///
+        /// Typical use:
+        /// @code
+        ///   HttpServer server("my-server", 0);         // bind all IPv4 interfaces, ephemeral port
+        ///   server.route("/api/", [](const HttpRequest& req, HttpResponse& res) {
+        ///       res.set_content("{}", CONTENT_TYPE_JSON);
+        ///       return 200;
+        ///   });
+        ///   server.start();                           // non-blocking
+        ///   int port = server.getListeningPort();
+        ///   // ...
+        ///   server.stop();
+        /// @endcode
+        ///
+        /// Routing: every handler whose path is a prefix of the request URI is a
+        /// candidate. Candidates run longest prefix first, then in registration order,
+        /// until one handles the request (see CallbackFunction). If none does, OPTIONS
+        /// gets 204 (CORS enabled) or 405, DELETE with an Mcp-Session-Id header
+        /// terminates that session (200/404; 400 without the header), and anything
+        /// else gets 404. HEAD is dispatched as GET and a buffered body is dropped.
+        ///
+        /// Threading: by default handlers and stream callbacks run on the reactor
+        /// thread, one at a time, so a slow handler stalls all connections. With
+        /// enableThreadPool() they run on worker threads instead.
+        ///
+        /// Configuration (listening ports, routes, limits, keep-alive, CORS, thread
+        /// pool) is not synchronized with the reactor: finish it before start().
+        ///
+        /// Goals: enough of HTTP to embed or mock a service. Out of scope: high
+        /// performance, TLS, full RFC 9110/9112 coverage.
         class HttpServer : private Reactor::SocketCallback
         {
         protected:
+            /// @brief Per-connection state, keyed by socket in m_connections.
             struct Connection
             {
-                Socket socket;
-                std::string receiveBuffer;
-                std::string sendBuffer;
+                Socket socket;              ///< Client socket.
+                std::string receiveBuffer;  ///< Received bytes not yet consumed by the parser.
+                std::string sendBuffer;     ///< Bytes queued for sending.
+                /// @brief Connection state machine position.
                 enum
                 {
-                    Idle,
-                    ReceivingHeaders,
-                    Sending100Continue,
-                    ReceivingBody,
-                    Processing,
-                    ProcessingAsync,  // New: processing in thread pool
-                    SendingHeaders,
-                    SendingBody,
-                    StreamingChunked,  // New: sending chunked data
-                    Closing,
-                    ReceivingChunkedBody  // Decoding a "Transfer-Encoding: chunked" request body
+                    Idle,                 ///< Between requests; per-request state is reset on the next pass.
+                    ReceivingHeaders,     ///< Waiting for the complete request head.
+                    Sending100Continue,   ///< Sending "100 Continue" before reading the body.
+                    ReceivingBody,        ///< Reading a Content-Length delimited body.
+                    Processing,           ///< Request complete; handlers about to run.
+                    ProcessingAsync,      ///< Handler or stream callback running on the thread pool.
+                    SendingHeaders,       ///< Sending the status line and headers.
+                    SendingBody,          ///< Sending the buffered body (or the terminal chunk).
+                    StreamingChunked,     ///< Producing and sending chunks of a streaming response.
+                    Closing,              ///< Send side shut down; waiting for the peer to close.
+                    ReceivingChunkedBody  ///< Decoding a "Transfer-Encoding: chunked" request body.
                 } state = Idle;
-                size_t contentLength = 0;
-                bool keepalive = false;
-                HttpRequest request;
-                HttpResponse response;
+                size_t contentLength = 0;  ///< Declared Content-Length of the current request body.
+                bool keepalive = false;    ///< Whether the connection stays open after this response.
+                HttpRequest request;       ///< Current request.
+                HttpResponse response;     ///< Current response.
 
                 // Streaming state
-                bool streamingActive = false;
-                size_t chunksSent = 0;
+                bool streamingActive = false;  ///< A streaming response is in progress.
+                size_t chunksSent = 0;         ///< Chunks sent so far in the current stream.
 
                 // Chunked request-body decoder state
-                bool chunkedRequest = false;
+                bool chunkedRequest = false;   ///< Current request body uses chunked transfer coding.
+                /// @brief Chunked request-body decoder position.
                 enum
                 {
-                    ChunkSize,     // expecting "<hex-size>[;ext]\r\n"
-                    ChunkData,     // copying chunk payload
-                    ChunkDataEnd,  // expecting the CRLF that follows the payload
-                    ChunkTrailer   // skipping trailer fields up to the empty line
+                    ChunkSize,     ///< Expecting the chunk-size line: hex size, optional ";ext", CRLF.
+                    ChunkData,     ///< Copying chunk payload.
+                    ChunkDataEnd,  ///< Expecting the CRLF that follows the payload.
+                    ChunkTrailer   ///< Skipping trailer fields up to the empty line.
                 } chunkState = ChunkSize;
-                size_t chunkRemaining = 0;
-                size_t trailerBytes = 0;
+                size_t chunkRemaining = 0;  ///< Payload bytes left in the current chunk.
+                size_t trailerBytes = 0;    ///< Trailer bytes consumed (bounded by the header size limit).
 
-                // Set when the connection must be torn down (a handler returned -1,
-                // or a hard send error). The connection is closed - and erased from
-                // m_connections - only by handleConnection()/onSocketWritable(), as
-                // the very last step, so nothing touches it afterwards.
+                /// @brief Set when the connection must be torn down (a handler returned -1,
+                /// or a hard send error). The connection is closed - and erased from
+                /// m_connections - only by handleConnection() or flushAndContinue(), as
+                /// the very last step, so nothing touches it afterwards.
                 bool closeRequested = false;
 
-                // Identifies the in-flight thread-pool dispatch; lets the worker detect
-                // that the connection was closed (and its fd possibly reused) meanwhile.
+                /// @brief Identifies the in-flight thread-pool dispatch; lets the worker detect
+                /// that the connection was closed (and its fd possibly reused) meanwhile.
                 uint64_t asyncToken = 0;
             };
 
-            std::string m_serverHost;
-            bool allowKeepalive{ true };
-            Reactor m_reactor;
-            std::list<Socket> m_listeningSockets;
-            std::vector<int> m_listeningPorts;
+            std::string m_serverHost;                ///< Value of the "Server" response header.
+            bool allowKeepalive{ true };             ///< Server-wide keep-alive switch (setKeepalive()).
+            Reactor m_reactor;                       ///< Socket event loop; owns the I/O thread.
+            std::list<Socket> m_listeningSockets;    ///< Listening sockets, in the order added.
+            std::vector<int> m_listeningPorts;       ///< Bound port of each listening socket.
 
+            /// @brief A route: URI prefix (first) and non-owning handler pointer (second).
+            ///        A null handler is skipped during dispatch.
             class HttpRequestHandler : public std::pair<std::string, HttpRequestCallback*>
             {
             public:
+                /// @brief Route @p key to @p value (not owned; may be null).
                 HttpRequestHandler(std::string key, HttpRequestCallback* value)
                 {
                     first = key;
                     second = value;
                 };
 
+                /// @brief Empty route ("" with no handler).
                 HttpRequestHandler() : std::pair<std::string, HttpRequestCallback*>()
                 {
                     first = "";
                     second = nullptr;
                 };
 
+                /// @brief Replace both the prefix and the handler.
                 HttpRequestHandler& operator=(std::pair<std::string, HttpRequestCallback*> other)
                 {
                     first = other.first;
@@ -894,12 +1033,14 @@ namespace http
                     return (*this);
                 };
 
+                /// @brief Set the handler (stored by address; @p cb must outlive the server).
                 HttpRequestHandler& operator=(HttpRequestCallback& cb)
                 {
                     second = &cb;
                     return (*this);
                 };
 
+                /// @brief Set the handler pointer (not owned; null disables the route).
                 HttpRequestHandler& operator=(HttpRequestCallback* cb)
                 {
                     second = cb;
@@ -907,23 +1048,29 @@ namespace http
                 };
             };
 
-            std::list<HttpRequestHandler> m_handlers;
-            std::list<std::unique_ptr<HttpRequestCallback>> m_ownedCallbacks;  // Callbacks created by route()
+            std::list<HttpRequestHandler> m_handlers;  ///< Routes in registration order.
+            std::list<std::unique_ptr<HttpRequestCallback>> m_ownedCallbacks;  ///< Callbacks created by route(), owned by the server.
 
-            std::map<Socket, Connection> m_connections;
-            std::mutex m_connectionsMutex;  // Protects m_connections
-            std::optional<BS::thread_pool<>> m_threadPool;
-            std::atomic<uint64_t> m_asyncSerial{0};  // tokens for dispatchToThreadPool()  // Optional thread pool for async request processing
-            size_t m_maxRequestHeadersSize, m_maxRequestContentSize;
-            size_t m_maxSessions;  // Maximum allowed sessions
+            std::map<Socket, Connection> m_connections;  ///< Open client connections; guarded by m_connectionsMutex.
+            std::mutex m_connectionsMutex;               ///< Protects m_connections and each Connection.
+            std::optional<BS::thread_pool<>> m_threadPool;  ///< Worker pool for handlers and stream callbacks, if enabled.
+            std::atomic<uint64_t> m_asyncSerial{0};  ///< Source of Connection::asyncToken values for thread-pool dispatches.
+            /// @brief Request head size limit (setRequestLimits()).
+            size_t m_maxRequestHeadersSize, m_maxRequestContentSize;  ///< Request body size limit (setRequestLimits()).
+            size_t m_maxSessions;  ///< Initialized to config::DEFAULT_MAX_SESSIONS but currently unused (not forwarded to m_sessionManager).
 
-            SessionManager m_sessionManager;
-            CorsConfig m_corsConfig;
-            std::atomic<bool> m_stopped{false};
+            SessionManager m_sessionManager;  ///< Sessions used by createSession() and the built-in DELETE handling.
+            CorsConfig m_corsConfig;          ///< CORS settings.
+            std::atomic<bool> m_stopped{false};  ///< Set by stop(); cleared by start().
 
         public:
+            /// @brief Enable or disable HTTP keep-alive for all connections.
+            /// @note When false, every response is sent with "Connection: close".
+            ///       Call before start().
             void setKeepalive(bool keepAlive) { allowKeepalive = keepAlive; }
 
+            /// @brief Create a server named "unnamed" with no listening socket; add one
+            ///        with addListeningPort() before start().
             HttpServer()
                 : m_serverHost("unnamed"),
                 allowKeepalive(true),
@@ -932,8 +1079,14 @@ namespace http
                 m_maxRequestContentSize(config::MAX_HTTP_BODY_SIZE),
                 m_maxSessions(config::DEFAULT_MAX_SESSIONS) {};
 
+            /// @brief Create a server and bind a listening socket on all IPv4 interfaces.
+            /// @note @p serverHost is not a bind address: it only forms the "Server"
+            ///       header ("serverHost:port", with the port as passed). To bind a
+            ///       specific address, use the default constructor and
+            ///       addListeningPort(host, port). Requests are served after start().
             /// @param serverHost Name used in the "Server" response header
             /// @param port Port to listen on; 0 picks an ephemeral port (see getListeningPort())
+            /// @throws std::runtime_error if the port cannot be bound or listened on.
             HttpServer(std::string serverHost, int port = 30000) : HttpServer()
             {
                 std::ostringstream os;
@@ -942,6 +1095,9 @@ namespace http
                 addListeningPort(port);
             };
 
+            /// @brief Stop the server, wait for queued thread-pool work to finish, and
+            ///        close all listening and client sockets.
+            /// @warning Blocks until in-flight handlers and stream callbacks return.
             virtual ~HttpServer()
             {
                 // Join the reactor thread first: its callbacks use this object, so it
@@ -970,20 +1126,28 @@ namespace http
                 m_connections.clear();
             }
 
+            /// @brief Set request size limits.
+            /// @param maxRequestHeadersSize Maximum size of the request line plus headers
+            ///        (and of chunked-body trailers); larger requests get 431.
+            /// @param maxRequestContentSize Maximum request body size; larger bodies get 413.
+            /// @note Defaults: config::MAX_HTTP_HEADER_SIZE / config::MAX_HTTP_BODY_SIZE.
+            ///       Call before start().
             void setRequestLimits(size_t maxRequestHeadersSize, size_t maxRequestContentSize)
             {
                 m_maxRequestHeadersSize = maxRequestHeadersSize;
                 m_maxRequestContentSize = maxRequestContentSize;
             }
 
+            /// @brief Set the value of the "Server" response header. Call before start().
             void setServerName(std::string const& name) { m_serverHost = name; }
 
             /// @brief Run request handlers (and streaming callbacks) on a worker pool so
             /// slow handlers never block the I/O reactor or other connections.
-            /// @note Handlers may then run concurrently for different connections and
-            ///       must be thread-safe. Requests on one connection are still handled in
-            ///       order. Call before start().
-            /// @param numThreads Worker count (0 = hardware concurrency)
+            /// @note Handlers and stream callbacks may then run concurrently for
+            ///       different connections and must be thread-safe. Requests on one
+            ///       connection are still handled in order. Call before start();
+            ///       calling again replaces the pool (waiting for queued work).
+            /// @param numThreads Worker count (0 = hardware concurrency, or 4 if unknown)
             void enableThreadPool(size_t numThreads = 0)
             {
                 if (numThreads == 0)
@@ -995,22 +1159,35 @@ namespace http
                 LOG_INFO("HttpServer: Thread pool enabled with %zu threads", numThreads);
             }
 
+            /// @brief Destroy the worker pool (waiting for queued work); handlers then run
+            ///        on the reactor thread again.
+            /// @warning Not synchronized with the reactor: call only while the server
+            ///          is not running.
             void disableThreadPool()
             {
                 m_threadPool.reset();
                 LOG_INFO("HttpServer: Thread pool disabled");
             }
 
+            /// @brief Whether enableThreadPool() is in effect.
             bool isThreadPoolEnabled() const
             {
                 return m_threadPool.has_value();
             }
 
             // CORS configuration
+
+            /// @brief Enable or disable CORS headers on all responses and 204 answers to
+            ///        otherwise unhandled OPTIONS (preflight) requests. Call before start().
             void enableCors(bool enabled = true) { m_corsConfig.enabled = enabled; }
 
+            /// @brief Set Access-Control-Allow-Origin (default "*"). Call before start().
             void setCorsOrigin(const std::string& origin) { m_corsConfig.allowOrigin = origin; }
 
+            /// @brief Set Access-Control-Allow-Headers and, if non-empty,
+            ///        Access-Control-Expose-Headers. Call before start().
+            /// @param allowHeaders Access-Control-Allow-Headers value.
+            /// @param exposeHeaders Access-Control-Expose-Headers value; empty keeps the current one.
             void setCorsHeaders(const std::string& allowHeaders, const std::string& exposeHeaders = "")
             {
                 m_corsConfig.allowHeaders = allowHeaders;
@@ -1021,31 +1198,46 @@ namespace http
             }
 
             // Session management
+
+            /// @brief Set the idle timeout of sessions (see SessionManager::setSessionTimeout()).
+            /// @note Thread-safe.
             void setSessionTimeout(std::chrono::seconds timeout)
             {
                 m_sessionManager.setSessionTimeout(timeout);
             }
 
+            /// @brief Create a session (see SessionManager::createSession()).
+            /// @return The new session ID.
+            /// @throws std::runtime_error if the session limit is reached.
+            /// @note Thread-safe.
             std::string createSession()
             {
                 return m_sessionManager.createSession();
             }
 
+            /// @brief Check a session and refresh its idle timer (see
+            ///        SessionManager::validateSession()).
+            /// @return true if the session exists and has not expired.
+            /// @note Thread-safe.
             bool validateSession(const std::string& sessionId)
             {
                 return m_sessionManager.validateSession(sessionId);
             }
 
+            /// @brief Remove a session.
+            /// @return true if the session existed.
+            /// @note Thread-safe. An unhandled DELETE request carrying an
+            ///       Mcp-Session-Id header calls this too.
             bool terminateSession(const std::string& sessionId)
             {
                 return m_sessionManager.terminateSession(sessionId);
             }
 
-            /// @brief Listen on an additional port (0 = ephemeral).
-            /// @return The port actually bound.
             /// @brief Listen on all IPv4 interfaces (INADDR_ANY).
             /// @param port Port to listen on; 0 picks an ephemeral port
             /// @return The bound port
+            /// @throws std::runtime_error if the socket cannot be bound or listened on.
+            /// @note Call before start().
             int addListeningPort(int port)
             {
                 return addListeningSocket(SocketAddr(static_cast<u_long>(0), port));
@@ -1056,6 +1248,8 @@ namespace http
             /// @param host Local address or hostname to bind to
             /// @param port Port to listen on; 0 picks an ephemeral port
             /// @return The bound port
+            /// @throws std::runtime_error if the socket cannot be bound or listened on.
+            /// @note Call before start().
             int addListeningPort(const std::string& host, int port)
             {
                 return addListeningSocket(SocketAddr(host.c_str(), port));
@@ -1112,6 +1306,13 @@ namespace http
                 return m_listeningPorts;
             }
 
+            /// @brief Register @p handler for every URI starting with @p root.
+            /// @param root URI prefix to match (plain string prefix, e.g. "/api/").
+            /// @param handler Handler object; stored by address, not owned - it must
+            ///        outlive the server.
+            /// @return The new route entry.
+            /// @note Routes are tried longest prefix first, then in registration order.
+            ///       Not thread-safe: register routes before start().
             HttpRequestHandler& addHandler(const std::string& root, HttpRequestCallback& handler)
             {
                 // No thread-safety here!
@@ -1120,6 +1321,10 @@ namespace http
                 return m_handlers.back();
             }
 
+            /// @brief Add a route for @p root with no handler yet; assign one to the
+            ///        result, e.g. `server["/x"] = myCallback;` (stored by address, not owned).
+            /// @note Every call appends a new route, even for an existing prefix. A
+            ///       route left without a handler is ignored. Register before start().
             HttpRequestHandler& operator[](const std::string& root)
             {
                 // No thread-safety here!
@@ -1128,6 +1333,8 @@ namespace http
                 return m_handlers.back();
             }
 
+            /// @brief Register a {prefix, handler} pair; same as addHandler().
+            /// @note The handler is stored by address and must outlive the server.
             HttpServer& operator+=(std::pair<const std::string&, HttpRequestCallback&> other)
             {
                 LOG_INFO("HttpServer: Added handler for %s", other.first.c_str());
@@ -1135,11 +1342,17 @@ namespace http
                 return (*this);
             };
 
-            /// @brief Register a route with a handler function (convenience method)
+            /// @brief Register a handler function for every URI starting with @p path.
+            ///
+            /// Matching is a plain string prefix test on the raw request target, so
+            /// "/api" also matches "/apix" and "/api?x=1". Routes are tried longest
+            /// prefix first, then in registration order, until one handles the request
+            /// (see CallbackFunction for what counts as handled).
             /// @param path URI prefix to match
             /// @param handler Callback function to handle requests
-            /// @return Reference to the created handler
-            /// @note The callback object is owned by the server.
+            /// @return Reference to the created route entry
+            /// @note The callback object is owned by the server. Not thread-safe:
+            ///       register routes before start().
             HttpRequestHandler& route(const std::string& path, CallbackFunction handler)
             {
                 m_ownedCallbacks.push_back(std::make_unique<HttpRequestCallback>(std::move(handler)));
@@ -1148,13 +1361,19 @@ namespace http
                 return m_handlers.back();
             }
 
-            /// @brief Set maximum request content size (convenience alias)
+            /// @brief Set the maximum request body size (see setRequestLimits()); larger
+            ///        bodies get 413. Call before start().
             /// @param maxSize Maximum allowed content size in bytes
             void setMaxRequestContentSize(size_t maxSize)
             {
                 m_maxRequestContentSize = maxSize;
             }
 
+            /// @brief Start the reactor thread and begin serving. Non-blocking: returns
+            ///        immediately.
+            /// @note Add listening ports, routes and settings before calling this.
+            ///       Restarting after stop() is not supported (stop() unregisters the
+            ///       listening sockets and closes the first one).
             void start()
             {
                 m_stopped = false;
@@ -1162,6 +1381,8 @@ namespace http
             }
 
             /// @brief Stop serving and join the reactor thread. Idempotent.
+            /// @note Client connections are closed by the destructor, not here. Thread-pool
+            ///       work already queued still runs, but no longer sends responses.
             void stop()
             {
                 if (m_stopped.exchange(true))
@@ -1180,6 +1401,8 @@ namespace http
             }
 
         protected:
+            /// @brief Reactor callback: accept a client on listening socket @p socket
+            ///        and register the new connection. Runs on the reactor thread.
             virtual void onSocketAcceptable(Socket socket) override
             {
                 LOG_TRACE("HttpServer: accepting socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
@@ -1203,6 +1426,9 @@ namespace http
                 }
             }
 
+            /// @brief Reactor callback: read available bytes and advance the connection's
+            ///        state machine (which may run handlers when no thread pool is used).
+            ///        Closes the connection on EOF or a hard error. Runs on the reactor thread.
             virtual void onSocketReadable(Socket socket) override
             {
                 LOG_TRACE("HttpServer: reading socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
@@ -1234,6 +1460,8 @@ namespace http
                 handleConnection(conn);  // May close and erase conn - must be the last use
             }
 
+            /// @brief Reactor callback: send pending output and continue the state
+            ///        machine (see flushAndContinue()). Runs on the reactor thread.
             virtual void onSocketWritable(Socket socket) override
             {
                 LOG_TRACE("HttpServer: writing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
@@ -1269,6 +1497,8 @@ namespace http
                 handleConnection(conn);
             }
 
+            /// @brief Reactor callback: the peer closed (or reset) the connection; close
+            ///        it and erase its state. Runs on the reactor thread.
             virtual void onSocketClosed(Socket socket) override
             {
                 LOG_TRACE("HttpServer: closing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
@@ -1286,6 +1516,8 @@ namespace http
                 handleConnectionClosed(conn);
             }
 
+            /// @brief Whether a socket error means "try again later" (would-block,
+            ///        EINTR, EAGAIN) rather than a broken connection.
             static bool isTransientSocketError(int err)
             {
                 if (err == Socket::ErrorWouldBlock)
@@ -1463,6 +1695,7 @@ namespace http
                 return true;
             }
 
+            /// @brief Return @p s with ASCII letters lower-cased.
             static std::string toLowerAscii(std::string s)
             {
                 for (char& c : s)
@@ -1472,6 +1705,7 @@ namespace http
                 return s;
             }
 
+            /// @brief Strip leading and trailing optional whitespace (spaces and tabs).
             static std::string trimOws(const std::string& s)
             {
                 size_t b = s.find_first_not_of(" \t");
@@ -1647,6 +1881,11 @@ namespace http
                 }
             }
 
+            /// @brief Advance the connection state machine as far as the buffered input
+            ///        and socket allow: parse the head, read the body, run handlers (or
+            ///        dispatch them to the thread pool), and send the response or stream.
+            /// @note Called with m_connectionsMutex held. Sets conn.closeRequested
+            ///       instead of closing; use handleConnection(), which then closes.
             void runConnection(Connection& conn)
             {
                 for (;;)
@@ -2045,6 +2284,7 @@ namespace http
                 return parseRequestHead(conn, consumed) == 0;
             }
 
+            /// @brief Whether @p c is an RFC 9110 "tchar" (valid in a header field name).
             static bool isTokenChar(unsigned char c)
             {
                 if (std::isalnum(c))
@@ -2303,6 +2543,7 @@ namespace http
                 return 0;
             }
 
+            /// @brief Case-insensitive equality of @p str with the lower-case string @p mask.
             static bool equalsLowercased(std::string const& str, char const* mask)
             {
                 char const* ptr = str.c_str();
@@ -2314,17 +2555,19 @@ namespace http
                 return !*ptr && !*mask;
             }
 
+            /// @brief HttpRequest::normalize_header_name() for the range [begin, end).
             static std::string normalizeHeaderName(char const* begin, char const* end)
             {
                 return HttpRequest::normalize_header_name(std::string(begin, end));
             }
 
+            /// @brief Whether responses with this status never carry a body (1xx, 204, 304).
             static bool isBodylessStatus(int code)
             {
                 return (code >= 100 && code < 200) || code == 204 || code == 304;
             }
 
-            /// Serialize the status line and headers and move to SendingHeaders.
+            /// @brief Serialize the status line and headers and move to SendingHeaders.
             void beginResponse(Connection& conn)
             {
                 std::ostringstream os;
@@ -2341,7 +2584,7 @@ namespace http
                 LOG_TRACE("HttpServer: [%s] sending headers", conn.request.client.c_str());
             }
 
-            /// Run processRequest() for `conn` on the thread pool.
+            /// @brief Run processRequest() for `conn` on the thread pool.
             ///
             /// The handlers work on a detached copy of the request, so the reactor can
             /// keep serving other connections (and may even close this one) meanwhile.
@@ -2393,6 +2636,19 @@ namespace http
                 });
             }
 
+            /// @brief Dispatch the request to the matching routes and finalize the
+            ///        response headers.
+            ///
+            /// If conn.response.code is already non-zero (the request was rejected
+            /// while being read), only the error response is prepared. Otherwise
+            /// candidate routes run longest prefix first, then in registration order,
+            /// until one handles the request (see CallbackFunction); -1 sets
+            /// conn.closeRequested. Unhandled requests get the built-in OPTIONS /
+            /// DELETE / 404 fallbacks. Finally Server, Connection, Date, CORS and
+            /// framing headers are set; buffered bodies of HEAD and 1xx/204/304
+            /// responses are dropped (a streaming response is sent as is).
+            /// @note Runs user handlers: on the reactor thread with m_connectionsMutex
+            ///       held, or on a pool worker without it (on a detached Connection).
             void processRequest(Connection& conn)
             {
                 conn.response.message.clear();
@@ -2605,6 +2861,8 @@ namespace http
                 }
             }
 
+            /// @brief Format @p time as an IMF-fixdate for the Date header,
+            ///        e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
             static std::string formatTimestamp(time_t time)
             {
                 tm tm;
@@ -2619,6 +2877,8 @@ namespace http
             }
 
         public:
+            /// @brief Standard reason phrase for an HTTP status code.
+            /// @return e.g. "Not Found" for 404, or "???" for an unknown code.
             static char const* getDefaultResponseMessage(int code)
             {
                 switch (code)
