@@ -2302,6 +2302,8 @@ namespace http
             }
 
             /// @brief Parse request-line and header fields from conn.receiveBuffer.
+            /// @param conn Connection whose receiveBuffer holds the request head; its
+            ///        request fields are filled in.
             /// @param consumed Receives the number of bytes making up the request head
             ///        (including the terminating empty line).
             /// @return 0 on success, otherwise the HTTP status to reply with.

@@ -385,7 +385,7 @@ namespace mcp
 
             /// @brief Extract the "id:" field of the first event in a raw SSE string.
             /// @param event Raw SSE text.
-            /// @return The id value (one leading space and a trailing '\r' removed), or ""
+            /// @return The id value (one leading space and a trailing CR removed), or ""
             ///         if the first event has none.
             static std::string sseEventId(const std::string& event)
             {
