@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+/// @file socket_tools.h
+/// @brief Cross-platform socket primitives: SocketAddr, Socket (non-owning handle),
+///        ScopedSocket (owning RAII handle) and the event-driven Reactor
+///        (epoll on Linux, kqueue on Apple, WSAEventSelect on Windows).
+
 #include <SocketsHpp/config.h>
 
 #include <algorithm>
@@ -68,6 +73,8 @@
 #  endif
 
 #else
+/// @brief Defined when Unix domain sockets (AF_UNIX / sockaddr_un) are available:
+///        always on POSIX, on Windows when <afunix.h> exists and USE_UNIX_SOCKETS is not defined.
 #  define HAVE_UNIX_DOMAIN
 #  include <unistd.h>
 
@@ -100,24 +107,23 @@ namespace net
 {
     namespace common {
 
-        /// <summary>
-        /// A simple thread, derived class overloads onThread() method.
-        /// </summary>
+        /// @brief Minimal worker-thread base class; derived classes implement onThread().
+        /// @note The worker should poll shouldTerminate() and return when it is set;
+        ///       joinThread() only raises the flag and joins, it does not interrupt.
         struct Thread
         {
+            /// @brief Worker thread object (not joinable until startThread()).
             std::thread m_thread;
 
+            /// @brief Cooperative stop flag, set by joinThread() and cleared by startThread().
             std::atomic<bool> m_terminate{ false };
 
-            /// <summary>
-            /// Thread Constructor
-            /// </summary>
-            /// <returns>Thread</returns>
+            /// @brief Construct an idle thread object; no thread is started.
             Thread() {}
 
-            /// <summary>
-            /// Start Thread
-            /// </summary>
+            /// @brief Start the worker thread running onThread().
+            /// @param wait If true, call waitForStart() before returning.
+            /// @note No-op if the thread is already running (joinable).
             void startThread(bool wait = true)
             {
                 if (m_thread.joinable())
@@ -134,9 +140,9 @@ namespace net
                 }
             }
 
-            /// <summary>
-            /// Wait for thread start
-            /// </summary>
+            /// @brief Spin (yielding) until the std::thread object is joinable.
+            /// @note This only waits for the thread object to exist; it does not
+            ///       guarantee that onThread() has started executing.
             void waitForStart()
             {
                 while (!m_thread.joinable())
@@ -145,9 +151,9 @@ namespace net
                 }
             }
 
-            /// <summary>
-            /// Join Thread
-            /// </summary>
+            /// @brief Set the terminate flag and join the worker thread.
+            /// @note Blocks until onThread() returns. When called from the worker
+            ///       itself the thread is detached instead to avoid self-deadlock.
             void joinThread()
             {
                 m_terminate = true;
@@ -166,22 +172,17 @@ namespace net
                 }
             }
 
-            /// <summary>
-            /// Indicates if this thread should terminate
-            /// </summary>
-            /// <returns></returns>
+            /// @brief Whether the worker has been asked to stop.
+            /// @return true after joinThread() has been called.
             bool shouldTerminate() const { return m_terminate; }
 
-            /// <summary>
-            /// Must be implemented by children
-            /// </summary>
+            /// @brief Thread body, executed on the worker thread. Implemented by derived classes.
             virtual void onThread() = 0;
 
-            /// <summary>
-            /// Thread destructor. Derived classes should call joinThread() in their
-            /// own destructor (before their members are destroyed); this is a last
-            /// resort so that destroying a running thread never calls std::terminate.
-            /// </summary>
+            /// @brief Destructor; calls joinThread().
+            /// @warning Derived classes should call joinThread() in their own destructor
+            ///          (before their members are destroyed); this is a last resort so
+            ///          that destroying a running thread never calls std::terminate.
             virtual ~Thread() noexcept { joinThread(); }
         };
 
@@ -191,53 +192,53 @@ namespace net
     {
 
 #ifdef _WIN32
-        // WinSocks need extra (de)initialization, solved by a global object here,
-        // whose constructor/destructor will be called before and after main().
+        /// @brief Windows only: calls WSAStartup(2.2) on construction and WSACleanup() on destruction.
+        /// @note A static instance (g_wsaInitializer) exists per translation unit, so
+        ///       WinSock is initialized before main() and cleaned up after it.
         struct WsaInitializer
         {
+            /// @brief Initialize WinSock 2.2.
             WsaInitializer()
             {
                 WSADATA wsaData;
                 WSAStartup(MAKEWORD(2, 2), &wsaData);
             }
 
+            /// @brief Release WinSock.
             ~WsaInitializer() { WSACleanup(); }
         };
 
+        /// @brief Per-translation-unit WinSock initializer (Windows only).
         static WsaInitializer g_wsaInitializer;
 
 #endif
 
-        /// <summary>
-        /// Encapsulation of C struct sockaddr[_in|_un] with additional helper methods.
-        /// Both Internet and Unix Domain sockets are suported.
-        /// The struct may be cast directly to sockaddr:
-        /// - operator sockaddr *()
-        /// - size_t size() const - returns proper size depending on socket type.
-        /// </summary>
+        /// @brief Value type wrapping sockaddr / sockaddr_in / sockaddr_in6 / sockaddr_un.
+        ///
+        /// Supports IPv4, IPv6 and (where available, HAVE_UNIX_DOMAIN) Unix domain
+        /// addresses. Converts implicitly to `sockaddr*`; size() returns the length
+        /// matching the stored family.
         struct SocketAddr
         {
             // The union is only as big as necessary to hold its largest data member.
             // Modern OS (both Un*x and Windows) require at least sizeof(sockaddr_un).
             union
             {
-                sockaddr m_data;
-                sockaddr_in m_data_in;
-                sockaddr_in6 m_data_in6;
+                sockaddr m_data;          ///< Generic view (family in sa_family).
+                sockaddr_in m_data_in;    ///< IPv4 view.
+                sockaddr_in6 m_data_in6;  ///< IPv6 view.
 #ifdef HAVE_UNIX_DOMAIN
-                sockaddr_un m_data_un;
+                sockaddr_un m_data_un;    ///< Unix domain view.
 #endif
             };
 
+            /// @brief IPv4 loopback 127.0.0.1 in host byte order (for SocketAddr(u_long, int)).
             constexpr static u_long const Loopback = 0x7F000001;
 
-            // Indicator that the sockaddr is sockaddr_un
+            /// @brief true if the address holds a sockaddr_un (Unix domain path).
             bool isUnixDomain;
 
-            /// <summary>
-            /// SocketAddr constructor
-            /// </summary>
-            /// <returns>SocketAddr</returns>
+            /// @brief Construct an all-zero address (family unspecified, not Unix domain).
             SocketAddr()
             {
                 isUnixDomain = false;
@@ -248,6 +249,9 @@ namespace net
 #endif
             }
 
+            /// @brief Construct an IPv4 address.
+            /// @param addr IPv4 address in host byte order (e.g. SocketAddr::Loopback).
+            /// @param port Port number in host byte order.
             SocketAddr(u_long addr, int port) : SocketAddr()
             {
                 isUnixDomain = false;
@@ -256,11 +260,12 @@ namespace net
                 m_data_in.sin_addr.s_addr = htonl(addr);
             }
 
-            /// <summary>
-            /// Construct from a host (IPv4 literal, IPv6 literal with or without
-            /// square brackets, or hostname) and a numeric port. An optional
-            /// "scheme://" prefix is ignored.
-            /// </summary>
+            /// @brief Construct from a host and a separate numeric port.
+            /// @param addr IPv4 literal, IPv6 literal (with or without square brackets)
+            ///        or hostname; an optional "scheme://" prefix is ignored. Hostnames
+            ///        are resolved to IPv4 only, via blocking getaddrinfo().
+            /// @param port Port number in host byte order.
+            /// @throws std::invalid_argument if addr is null or cannot be parsed/resolved.
             SocketAddr(const char* addr, int port) : SocketAddr()
             {
                 if (addr == nullptr)
@@ -283,16 +288,19 @@ namespace net
                 }
             }
 
-            /// <summary>
-            /// Parse "[scheme://]host[:port]" or a Unix domain socket path.
+            /// @brief Parse "[scheme://]host[:port]" or a Unix domain socket path.
             ///
             /// Accepted forms (port defaults to 0 when omitted):
             /// - IPv4 or hostname: "127.0.0.1", "127.0.0.1:8080", "localhost:80"
+            ///   (hostnames resolve to IPv4 via blocking getaddrinfo())
             /// - IPv6: "[::1]:8080", "[::1]", or bare "::1" / "fe80::1" (no port)
             /// - Unix domain (unixDomain == true, or "unix://" scheme): a filesystem path
+            ///   shorter than sizeof(sockaddr_un::sun_path)
             ///
-            /// Throws std::invalid_argument on malformed addresses or ports.
-            /// </summary>
+            /// @param addr Address string (must not be null).
+            /// @param unixDomain Treat addr as a Unix domain socket path.
+            /// @throws std::invalid_argument on malformed addresses or ports, overlong
+            ///         Unix paths, or Unix paths on platforms without HAVE_UNIX_DOMAIN.
             SocketAddr(const char* addr, bool unixDomain = false) : SocketAddr()
             {
                 if (addr == nullptr)
@@ -361,10 +369,8 @@ namespace net
                 setIPv4(ipAddress, port, addr);
             }
 
-            /// <summary>
-            /// Size of the address storage (the largest supported sockaddr type).
-            /// Use this as the in/out length for recvfrom/accept/getsockname.
-            /// </summary>
+            /// @brief Size of the address storage (the largest supported sockaddr type).
+            /// @return Byte count to use as the in/out length for recvfrom/accept/getsockname.
             static constexpr size_t capacity()
             {
 #ifdef HAVE_UNIX_DOMAIN
@@ -445,14 +451,21 @@ namespace net
 
         public:
 
+            /// @brief Copy constructor.
             SocketAddr(SocketAddr const& other) = default;
 
+            /// @brief Copy assignment.
             SocketAddr& operator=(SocketAddr const& other) = default;
 
+            /// @brief View as a mutable `sockaddr*` for socket APIs.
             operator sockaddr* () { return &m_data; }
 
+            /// @brief View as a `const sockaddr*` for socket APIs.
             operator const sockaddr* () const { return &m_data; }
 
+            /// @brief Length of the active sockaddr structure.
+            /// @return sizeof(sockaddr_un), sockaddr_in or sockaddr_in6 depending on the
+            ///         stored family; sizeof(sockaddr) for an unknown family.
             size_t size() const
             {
 #ifdef HAVE_UNIX_DOMAIN
@@ -470,6 +483,8 @@ namespace net
                 return sizeof(m_data);
             }
 
+            /// @brief Port number in host byte order.
+            /// @return The IPv4/IPv6 port, or -1 for Unix domain or unknown families.
             int port() const
             {
 #ifdef HAVE_UNIX_DOMAIN
@@ -492,6 +507,9 @@ namespace net
                 }
             }
 
+            /// @brief Human-readable form of the address.
+            /// @return "a.b.c.d:port" for IPv4, "[v6addr]:port" for IPv6, the path for
+            ///         Unix domain, or "[?AF?<family>]" for an unknown family.
             std::string toString() const
             {
                 std::ostringstream os;
@@ -528,23 +546,21 @@ namespace net
             }
         };  // struct SocketAddr
 
-        static const char* kSchemeUDP = "udp";
-        static const char* kSchemeTCP = "tcp";
-        static const char* kSchemeUnix = "unix";
-        static const char* kSchemeUnk = "unknown";
+        static const char* kSchemeUDP = "udp";      ///< Scheme name for UDP sockets.
+        static const char* kSchemeTCP = "tcp";      ///< Scheme name for TCP sockets.
+        static const char* kSchemeUnix = "unix";    ///< Scheme name for Unix domain sockets.
+        static const char* kSchemeUnk = "unknown";  ///< Scheme name for anything else.
 
+        /// @brief Arguments for the socket() system call: address family, socket type and protocol.
         struct SocketParams
         {
-            int af;     // POSIX socket domain
-            int type;   // POSIX socket type
-            int proto;  // POSIX socket protocol
+            int af;     ///< Address family / domain (AF_INET, AF_INET6, AF_UNIX).
+            int type;   ///< Socket type (SOCK_STREAM, SOCK_DGRAM, ...).
+            int proto;  ///< Protocol (e.g. IPPROTO_TCP, IPPROTO_UDP, or 0).
 
-            /**
-             * @brief Determine connection scheme based on socket parameters:
-             * "tcp", "udp", "unix" or "unknown".
-             *
-             * @return Text representation of scheme.
-             */
+            /// @brief Determine the connection scheme from the socket parameters.
+            /// @return "tcp" or "udp" for AF_INET/AF_INET6 stream/datagram sockets,
+            ///         "unix" for AF_UNIX, otherwise "unknown".
             inline const char* scheme()
             {
                 if ((af == AF_INET) || (af == AF_INET6))
@@ -562,32 +578,39 @@ namespace net
             }
         };
 
-        /// <summary>
-        /// Encapsulation of a socket (non-exclusive ownership).
-        /// IMPORTANT: This class does NOT automatically close the socket in its destructor
-        /// for backward compatibility and to support non-owning references.
-        /// Users MUST call close() explicitly, or use ScopedSocket for RAII behavior.
-        /// </summary>
+        /// @brief Thin, copyable wrapper around a native socket handle (non-owning).
+        ///
+        /// @warning Socket does NOT close the handle in its destructor: copies share
+        ///          the same handle and any copy may close it. Call close() explicitly,
+        ///          or use ScopedSocket for RAII ownership.
+        /// @note Not internally synchronized; the OS permits concurrent send/recv on
+        ///       one handle, but close() must not race other operations.
         struct Socket
         {
 #ifdef _WIN32
             typedef SOCKET Type;
             static constexpr Type const Invalid = INVALID_SOCKET;
 #else
+            /// @brief Native handle type (`int` on POSIX, `SOCKET` on Windows).
             typedef int Type; /* POSIX m_sock type is int */
+            /// @brief Invalid handle value (-1 on POSIX, INVALID_SOCKET on Windows).
             static constexpr Type const Invalid = -1;
 #endif
 
+            /// @brief The native socket handle (Invalid when not open).
             Type m_sock;
 
-            /// @brief Construct socket from parameters
+            /// @brief Create a new socket from SocketParams.
+            /// @throws std::runtime_error if socket creation fails.
             Socket(SocketParams params) : Socket(params.af, params.type, params.proto) {}
 
-            /// @brief Construct socket from existing handle (non-owning)
+            /// @brief Wrap an existing handle without taking ownership.
+            /// @param sock Native handle, or Invalid (default).
             Socket(Type sock = Invalid) noexcept : m_sock(sock) {}
 
-            /// @brief Create new socket with specified parameters
-            /// @throws std::runtime_error if socket creation fails
+            /// @brief Create a new socket via the socket(af, type, proto) system call.
+            /// Also applies suppressSigPipe() and setCloseOnExec().
+            /// @throws std::runtime_error if socket creation fails.
             Socket(int af, int type, int proto)
             {
                 m_sock = ::socket(af, type, proto);
@@ -631,16 +654,19 @@ namespace net
 #endif
             }
 
-            // Copy operations allowed (non-owning semantics)
+            /// @brief Copy the handle (both copies refer to the same OS socket).
             Socket(Socket const& other) = default;
+            /// @brief Copy-assign the handle; the previous handle is NOT closed.
             Socket& operator=(Socket const& other) = default;
 
-            // Move operations (transfers handle without closing)
+            /// @brief Move the handle; @p other becomes Invalid. Nothing is closed.
             Socket(Socket&& other) noexcept : m_sock(other.m_sock)
             {
                 other.m_sock = Invalid;
             }
 
+            /// @brief Move-assign the handle; @p other becomes Invalid. The previous
+            ///        handle of *this is NOT closed.
             Socket& operator=(Socket&& other) noexcept
             {
                 if (this != &other)
@@ -651,20 +677,26 @@ namespace net
                 return *this;
             }
 
-            /// @brief Destructor does NOT close socket (call close() explicitly)
+            /// @brief Destructor; does NOT close the socket (call close() explicitly).
             ~Socket() = default;
 
+            /// @brief Implicit conversion to the native handle.
             operator Socket::Type() const noexcept { return m_sock; }
 
+            /// @brief Handles are equal.
             bool operator==(Socket const& other) const noexcept { return (m_sock == other.m_sock); }
 
+            /// @brief Handles differ.
             bool operator!=(Socket const& other) const noexcept { return (m_sock != other.m_sock); }
 
+            /// @brief Order by native handle value (for use as a map/set key).
             bool operator<(Socket const& other) const noexcept { return (m_sock < other.m_sock); }
 
-            /// @brief Check if socket handle is invalid
+            /// @brief Check whether the handle is Invalid.
             bool invalid() const noexcept { return (m_sock == Invalid); }
 
+            /// @brief Put the socket into non-blocking mode (O_NONBLOCK / FIONBIO).
+            /// @note Errors are ignored.
             void setNonBlocking()
             {
                 assert(m_sock != Invalid);
@@ -677,6 +709,8 @@ namespace net
 #endif
             }
 
+            /// @brief Enable SO_REUSEADDR.
+            /// @return true on success.
             bool setReuseAddr()
             {
                 assert(m_sock != Invalid);
@@ -689,6 +723,8 @@ namespace net
                     sizeof(value)) == 0);
             }
 
+            /// @brief Enable TCP_NODELAY (disable Nagle's algorithm).
+            /// @return true on success.
             bool setNoDelay()
             {
                 assert(m_sock != Invalid);
@@ -701,12 +737,18 @@ namespace net
                     sizeof(value)) == 0);
             }
 
+            /// @brief Connect to @p addr.
+            /// @return true if ::connect() returned 0. On a non-blocking socket an
+            ///         in-progress connect returns false; check error().
+            /// @note Blocks on a blocking socket until connected or failed.
             bool connect(SocketAddr const& addr)
             {
                 assert(m_sock != Invalid);
                 return (::connect(m_sock, (const sockaddr*)addr, addr.size()) == 0);
             }
 
+            /// @brief Close the native handle and set it to Invalid.
+            /// @note Other copies of this Socket still hold the (now closed) handle value.
             void close()
             {
 #ifdef _WIN32
@@ -717,6 +759,12 @@ namespace net
                 m_sock = Invalid;
             }
 
+            /// @brief Receive a datagram.
+            /// @param buffer Destination buffer.
+            /// @param size Buffer capacity in bytes.
+            /// @param flags Flags passed to ::recvfrom().
+            /// @param clientAddr Receives the sender address.
+            /// @return Bytes received, or -1 on error (see error()).
             int recvfrom(_Out_cap_(size) void* buffer, size_t size, int flags, SocketAddr& clientAddr)
             {
                 assert(m_sock != Invalid);
@@ -731,12 +779,23 @@ namespace net
                     ::recvfrom(m_sock, reinterpret_cast<char*>(buffer), size, flags, clientAddr, &len));
             }
 
+            /// @brief Receive up to @p size bytes.
+            /// @param buffer Destination buffer.
+            /// @param size Buffer capacity in bytes.
+            /// @param flags Flags passed to ::recv().
+            /// @return Bytes received, 0 on orderly shutdown, or -1 on error (see error()).
             int recv(_Out_cap_(size) void* buffer, size_t size, int flags = 0)
             {
                 assert(m_sock != Invalid);
                 return static_cast<int>(::recv(m_sock, reinterpret_cast<char*>(buffer), size, flags));
             }
 
+            /// @brief Read until @p buffer is full, the peer closes, or an error occurs.
+            /// @tparam T Contiguous container with data(), size() and resize() (e.g.
+            ///         std::vector<char>); its initial size() is the maximum to read.
+            /// @param buffer Destination; resized to the number of bytes received.
+            /// @return Total number of bytes received.
+            /// @note Blocks on a blocking socket. Errors (including would-block) end the read.
             template <typename T>
             size_t readall(T& buffer)
             {
@@ -826,6 +885,9 @@ namespace net
             }
 
             /// @brief True if err is a transient "try again later" socket error.
+            /// @param err Error code from error().
+            /// @return true for EAGAIN/EWOULDBLOCK/EINTR (POSIX) or
+            ///         WSAEWOULDBLOCK/WSAEINTR/WSAEINPROGRESS (Windows).
             static bool isWouldBlock(int err) noexcept
             {
 #ifdef _WIN32
@@ -835,6 +897,11 @@ namespace net
 #endif
             }
 
+            /// @brief Send up to @p size bytes (a single ::send() call).
+            /// @return Bytes sent, 0 if the socket is Invalid or the buffer is empty,
+            ///         or -1 on error (see error()).
+            /// @note Uses MSG_NOSIGNAL where available so a peer-closed socket
+            ///       yields EPIPE instead of SIGPIPE.
             int send(void const* buffer, size_t size)
             {
                 assert(m_sock != Invalid);
@@ -851,6 +918,9 @@ namespace net
                     ::send(m_sock, reinterpret_cast<char const*>(buffer), size, sendFlags));
             }
 
+            /// @brief Send a datagram to @p destAddr.
+            /// @return Bytes sent, 0 if the socket is Invalid or the buffer is empty,
+            ///         or -1 on error (see error()).
             int sendto(void const* buffer, size_t size, int flags, SocketAddr& destAddr)
             {
                 assert(m_sock != Invalid);
@@ -861,12 +931,17 @@ namespace net
                     ::sendto(m_sock, reinterpret_cast<char const*>(buffer), size, flags, destAddr, len));
             }
 
+            /// @brief Bind to @p addr.
+            /// @return 0 on success, -1 (SOCKET_ERROR) on failure (see error()).
             int bind(SocketAddr const& addr)
             {
                 assert(m_sock != Invalid);
                 return ::bind(m_sock, addr, addr.size());
             }
 
+            /// @brief Query the local address (e.g. the ephemeral port after bind to port 0).
+            /// @param addr Receives the local address.
+            /// @return true on success.
             bool getsockname(SocketAddr& addr) const
             {
                 assert(m_sock != Invalid);
@@ -878,6 +953,8 @@ namespace net
                 return (::getsockname(m_sock, addr, &addrlen) == 0);
             }
 
+            /// @brief Read a socket option into @p optval (length = sizeof(T)).
+            /// @return 0 on success, -1 on failure.
             template <typename T>
             int getsockopt(int level, int optname, T& optval)
             {
@@ -890,12 +967,21 @@ namespace net
 #endif
             }
 
+            /// @brief Start listening for connections.
+            /// @param backlog Maximum pending-connection queue length.
+            /// @return true on success.
             bool listen(size_t backlog)
             {
                 assert(m_sock != Invalid);
                 return (::listen(m_sock, backlog) == 0);
             }
 
+            /// @brief Accept a pending connection.
+            /// @param csock Receives the new client socket (caller owns and must close it).
+            ///        SIGPIPE suppression and close-on-exec are applied to it.
+            /// @param caddr Receives the peer address.
+            /// @return true if a connection was accepted.
+            /// @note Blocks on a blocking listening socket.
             bool accept(Socket& csock, SocketAddr& caddr)
             {
                 assert(m_sock != Invalid);
@@ -914,12 +1000,17 @@ namespace net
                 return false;
             }
 
+            /// @brief Shut down one or both directions.
+            /// @param how ShutdownReceive, ShutdownSend or ShutdownBoth.
+            /// @return true on success.
             bool shutdown(int how)
             {
                 assert(m_sock != Invalid);
                 return (::shutdown(m_sock, how) == 0);
             }
 
+            /// @brief Last socket error of the calling thread.
+            /// @return errno on POSIX, WSAGetLastError() on Windows (not specific to this socket).
             int error() const
             {
 #ifdef _WIN32
@@ -929,15 +1020,17 @@ namespace net
 #endif
             }
 
+            /// @brief Platform "would block" error code.
             enum
             {
 #ifdef _WIN32
                 ErrorWouldBlock = WSAEWOULDBLOCK
 #else
-                ErrorWouldBlock = EWOULDBLOCK
+                ErrorWouldBlock = EWOULDBLOCK  ///< EWOULDBLOCK (POSIX) / WSAEWOULDBLOCK (Windows).
 #endif
             };
 
+            /// @brief Portable values for shutdown().
             enum
             {
 #ifdef _WIN32
@@ -945,17 +1038,15 @@ namespace net
                 ShutdownSend = SD_SEND,
                 ShutdownBoth = SD_BOTH
 #else
-                ShutdownReceive = SHUT_RD,
-                ShutdownSend = SHUT_WR,
-                ShutdownBoth = SHUT_RDWR
+                ShutdownReceive = SHUT_RD,  ///< Disallow further receives.
+                ShutdownSend = SHUT_WR,     ///< Disallow further sends.
+                ShutdownBoth = SHUT_RDWR    ///< Disallow both.
 #endif
             };
         };
 
-        /// <summary>
-        /// RAII wrapper for Socket providing automatic cleanup.
-        /// Use this when you want automatic socket closure on scope exit.
-        /// </summary>
+        /// @brief Move-only RAII owner of a Socket: closes the handle on destruction.
+        /// @note Not thread-safe; use from one thread or synchronize externally.
         class ScopedSocket
         {
         private:
@@ -963,25 +1054,28 @@ namespace net
             bool m_owned;
 
         public:
-            /// @brief Construct from Socket, taking ownership
+            /// @brief Take ownership of @p sock (which is left Invalid).
             explicit ScopedSocket(Socket&& sock) noexcept
                 : m_socket(std::move(sock)), m_owned(true) {}
 
-            /// @brief Create new socket with parameters
+            /// @brief Create and own a new socket via the socket(af, type, proto) system call.
+            /// @throws std::runtime_error if socket creation fails.
             ScopedSocket(int af, int type, int proto)
                 : m_socket(af, type, proto), m_owned(true) {}
 
-            /// @brief Non-copyable
+            /// @brief Non-copyable.
             ScopedSocket(ScopedSocket const&) = delete;
+            /// @brief Non-copyable.
             ScopedSocket& operator=(ScopedSocket const&) = delete;
 
-            /// @brief Movable
+            /// @brief Transfer ownership from @p other.
             ScopedSocket(ScopedSocket&& other) noexcept
                 : m_socket(std::move(other.m_socket)), m_owned(other.m_owned)
             {
                 other.m_owned = false;
             }
 
+            /// @brief Close the currently owned socket (if any), then take ownership from @p other.
             ScopedSocket& operator=(ScopedSocket&& other) noexcept
             {
                 if (this != &other)
@@ -997,7 +1091,7 @@ namespace net
                 return *this;
             }
 
-            /// @brief Auto-close socket on destruction
+            /// @brief Close the socket if still owned and valid.
             ~ScopedSocket()
             {
                 if (m_owned && !m_socket.invalid())
@@ -1006,78 +1100,105 @@ namespace net
                 }
             }
 
-            /// @brief Get underlying socket (non-owning reference)
+            /// @brief Access the underlying socket; ownership is retained.
             Socket& get() noexcept { return m_socket; }
+            /// @brief Access the underlying socket; ownership is retained.
             Socket const& get() const noexcept { return m_socket; }
 
-            /// @brief Release ownership (caller must close)
+            /// @brief Give up ownership without closing.
+            /// @return A copy of the handle; the caller becomes responsible for closing it.
             Socket release() noexcept
             {
                 m_owned = false;
                 return m_socket;
             }
 
-            /// @brief Forwarding methods to underlying socket
+            /// @brief See Socket::invalid().
             bool invalid() const noexcept { return m_socket.invalid(); }
+            /// @brief See Socket::setNonBlocking().
             void setNonBlocking() { m_socket.setNonBlocking(); }
+            /// @brief See Socket::setReuseAddr().
             bool setReuseAddr() { return m_socket.setReuseAddr(); }
+            /// @brief See Socket::setNoDelay().
             bool setNoDelay() { return m_socket.setNoDelay(); }
+            /// @brief See Socket::connect().
             bool connect(SocketAddr const& addr) { return m_socket.connect(addr); }
+            /// @brief See Socket::send().
             int send(void const* buffer, size_t size) { return m_socket.send(buffer, size); }
+            /// @brief See Socket::recv().
             int recv(void* buffer, size_t size, int flags = 0) { return m_socket.recv(buffer, size, flags); }
+            /// @brief See Socket::bind().
             int bind(SocketAddr const& addr) { return m_socket.bind(addr); }
+            /// @brief See Socket::listen().
             bool listen(size_t backlog) { return m_socket.listen(backlog); }
+            /// @brief See Socket::accept(). The accepted socket is NOT owned by this object.
             bool accept(Socket& csock, SocketAddr& caddr) { return m_socket.accept(csock, caddr); }
+            /// @brief Close the socket if owned, then drop ownership. A released
+            ///        (non-owned) socket is left open.
             void close() { if (m_owned) m_socket.close(); m_owned = false; }
         };
 
-        /// <summary>
-        /// Socket Data
-        /// </summary>
+        /// @brief A socket registered with the Reactor together with its armed event flags.
         struct SocketData
         {
-            Socket socket;
-            int flags;
+            Socket socket;  ///< Registered socket (not owned).
+            int flags;      ///< Armed Reactor::State bit mask.
 
+            /// @brief Invalid socket with no flags.
             SocketData() noexcept : socket(), flags(0) {}
 
+            /// @brief Match by socket handle (for std::find).
             bool operator==(Socket s) const noexcept { return (socket == s); }
         };
 
-        /// <summary>
-        /// Socket Reactor
-        /// </summary>
+        /// @brief Single-threaded socket event loop that dispatches readiness events
+        ///        to a SocketCallback.
+        ///
+        /// Stream mode (TCP / Unix domain) uses epoll on Linux, kqueue on Apple and
+        /// WSAEventSelect + WSAWaitForMultipleEvents on Windows, each waiting at most
+        /// config::REACTOR_POLL_TIMEOUT_MS per iteration. Datagram mode is selected
+        /// when the first socket is added with flags == Readable only: the loop then
+        /// polls that single socket and calls onSocketReadable() for each datagram.
+        ///
+        /// @note Callbacks run on the reactor thread, without m_sockets_mutex held;
+        ///       they must not block for long. addSocket()/removeSocket() are thread-safe.
+        /// @note Registered sockets are not owned, except that stop() closes the first
+        ///       registered (listening/bound) socket.
         struct Reactor : protected common::Thread
         {
-            /// <summary>
-            /// Socket State callback
-            /// </summary>
+            /// @brief Receiver of reactor events. All methods run on the reactor thread.
             class SocketCallback
             {
             public:
+                /// @brief Data (or EOF) is available on @p sock; also every datagram in datagram mode.
                 virtual void onSocketReadable(Socket sock) = 0;
+                /// @brief @p sock can accept more outgoing data.
                 virtual void onSocketWritable(Socket sock) = 0;
+                /// @brief A listening socket has a pending connection to accept().
                 virtual void onSocketAcceptable(Socket sock) = 0;
+                /// @brief The peer hung up or an error occurred on @p sock (also called
+                ///        once when the datagram loop ends).
                 virtual void onSocketClosed(Socket sock) = 0;
             };
 
-            /// <summary>
-            /// Socket State
-            /// </summary>
+            /// @brief Event flags that can be armed with addSocket() (bit mask).
             enum State
             {
-                Readable = 1,
-                Writable = 2,
-                Acceptable = 4,
-                Closed = 8
+                Readable = 1,    ///< Notify onSocketReadable().
+                Writable = 2,    ///< Notify onSocketWritable().
+                Acceptable = 4,  ///< Notify onSocketAcceptable() (listening sockets).
+                Closed = 8       ///< Notify onSocketClosed() on hang-up / error.
             };
 
+            /// @brief Callback target (must outlive the reactor).
             SocketCallback& m_callback;
 
+            /// @brief Guards m_sockets (and the platform event arrays).
             std::recursive_mutex m_sockets_mutex;
+            /// @brief Registered sockets and their armed flags; element 0 is the first added.
             std::vector<SocketData> m_sockets;
 
-            // Event loop is required for stream sockets
+            /// @brief true for stream (event-loop) mode, false once a datagram socket was added.
             bool m_streaming{ true };
 
 #ifdef _WIN32
@@ -1098,6 +1219,8 @@ namespace net
 #endif
 
         public:
+            /// @brief Create the platform event facility (epoll / kqueue); does not start the thread.
+            /// @param callback Event receiver; must outlive the reactor.
             Reactor(SocketCallback& callback) : m_callback(callback)
             {
 #ifdef __linux__
@@ -1127,13 +1250,13 @@ namespace net
 #endif
             }
 
+            /// @brief Non-copyable.
             Reactor(Reactor const&) = delete;
+            /// @brief Non-copyable.
             Reactor& operator=(Reactor const&) = delete;
 
-            /// <summary>
-            /// Destructor. Stops the worker thread if the owner did not call stop().
+            /// @brief Stop the worker thread if still running and release the event facility.
             /// Sockets are not closed here: they belong to the owner (see stop()).
-            /// </summary>
             ~Reactor()
             {
                 joinThread();
@@ -1158,11 +1281,12 @@ namespace net
 #endif
             }
 
-            /// <summary>
-            /// Add Socket
-            /// </summary>
-            /// <param name="socket"></param>
-            /// <param name="flags"></param>
+            /// @brief Register a socket or update its armed flags.
+            /// @param socket Socket to watch (not owned).
+            /// @param flags Bit mask of State values; 0 is equivalent to removeSocket().
+            /// @note If this is the first socket and flags == Readable, the reactor switches
+            ///       permanently to datagram mode. In datagram mode later calls are ignored.
+            /// @note Thread-safe; may be called from callbacks.
             void addSocket(const Socket& socket, int flags)
             {
                 if (flags == 0)
@@ -1266,10 +1390,8 @@ namespace net
                 }
             }
 
-            /// <summary>
-            /// Remove Socket
-            /// </summary>
-            /// <param name="socket"></param>
+            /// @brief Unregister a socket (it is not closed). No-op if not registered.
+            /// @note Thread-safe; may be called from callbacks.
             void removeSocket(const Socket& socket)
             {
                 LOCKGUARD(m_sockets_mutex);
@@ -1299,20 +1421,18 @@ namespace net
                 }
             }
 
-            /// <summary>
-            /// Start server
-            /// </summary>
+            /// @brief Start the reactor thread (no-op if already running).
             void start()
             {
                 LOG_INFO("Reactor: Starting...");
                 startThread();
             }
 
-            /// <summary>
-            /// Stop the event loop, unregister all sockets and close the first
-            /// registered socket (the listening / bound server socket). Other
-            /// sockets are unregistered but not closed. Safe to call more than once.
-            /// </summary>
+            /// @brief Stop the event loop, unregister all sockets and close the first
+            /// registered socket (the listening / bound server socket).
+            /// Other sockets are unregistered but not closed. Safe to call more than once.
+            /// @note Blocks until the reactor thread exits (up to one poll timeout).
+            ///       If called from a callback the thread is detached instead of joined.
             void stop()
             {
                 LOG_INFO("Reactor: Stopping...");
@@ -1358,9 +1478,8 @@ namespace net
                 m_sockets.clear();
             }
 
-            /// <summary>
-            /// Thread Loop for async events processing
-            /// </summary>
+            /// @brief Reactor thread body: waits for events and dispatches them to m_callback
+            ///        until stop() is requested.
             virtual void onThread() override
             {
                 LOG_INFO("Reactor: Thread started");

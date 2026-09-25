@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+/// @file socket_server.h
+/// @brief Generic reactor-driven TCP / UDP / Unix domain server (SocketServer).
+
 #include <SocketsHpp/config.h>
 
 #include <algorithm>
@@ -23,66 +26,90 @@ namespace net
 {
     namespace common {
 
-        using Reactor = net::utils::Reactor;
-        using Socket = net::utils::Socket;
-        using SocketAddr = net::utils::SocketAddr;
-        using SocketParams = net::utils::SocketParams;
-        using ScopedSocket = net::utils::ScopedSocket;
+        using Reactor = net::utils::Reactor;            ///< Alias of net::utils::Reactor.
+        using Socket = net::utils::Socket;              ///< Alias of net::utils::Socket.
+        using SocketAddr = net::utils::SocketAddr;      ///< Alias of net::utils::SocketAddr.
+        using SocketParams = net::utils::SocketParams;  ///< Alias of net::utils::SocketParams.
+        using ScopedSocket = net::utils::ScopedSocket;  ///< Alias of net::utils::ScopedSocket.
 
-        /**
-         * @brief Common Server for TCP, UDP and Unix Domain.
-         */
+        /// @brief Reactor-driven server for TCP, UDP and Unix domain sockets.
+        ///
+        /// Binds in the constructor, then Start() runs the Reactor thread. For stream
+        /// sockets each accepted client gets a Connection in #connections; received
+        /// bytes are passed to #onRequest, which fills Connection::response_buffer and
+        /// inserts Connection::Responding to send it. For UDP every datagram is handled
+        /// as a transient Connection and any response is sent with sendto().
+        ///
+        /// The default #onRequest only inserts Connection::Responding; since
+        /// response_buffer is empty nothing is sent. Replace it with a real handler.
+        ///
+        /// @note All callbacks run on the single reactor thread while
+        ///       #connections_mutex is held; handlers must not block.
+        /// @note The server owns #server_socket and accepted client sockets and closes
+        ///       them in Stop().
         struct SocketServer : public Reactor::SocketCallback
         {
+            /// @brief Per-client connection state (one per accepted stream socket, or a
+            ///        transient one per UDP datagram).
             struct Connection
             {
+                /// @brief Connection states; several may be set at once in #state.
                 enum State
                 {
-                    Idle,        // No data transfer initiated
-                    Receiving,   // Receiving data
-                    Responding,  // Sending data
-                    Closing,     // Closing connection
-                    Closed,      // Closed connection
-                    Aborted      // Connection aborted
+                    Idle,        ///< No transfer in progress; waiting for data.
+                    Receiving,   ///< request_buffer holds newly received data.
+                    Responding,  ///< response_buffer should be (or is being) sent.
+                    Closing,     ///< Peer closed / error, or handler requested close.
+                    Closed,      ///< Socket has been closed.
+                    Aborted      ///< Closed while neither Idle nor Closing.
                 };
 
-                Socket socket;      // Active client-server socket
-                SocketAddr client;  // Client address
+                Socket socket;      ///< Client socket (for UDP: the server socket).
+                SocketAddr client;  ///< Peer address.
 
-                std::string request_buffer;   // Receive buffer for current event
-                std::string response_buffer;  // Send buffer for current event
+                std::string request_buffer;   ///< Bytes read by the current event (replaced on each read).
+                std::string response_buffer;  ///< Bytes to send; unsent remainder is kept across writable events.
 
-                std::set<State> state;  // Current connection state
-                bool keepalive{ true };   // Keep connection alive (reserved for future use)
+                std::set<State> state;  ///< Current set of State flags.
+                bool keepalive{ true };   ///< Re-arm for reading after a response (currently always effectively true).
             };
 
-            SocketAddr bind_address;  // Server bind address
-            bool is_bound{ false };
-            SocketParams server_socket_params;  // Server socket params
-            Socket server_socket;               // Server listening socket
-            Reactor reactor;                    // Socket event handler
+            SocketAddr bind_address;  ///< Requested bind address; updated with the actual one (e.g. ephemeral port) after bind.
+            bool is_bound{ false };   ///< true if bind() succeeded in the constructor.
+            SocketParams server_socket_params;  ///< Socket family / type / protocol of the server socket.
+            Socket server_socket;               ///< Listening (TCP/Unix) or bound (UDP) socket; owned by the server.
+            Reactor reactor;                    ///< Event loop dispatching to this object.
 
-            // Custom callback when server receives data
+            /// @brief Called on the reactor thread with newly received data in
+            ///        Connection::request_buffer. Fill response_buffer and insert
+            ///        Connection::Responding to reply; insert Connection::Closing to close.
             std::function<void(Connection& conn)> onRequest;
 
-            // Custom callback when server sends a response
+            /// @brief Response hook; default is a no-op. Not invoked by SocketServer itself.
             std::function<void(Connection& conn)> onResponse;
 
-            // Active client-server connections protected by recursive mutex
+            /// @brief Guards #connections; held while callbacks run.
             std::recursive_mutex connections_mutex;
+            /// @brief Accepted stream connections keyed by client socket.
             std::map<Socket, Connection> connections;
 
-            // Macro to safely obtain TEMPORARY string buffer pointer
+            /// @brief Log helper: peer address of @p conn as a TEMPORARY C string
+            ///        (valid only within the enclosing full expression).
 #define CLID(conn) conn.client.toString().c_str()
 
+            /// @brief Bound address (after bind, includes the actual port).
             const SocketAddr& address() const { return bind_address; };
 
-            /**
-             * @brief Route to start TCP, UDP or Unix Domain socket server.
-             * @param addr Address or Unix domain socket name to bind to.
-             * @param sock Socket type.
-             * @param numConnections Maximum number of connections.
-             */
+            /// @brief Create the server socket and bind it; for stream sockets also listen.
+            ///
+            /// Bind failures are logged and leave is_bound == false (no exception).
+            /// UDP sockets are made non-blocking. The reactor is not started: call Start().
+            /// @param addr Address or Unix domain socket path to bind to (port 0 = ephemeral;
+            ///        read the actual one from address()).
+            /// @param params Socket family / type / protocol.
+            /// @param numConnections listen() backlog for stream sockets (pending
+            ///        connections, not a limit on active connections).
+            /// @throws std::runtime_error if the socket cannot be created.
             SocketServer(SocketAddr addr, SocketParams params, int numConnections = 10)
                 : bind_address(addr), server_socket_params(params), reactor(*this)
             {
@@ -125,25 +152,21 @@ namespace net
                     bind_address.toString().c_str());
             }
 
+            /// @brief Non-copyable.
             SocketServer(SocketServer const&) = delete;
+            /// @brief Non-copyable.
             SocketServer& operator=(SocketServer const&) = delete;
 
-            /**
-             * @brief Destructor. Stops the server if Stop() was not called, so that
-             * destroying a started server never terminates the process on a joinable
-             * thread and does not leak sockets.
-             */
+            /// @brief Calls Stop(), so destroying a started server neither terminates on a
+            ///        joinable thread nor leaks sockets.
             virtual ~SocketServer() { Stop(); }
 
-            /**
-             * @brief Start server.
-             */
+            /// @brief Start the reactor thread (non-blocking; returns immediately).
             void Start() { reactor.start(); }
 
-            /**
-             * @brief Stop server: stop the event loop, close the server socket and
-             * all accepted client connections. Safe to call more than once.
-             */
+            /// @brief Stop the event loop, close the server socket and all accepted client
+            ///        connections. Safe to call more than once.
+            /// @note Blocks until the reactor thread exits (up to one poll interval).
             void Stop()
             {
                 // Joins the reactor thread, then closes the bound server socket
@@ -174,10 +197,9 @@ namespace net
                 }
             }
 
-            /**
-             * @brief Handle Reactor::State::Acceptable event.
-             * @param socket Client socket.
-             */
+            /// @brief Accept a client on the listening socket, make it non-blocking and
+            ///        register it (Readable | Closed) in #connections.
+            /// @param socket Listening socket.
             virtual void onSocketAcceptable(Socket socket) override
             {
                 LOG_TRACE("Server: accepting socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
@@ -209,10 +231,10 @@ namespace net
                 }
             }
 
-            /**
-             * @brief Handle Reactor::State::Reasable event.
-             * @param socket Client socket.
-             */
+            /// @brief Handle a Readable event: read stream data (ReadStreamBuffer) or one
+            ///        datagram (ReadDatagramBuffer), call #onRequest if data arrived, then
+            ///        drive the connection state (HandleConnection / UDP reply).
+            /// @param socket Client socket (stream) or server socket (UDP).
             virtual void onSocketReadable(Socket socket) override
             {
                 LOG_TRACE("Server: reading socket fd=0x%x", static_cast<int>(socket.m_sock));
@@ -265,10 +287,8 @@ namespace net
                 }
             }
 
-            /**
-             * @brief Event triggered when server may write data back to client.
-             * @param socket Client socket.
-             */
+            /// @brief Handle a Writable event: continue sending the pending response.
+            /// @param socket Client socket.
             virtual void onSocketWritable(Socket socket) override
             {
                 LOG_TRACE("Server: writing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
@@ -284,10 +304,9 @@ namespace net
                 HandleConnection(conn);
             }
 
-            /**
-             * @brief Handle event when socket is closed.
-             * @param socket
-             */
+            /// @brief Handle a hang-up / error event: mark the connection Closing and close it.
+            ///        Ignored for UDP servers.
+            /// @param socket Client socket.
             virtual void onSocketClosed(Socket socket) override
             {
                 LOG_TRACE("Server: closing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
@@ -308,12 +327,13 @@ namespace net
                 LOG_ERROR("Server: socket not found in connections map!");
             }
 
-            /**
-             * @brief Read from TCP or Unix Domain connection into request_buffer.
-             * This function invokes `HandleConnection` to process the buffer.
-             *
-             * @param conn_tcp Connection object.
-             */
+            /// @brief Read available data (up to 64 KiB per event) from a stream connection
+            ///        into request_buffer without blocking.
+            ///
+            /// Inserts Connection::Receiving if data was read and Connection::Closing on
+            /// EOF or a hard error. A would-block wakeup leaves the state unchanged.
+            /// The caller (onSocketReadable) then invokes #onRequest and HandleConnection().
+            /// @param conn_tcp Connection to read from.
             virtual void ReadStreamBuffer(Connection& conn_tcp)
             {
                 // Read what is available without blocking. Distinguish:
@@ -370,12 +390,9 @@ namespace net
                 }
             }
 
-            /**
-             * @brief Read from UDP connection into request_buffer.
-             * This function invokes `HandleConnection` to process the buffer.
-             *
-             * @param conn_udp
-             */
+            /// @brief Receive one datagram (up to 65535 bytes) into request_buffer and the
+            ///        sender into Connection::client; inserts Connection::Receiving on success.
+            /// @param conn_udp Transient connection whose socket is the server socket.
             virtual void ReadDatagramBuffer(Connection& conn_udp)
             {
                 // Maximum size is 0xffff - (sizeof(IP Header) + sizeof(UDP Header)).
@@ -397,15 +414,13 @@ namespace net
                 }
             }
 
-            /**
-             * @brief Handle a timeslice of sending data back to client. If sending is blocked,
-             * but not all data has been sent, then this function returns with an indication
-             * that it needs to be called for the same connection again.
-             *
-             * @param conn Client-server connection.
-             *
-             * @return true if not all data has been bytes_sent.
-             */
+            /// @brief Send as much of response_buffer as possible without blocking.
+            ///
+            /// UDP: sends the whole buffer with one sendto(). Stream: sends what the socket
+            /// accepts, keeps the unsent remainder in response_buffer and arms Writable.
+            /// A hard send error clears the buffer and marks the connection Closing.
+            /// @param conn Client-server connection.
+            /// @return true if data remains to be sent (call again on the next Writable event).
             bool WriteResponseBuffer(Connection& conn)
             {
                 if (conn.response_buffer.empty())
@@ -460,10 +475,11 @@ namespace net
                 return false;
             }
 
-            /**
-             * @brief Handle event when connection is closed.
-             * @param conn
-             */
+            /// @brief Unregister and close the client socket and erase it from #connections.
+            ///        Calls onConnectionAborted() first if the connection was neither Idle
+            ///        nor Closing.
+            /// @param conn Connection to close; if it lives in #connections the reference
+            ///        is invalid after this call.
             void onConnectionClosed(Connection& conn)
             {
                 LOG_TRACE("Server: [%s] connection closing...", CLID(conn));
@@ -488,11 +504,14 @@ namespace net
                 }
             }
 
+            /// @brief Hook for connections closed unexpectedly; logs a warning.
             void onConnectionAborted(Connection& conn)
             {
                 LOG_WARN("Server: [%s] connection closed unexpectedly", CLID(conn));
             }
 
+            /// @brief Shut down the send direction, then close via onConnectionClosed().
+            /// @param conn Connection to close (invalid after the call if it was in #connections).
             void CloseConnection(Connection& conn)
             {
                 LOG_TRACE("Server: [%s] closing connection...", CLID(conn));
@@ -500,18 +519,12 @@ namespace net
                 onConnectionClosed(conn);
             }
 
-            /**
-             * @brief Handle connection state update.
-             *
-             * Connection states:
-             * - Idle             - start receiving.
-             * - Receiving        - handle client request.
-             * - Responding       - respond back to client.
-             * - Closing          - closing connection.
-             * - Closed           - connection closed.
-             *
-             * @param conn
-             */
+            /// @brief Advance a stream connection after an event.
+            ///
+            /// - Responding: write the response (WriteResponseBuffer); return while data is pending.
+            /// - Closing: close the connection (onConnectionClosed).
+            /// - Otherwise (keepalive): re-arm Readable | Closed and mark Idle.
+            /// @param conn Connection to process.
             void HandleConnection(Connection& conn)
             {
 

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+/// @file mcp_client.h
+/// @brief MCP (Model Context Protocol) client over HTTP: mcp::client::MCPClient.
+
 #include <SocketsHpp/config.h>
 #include <SocketsHpp/http/client/http_client.h>
 #include <SocketsHpp/http/client/sse_client.h>
@@ -29,37 +32,58 @@ namespace mcp
     {
         using namespace http::client;
         using namespace http::common;
-        using json = nlohmann::json;
+        using json = nlohmann::json;  ///< nlohmann::json alias.
 
-        /// @brief MCP Client implementing Model Context Protocol
+        /// @brief Synchronous MCP client.
         ///
         /// Supported transports: TransportType::HTTP and TransportType::HTTP_STREAMABLE
-        /// (both send JSON-RPC over HTTP POST; responses may be application/json or a
-        /// text/event-stream carrying the response). STDIO is not implemented.
+        /// (both send JSON-RPC over HTTP POST to HttpConfig::url; responses may be
+        /// application/json or a text/event-stream carrying the response). STDIO is not
+        /// supported (connect() returns false).
+        ///
+        /// Typical use: connect(), initialize(), then the request methods; disconnect()
+        /// (or destruction) ends the session with HTTP DELETE.
+        ///
+        /// Request methods block the calling thread until the HTTP response arrives and
+        /// throw std::runtime_error on transport/HTTP failures (any status other than
+        /// 200) and JsonRpcError (not derived from std::exception) on a JSON-RPC error.
+        ///
+        /// Server-to-client notifications arrive on a GET SSE stream that is opened when
+        /// a notification handler is registered or HttpConfig::enableResumability is set;
+        /// it sends the configured headers plus Mcp-Session-Id and auto-reconnects with
+        /// Last-Event-ID. Notifications embedded in an SSE POST response are dispatched too.
         class MCPClient
         {
         public:
-            /// @brief Notification callback type
+            /// @brief Notification handler; receives the notification's params
+            ///        (an empty object if absent).
             using NotificationCallback = std::function<void(const json&)>;
 
-            /// @brief Connection status callback
+            /// @brief Connection status callback: (true, "Connected to <url>") from connect(),
+            ///        (false, error) from the notification stream thread on stream errors.
             using StatusCallback = std::function<void(bool connected, const std::string& message)>;
 
-            /// @brief Constructor
+            /// @brief Create a disconnected client.
             MCPClient() = default;
 
+            /// @brief Non-copyable.
             MCPClient(const MCPClient&) = delete;
+            /// @brief Non-copyable.
             MCPClient& operator=(const MCPClient&) = delete;
 
-            /// @brief Destructor
+            /// @brief Calls disconnect().
             ~MCPClient()
             {
                 disconnect();
             }
 
-            /// @brief Connect to MCP server
-            /// @param config Client configuration
-            /// @return true if connection successful
+            /// @brief Configure the client for a server (disconnecting any previous session).
+            ///
+            /// For HTTP transports no network I/O happens here: the HTTP client is set up
+            /// (HttpConfig::timeoutSeconds, ClientConfig::connectTimeoutSeconds) and the
+            /// first request is sent by initialize().
+            /// @param config Client configuration (copied)
+            /// @return true for HTTP / HTTP_STREAMABLE; false for STDIO (unsupported).
             bool connect(const ClientConfig& config)
             {
                 disconnect();
@@ -79,9 +103,12 @@ namespace mcp
                 return false;
             }
 
-            /// @brief Disconnect from MCP server.
-            /// Terminates the session with HTTP DELETE (MCP session termination) when the
-            /// server issued a session id, then stops the notification stream.
+            /// @brief Disconnect from the MCP server. No-op if not connected.
+            /// Closes the notification stream, sends HTTP DELETE with the configured headers
+            /// and Mcp-Session-Id when the server issued a session id (best effort; errors
+            /// ignored), joins the stream thread and clears the session id.
+            /// @note Blocks until the DELETE completes and the stream thread exits. Must
+            ///       not be called from a notification handler running on the stream thread.
             void disconnect()
             {
                 if (!m_connected.exchange(false))
@@ -125,10 +152,17 @@ namespace mcp
                 m_sessionId.clear();
             }
 
-            /// @brief Initialize MCP connection.
-            /// Sends `initialize`, then the required `notifications/initialized`.
-            /// @param clientInfo Client information (name, version)
-            /// @return Server capabilities and information
+            /// @brief Initialize the MCP session.
+            ///
+            /// Sends `initialize` (protocolVersion "2025-03-26" for HTTP_STREAMABLE,
+            /// "2024-11-05" for HTTP, empty client capabilities), stores the Mcp-Session-Id
+            /// response header and the server capabilities, then sends the required
+            /// `notifications/initialized`. Opens the notification stream if a handler is
+            /// registered or HttpConfig::enableResumability is set.
+            /// @param clientInfo Client information, e.g. {"name": ..., "version": ...}
+            /// @return The initialize result (protocolVersion, capabilities, serverInfo, ...).
+            /// @throws std::runtime_error if not connected or on transport/HTTP errors;
+            ///         JsonRpcError on a JSON-RPC error response.
             json initialize(const json& clientInfo)
             {
                 json params = {
@@ -163,25 +197,28 @@ namespace mcp
                 return response;
             }
 
-            /// @brief Ping server (health check)
-            /// @return Empty response on success
+            /// @brief Send `ping` (health check).
+            /// @return The result (normally an empty object).
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json ping()
             {
                 return sendRequest("ping", json::object());
             }
 
-            /// @brief List available tools
-            /// @return List of tools with names, descriptions, and schemas
+            /// @brief Send `tools/list` (first page only; pagination cursors are not followed).
+            /// @return The result's "tools" array (empty array if absent).
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json listTools()
             {
                 auto response = sendRequest("tools/list", json::object());
                 return response.value("tools", json::array());
             }
 
-            /// @brief Call a tool
+            /// @brief Send `tools/call`.
             /// @param name Tool name
-            /// @param arguments Tool arguments
-            /// @return Tool execution result
+            /// @param arguments Tool arguments (default: empty object)
+            /// @return The full tool result object (e.g. "content", "isError").
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json callTool(const std::string& name, const json& arguments = json::object())
             {
                 json params = {
@@ -192,18 +229,20 @@ namespace mcp
                 return sendRequest("tools/call", params);
             }
 
-            /// @brief List available prompts
-            /// @return List of prompts with names and descriptions
+            /// @brief Send `prompts/list` (first page only).
+            /// @return The result's "prompts" array (empty array if absent).
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json listPrompts()
             {
                 auto response = sendRequest("prompts/list", json::object());
                 return response.value("prompts", json::array());
             }
 
-            /// @brief Get a prompt
+            /// @brief Send `prompts/get`.
             /// @param name Prompt name
-            /// @param arguments Prompt arguments
-            /// @return Prompt messages
+            /// @param arguments Prompt arguments (omitted from the request when empty)
+            /// @return The full result object (e.g. "description", "messages").
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json getPrompt(const std::string& name, const json& arguments = json::object())
             {
                 json params = {
@@ -218,17 +257,19 @@ namespace mcp
                 return sendRequest("prompts/get", params);
             }
 
-            /// @brief List available resources
-            /// @return List of resources with URIs and metadata
+            /// @brief Send `resources/list` (first page only).
+            /// @return The result's "resources" array (empty array if absent).
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json listResources()
             {
                 auto response = sendRequest("resources/list", json::object());
                 return response.value("resources", json::array());
             }
 
-            /// @brief Read a resource
+            /// @brief Send `resources/read`.
             /// @param uri Resource URI
-            /// @return Resource contents
+            /// @return The full result object (e.g. "contents").
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json readResource(const std::string& uri)
             {
                 json params = {
@@ -238,9 +279,11 @@ namespace mcp
                 return sendRequest("resources/read", params);
             }
 
-            /// @brief Subscribe to resource updates
+            /// @brief Send `resources/subscribe`. Updates arrive as notifications
+            ///        (register "notifications/resources/updated" with onNotification()).
             /// @param uri Resource URI
-            /// @return Acknowledgment
+            /// @return The result (normally an empty object).
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json subscribeResource(const std::string& uri)
             {
                 json params = {
@@ -250,9 +293,10 @@ namespace mcp
                 return sendRequest("resources/subscribe", params);
             }
 
-            /// @brief Unsubscribe from resource updates
+            /// @brief Send `resources/unsubscribe`.
             /// @param uri Resource URI
-            /// @return Acknowledgment
+            /// @return The result (normally an empty object).
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json unsubscribeResource(const std::string& uri)
             {
                 json params = {
@@ -262,19 +306,21 @@ namespace mcp
                 return sendRequest("resources/unsubscribe", params);
             }
 
-            /// @brief List resource templates
-            /// @return List of resource templates
+            /// @brief Send `resources/templates/list` (first page only).
+            /// @return The result's "resourceTemplates" array (empty array if absent).
+            /// @throws std::runtime_error or JsonRpcError, as for initialize().
             json listResourceTemplates()
             {
                 auto response = sendRequest("resources/templates/list", json::object());
                 return response.value("resourceTemplates", json::array());
             }
 
-            /// @brief Register notification handler
+            /// @brief Register (or replace) the handler for a notification method.
             /// @param method Notification method (e.g., "notifications/message")
-            /// @param handler Handler function
-            /// @note Registering a handler opens the server→client notification stream
-            ///       (immediately if already initialized, otherwise after initialize()).
+            /// @param handler Handler; runs on the notification stream thread, or on the
+            ///        calling thread for notifications embedded in an SSE POST response.
+            /// @note Thread-safe. Registering a handler opens the server→client notification
+            ///       stream (immediately if already initialized, otherwise after initialize()).
             void onNotification(const std::string& method, NotificationCallback handler)
             {
                 {
@@ -287,24 +333,27 @@ namespace mcp
                 }
             }
 
-            /// @brief Register connection status callback (call before connect()).
-            /// @param callback Status callback
+            /// @brief Register the connection status callback.
+            /// @param callback Status callback; may be invoked on the notification stream thread.
+            /// @warning Not synchronized: call before connect().
             void onStatus(StatusCallback callback)
             {
                 m_statusCallback = callback;
             }
 
-            /// @brief Check if connected
+            /// @brief Whether connect() succeeded and disconnect() has not been called since
+            ///        (does not probe the server). Thread-safe.
             bool isConnected() const { return m_connected.load(); }
 
-            /// @brief Session id issued by the server on initialize ("" if none)
+            /// @brief Session id issued by the server on initialize ("" if none). Thread-safe.
             std::string sessionId() const
             {
                 std::lock_guard<std::mutex> lock(m_sessionMutex);
                 return m_sessionId;
             }
 
-            /// @brief Get server capabilities
+            /// @brief Server capabilities from the last initialize() (null before it).
+            /// @warning Not synchronized with a concurrent initialize().
             const json& getServerCapabilities() const { return m_serverCapabilities; }
 
         private:

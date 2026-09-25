@@ -1,61 +1,74 @@
 // Copyright The OpenTelemetry Authors; Max Golovanov.
 // SPDX-License-Identifier: Apache-2.0
 //
-// ┌─────────────────────────────────────────────────────────────────────────────┐
-// │  MCP SERVER — SocketsHpp                                                    │
-// │                                                                             │
-// │  Implements MCP 2024-11-05 (HTTP + persistent SSE) and                      │
-// │  MCP 2025-03-26 (Streamable HTTP) over the SocketsHpp HTTP server.          │
-// │  STDIO transport is also supported for VS Code / Claude Desktop integration. │
-// │                                                                             │
-// │  ── NGINX INTEGRATION GUIDE ──────────────────────────────────────────────  │
-// │                                                                             │
-// │  Run memento-native on a loopback port (e.g. 3601) and put nginx in front  │
-// │  for TLS, auth, rate-limiting and load balancing.  This server handles     │
-// │  only application logic; all transport hardening is offloaded.             │
-// │                                                                             │
-// │  Recommended nginx config:                                                  │
-// │                                                                             │
-// │    upstream mcp_backend {                                                   │
-// │        server 127.0.0.1:3601;                                               │
-// │        keepalive 32;           # reuse connections                          │
-// │    }                                                                        │
-// │                                                                             │
-// │    limit_req_zone $binary_remote_addr zone=mcp:10m rate=10r/s;              │
-// │                                                                             │
-// │    server {                                                                 │
-// │        listen 443 ssl http2;                                                │
-// │        ssl_certificate     /etc/ssl/mcp.crt;   # TLS (offloaded)           │
-// │        ssl_certificate_key /etc/ssl/mcp.key;                                │
-// │                                                                             │
-// │        location /mcp {                                                      │
-// │            proxy_pass         http://mcp_backend;                           │
-// │            proxy_http_version 1.1;                                          │
-// │            proxy_set_header   Connection "";   # keepalive pool             │
-// │            proxy_set_header   Host $host;                                   │
-// │            proxy_set_header   X-Forwarded-For $remote_addr;                 │
-// │            proxy_buffering    off;             # CRITICAL for SSE           │
-// │            proxy_cache        off;                                           │
-// │            proxy_read_timeout 3600s;           # keep SSE streams alive     │
-// │            limit_req          zone=mcp burst=20 nodelay;                    │
-// │        }                                                                    │
-// │        location /health {                                                   │
-// │            proxy_pass http://mcp_backend/health;  # GET /health → health   │
-// │        }                                                                    │
-// │    }                                                                        │
-// │                                                                             │
-// │  Features best offloaded to nginx (not implemented here):                   │
-// │    • TLS / mTLS termination                                                 │
-// │    • OAuth 2.1 / JWT validation (auth_request module or lua-jwt)            │
-// │    • Aggressive DDoS / IP-block rules (ngx_http_geo_module)                 │
-// │    • gzip compression for JSON payloads                                     │
-// │    • Load balancing across multiple server instances                        │
-// │    • Access logging / metrics export                                        │
-// │    • PKCE / token exchange flows                                            │
-// │                                                                             │
-// │  NOTE: proxy_buffering off is MANDATORY for SSE.  Without it nginx         │
-// │  buffers the entire stream and the client sees nothing until close.         │
-// └─────────────────────────────────────────────────────────────────────────────┘
+// MCP SERVER — SocketsHpp
+//
+// Implements MCP 2024-11-05 (HTTP + persistent SSE) and MCP 2025-03-26
+// (Streamable HTTP) over the SocketsHpp HTTP server. The STDIO transport is
+// supported only through MCPServer::processMessage(), driven by the caller: the
+// server never reads stdin itself and never binds a port in STDIO mode.
+// (MCPClient does not support STDIO.)
+//
+// ── NGINX INTEGRATION GUIDE ──────────────────────────────────────────────────
+//
+// Run the MCP server on a loopback port (e.g. 3601) and put nginx in front for
+// TLS, OAuth, advanced rate-limiting and load balancing. The server itself only
+// provides basic hardening: a loopback bind guard, optional per-client rate
+// limiting, and bearer / API-key / capability-token authentication.
+//
+// Recommended nginx config:
+//
+//   upstream mcp_backend {
+//       server 127.0.0.1:3601;
+//       keepalive 32;           # reuse connections
+//   }
+//
+//   limit_req_zone $binary_remote_addr zone=mcp:10m rate=10r/s;
+//
+//   server {
+//       listen 443 ssl http2;
+//       ssl_certificate     /etc/ssl/mcp.crt;   # TLS (offloaded)
+//       ssl_certificate_key /etc/ssl/mcp.key;
+//
+//       location /mcp {
+//           proxy_pass         http://mcp_backend;
+//           proxy_http_version 1.1;
+//           proxy_set_header   Connection "";   # keepalive pool
+//           proxy_set_header   Host $host;
+//           proxy_set_header   X-Forwarded-For $remote_addr;
+//           proxy_buffering    off;             # CRITICAL for SSE
+//           proxy_cache        off;
+//           proxy_read_timeout 3600s;           # keep SSE streams alive
+//           limit_req          zone=mcp burst=20 nodelay;
+//       }
+//       location /health {
+//           proxy_pass http://mcp_backend/health;  # GET /health → health
+//       }
+//   }
+//
+// Features best offloaded to nginx (not implemented here):
+//   • TLS / mTLS termination
+//   • OAuth 2.1 flows and JWT validation beyond HS256 shared secrets
+//   • Aggressive DDoS / IP-block rules (ngx_http_geo_module)
+//   • gzip compression for JSON payloads
+//   • Load balancing across multiple server instances
+//   • Access logging / metrics export
+//   • PKCE / token exchange flows
+//
+// NOTE: proxy_buffering off is MANDATORY for SSE. Without it nginx buffers the
+// entire stream and the client sees nothing until close.
+
+/// @file mcp_server.h
+/// @brief MCP (Model Context Protocol) server: mcp::server::MCPServer.
+///
+/// - HTTP transports: MCPServer::listen() is non-blocking; it binds only to
+///   ServerConfig::host / ServerConfig::port (port 0 = ephemeral, see MCPServer::port())
+///   and refuses non-loopback hosts unless ServerConfig::allowNonLoopback is set.
+/// - STDIO transport: the caller reads messages and passes them to
+///   MCPServer::processMessage(); nothing is bound.
+/// - JWT (HS256) validation of bearer tokens requires jwt-cpp and the
+///   SOCKETSHPP_HAS_JWT_CPP macro, which the SocketsHpp::SocketsHpp CMake target
+///   defines automatically when jwt-cpp is found.
 #pragma once
 
 #include <SocketsHpp/config.h>
@@ -90,40 +103,58 @@ namespace mcp
     {
         using namespace http::server;
         using namespace http::common;
-        using json = nlohmann::json;
+        using json = nlohmann::json;  ///< nlohmann::json alias.
 
-        /// @brief MCP Server implementing Model Context Protocol over HTTP Stream Transport
+        /// @brief MCP server: dispatches JSON-RPC 2.0 messages to registered method handlers.
         ///
-        /// Supports three transports:
-        ///   - TransportType::STDIO              — stdin/stdout JSON-RPC for VS Code / Claude Desktop
-        ///   - TransportType::HTTP               — HTTP + persistent SSE GET stream (MCP 2024-11-05)
-        ///   - TransportType::HTTP_STREAMABLE    — Streamable HTTP POST (MCP 2025-03-26)
+        /// Transports (ServerConfig::transport):
+        ///   - TransportType::STDIO — caller-driven: pass each message to processMessage().
+        ///     The server never reads stdin and never binds a port.
+        ///   - TransportType::HTTP — POST + persistent SSE GET stream (MCP 2024-11-05).
+        ///   - TransportType::HTTP_STREAMABLE — Streamable HTTP POST, optional GET stream
+        ///     (MCP 2025-03-26).
+        /// HTTP transports serve ServerConfig::endpoint (POST, GET, DELETE, OPTIONS) and
+        /// GET /health, and bind only in listen().
         ///
-        /// Auto-registered built-in methods:
-        ///   - "ping"                     → {} (liveness check, required by spec)
-        ///   - "notifications/initialized"→ no-op (client ACK after initialize)
-        ///   - "notifications/cancelled" → cancels a pending in-flight request (by JSON-RPC id)
-        ///   - "logging/setLevel"        → sets minimum log level for notifications/message
+        /// Auto-registered built-in methods (registering the same name replaces them):
+        ///   - "ping"                      → {} (liveness check, required by spec)
+        ///   - "notifications/initialized" → no-op (client ACK after initialize)
+        ///   - "notifications/cancelled"   → sets the cancel token of the in-flight request
+        ///     whose JSON-RPC id is params.requestId, within the sender's own session
+        ///   - "logging/setLevel"          → sets the minimum level for push_log()
+        ///     (server-wide, not per session)
+        /// "initialize" is handled internally (version negotiation, session creation); a
+        /// simple handler registered as "initialize" supplies the result object.
         ///
-        /// Thread safety: registerMethod()/registerCancellable() may be called at any
-        /// time, including after listen(); push_* helpers may be called from any thread.
+        /// @note Thread safety: on the HTTP transports listen() enables 4 worker threads
+        ///       and handlers run on them concurrently, so registered handlers (and
+        ///       AuthConfig::validator) must be thread-safe. registerMethod() /
+        ///       registerCancellable() may be called at any time, including after listen();
+        ///       push_* helpers may be called from any thread.
         ///
-        /// See file header comment for nginx integration guide.
+        /// See the file header comment for the nginx integration guide.
         class MCPServer
         {
         public:
-            /// @brief Simple method handler (no cancellation support)
+            /// @brief Simple method handler (no cancellation support).
+            ///
+            /// Receives the request params (an empty object if absent) and returns the
+            /// JSON-RPC result. Throwing JsonRpcError sends that error; any other
+            /// std::exception becomes an internal error (-32603).
             using MethodHandler = std::function<json(const json& params)>;
 
-            /// @brief Cancellable method handler — receives a cancel token.
-            /// Poll cancel_requested->load() in long-running operations.
-            /// Throw std::runtime_error or return a result when done.
+            /// @brief Cancellable method handler — also receives a cancel token.
+            ///
+            /// Poll cancel_requested->load() in long-running operations; it becomes true
+            /// when the same session sends notifications/cancelled for this request id.
+            /// Return a result or throw (e.g. std::runtime_error("cancelled")) when done.
             using CancellableMethodHandler =
                 std::function<json(const json& params,
                                    std::shared_ptr<std::atomic<bool>> cancel_requested)>;
 
-            /// @brief Create MCP server with configuration
-            /// @param config Server configuration
+            /// @brief Create an MCP server. Registers built-in methods and, for HTTP
+            ///        transports, the HTTP routes. Nothing is bound until listen().
+            /// @param config Server configuration (copied).
             explicit MCPServer(const ServerConfig& config)
                 : m_config(config)
                 // Default-constructed: nothing is bound until listen(), so STDIO
@@ -190,16 +221,19 @@ namespace mcp
                 {
                     setupStreamableRoutes();
                 }
-                // STDIO transport handled externally (read from stdin, write to stdout)
+                // STDIO: no routes; the caller feeds messages to processMessage()
             }
 
+            /// @brief Calls stop().
             ~MCPServer()
             {
                 stop();
             }
 
-            /// @brief Register a method handler (simple — no cancellation)
-            /// @note Registering a built-in name (ping, notifications/initialized,
+            /// @brief Register (or replace) a simple method or notification handler.
+            /// @param method JSON-RPC method name.
+            /// @param handler Handler; must be thread-safe on the HTTP transports.
+            /// @note Thread-safe. Registering a built-in name (ping, notifications/initialized,
             ///       notifications/cancelled, logging/setLevel) replaces the built-in.
             void registerMethod(const std::string& method, MethodHandler handler)
             {
@@ -207,24 +241,33 @@ namespace mcp
                 m_methods[method] = MethodEntry{std::move(handler), nullptr};
             }
 
-            /// @brief Register a cancellable method handler.
+            /// @brief Register (or replace) a cancellable method handler.
+            ///
             /// The handler receives a shared cancel_requested token. Poll it in long-running
-            /// operations; when true, abort and throw std::runtime_error("cancelled").
-            /// The token is set by a notifications/cancelled whose params.requestId equals
-            /// the JSON-RPC id of the in-flight request.
+            /// operations; when true, abort (e.g. throw std::runtime_error("cancelled")).
+            /// The token is set by a notifications/cancelled from the same session whose
+            /// params.requestId equals the JSON-RPC id of the in-flight request (tokens are
+            /// keyed by (session, id)). For STDIO the session is "" and cancellation only
+            /// works if the caller runs processMessage() concurrently.
+            /// @param method JSON-RPC method name.
+            /// @param handler Handler; must be thread-safe on the HTTP transports.
+            /// @note Thread-safe. A cancellable "initialize" handler is ignored.
             void registerCancellable(const std::string& method, CancellableMethodHandler handler)
             {
                 std::unique_lock<std::shared_mutex> lock(m_methodsMutex);
                 m_methods[method] = MethodEntry{nullptr, std::move(handler)};
             }
 
-            /// @brief Push a progress notification to a session's SSE stream.
+            /// @brief Push a notifications/progress message to a session's SSE stream
+            ///        (via push_event()).
             /// Call from within a tool handler to report long-running operation progress.
             /// @param sessionId   Session to push to (from Mcp-Session-Id header)
             /// @param token       progressToken from the tool call params (string or int)
             /// @param progress    0.0–1.0 or total steps completed (spec allows either)
             /// @param total       Optional: denominator when progress is a step count
             /// @param message     Optional: human-readable status message
+            /// @return true if queued; false if the session has no open stream queue.
+            /// @note Thread-safe. Not available for STDIO (always returns false).
             bool push_progress(const std::string& sessionId,
                                 const json&        token,
                                 double             progress,
@@ -247,12 +290,16 @@ namespace mcp
                     "event: message\ndata: " + event_body.dump() + "\n\n");
             }
 
-            /// @brief Push a log message notification to a session's SSE stream.
-            /// Only emitted when level >= the level set by logging/setLevel (default: warning).
+            /// @brief Push a notifications/message (log) message to a session's SSE stream.
+            /// Suppressed when level is below the minimum set by logging/setLevel
+            /// (default "warning"; the minimum is server-wide). Unknown level names are
+            /// never suppressed.
             /// @param sessionId Session to push to
             /// @param level     One of: debug info notice warning error critical alert emergency
-            /// @param logger    Logger name (e.g., "memento-native")
+            /// @param logger    Logger name (e.g., "my-server")
             /// @param data      Log message (string or structured JSON object)
+            /// @return true if queued; false if suppressed or the session has no open stream queue.
+            /// @note Thread-safe.
             bool push_log(const std::string& sessionId,
                           const std::string& level,
                           const std::string& logger,
@@ -275,7 +322,8 @@ namespace mcp
             /// @brief Get the capabilities object the client advertised in its initialize call.
             /// For HTTP transports pass the session id; for the STDIO transport
             /// (processMessage) pass an empty string.
-            /// Returns null JSON if no initialize has completed for that session.
+            /// @return The capabilities, or null JSON if no initialize has completed for
+            ///         that session. Thread-safe.
             json get_client_capabilities(const std::string& sessionId) const
             {
                 std::lock_guard<std::mutex> lock(m_clientCapsMutex);
@@ -283,8 +331,10 @@ namespace mcp
                 return it != m_clientCapabilities.end() ? it->second : json{};
             }
 
-            /// @brief Return the negotiated server info (name, version, protocolVersion).
-            /// Useful for diagnostics and the health endpoint.
+            /// @brief Server info as returned by GET /health.
+            /// @return {"name", "version", "protocolVersion"}: ServerConfig::serverName /
+            ///         serverVersion (defaults if empty) and the newest supported protocol
+            ///         version ("2025-03-26"), not a per-session negotiated one.
             json server_info() const
             {
                 return {
@@ -296,9 +346,13 @@ namespace mcp
 
             /// @brief Push a server-initiated SSE event to a specific session's notification stream.
             /// Thread-safe; can be called from any thread.
+            ///
+            /// A session has a queue once its GET stream is open, or, for
+            /// HTTP_STREAMABLE, right after initialize (events pushed before the GET stream
+            /// opens are kept and delivered when it does).
             /// @param sessionId  Session to push to (from initialize response Mcp-Session-Id header)
-            /// @param eventData  Raw SSE event string (e.g. "event: message\ndata: {...}\n\n")
-            /// @return true if the session exists and event was queued
+            /// @param eventData  Complete raw SSE event (e.g. "event: message\ndata: {...}\n\n")
+            /// @return true if the session has an open queue and the event was queued
             /// @note With resumability enabled, every event gets an "id:" (unless it
             ///       already has one) and is recorded in the session's history, so a
             ///       client reconnecting with Last-Event-ID receives what it missed.
@@ -329,7 +383,10 @@ namespace mcp
                 return true;
             }
 
-            /// @brief The value of an event's "id:" field, or "" if it has none.
+            /// @brief Extract the "id:" field of the first event in a raw SSE string.
+            /// @param event Raw SSE text.
+            /// @return The id value (one leading space and a trailing '\r' removed), or ""
+            ///         if the first event has none.
             static std::string sseEventId(const std::string& event)
             {
                 size_t pos = 0;
@@ -355,8 +412,13 @@ namespace mcp
                 return std::string();
             }
 
-            /// @brief Close and remove all SSE streams idle longer than sseIdleTimeoutSeconds.
-            /// Call periodically from a maintenance thread.
+            /// @brief Close and remove all SSE queues idle longer than sseIdleTimeoutSeconds
+            ///        (or already closed). The MCP sessions themselves are not terminated.
+            /// Call periodically from a maintenance thread; the server never calls it itself.
+            /// @param sseIdleTimeoutSeconds Idle limit in seconds (default 300). An open stream
+            ///        stays active through its periodic keepalives
+            ///        (ServerConfig::sseWriteDeadlineSeconds).
+            /// @note Thread-safe.
             void cleanupStaleSessions(int sseIdleTimeoutSeconds = 300)
             {
                 auto now = std::chrono::steady_clock::now();
@@ -380,8 +442,16 @@ namespace mcp
                 }
             }
 
-            /// @brief Start server (HTTP or HTTP_STREAMABLE mode).
-            /// SSRF guard: refuses to bind to non-loopback unless config.allowNonLoopback is true.
+            /// @brief Bind and start serving (HTTP or HTTP_STREAMABLE mode). Non-blocking:
+            ///        requests are served on background threads until stop().
+            ///
+            /// Binds only to ServerConfig::host and ServerConfig::port (0 = ephemeral; see
+            /// port()) and enables a 4-thread worker pool for handlers. No-op if already
+            /// running (the loopback guard is still checked first).
+            /// SSRF guard: refuses a host other than "127.0.0.1", "localhost", "::1" or
+            /// "[::1]" unless ServerConfig::allowNonLoopback is true.
+            /// @throws std::runtime_error for the STDIO transport, a refused non-loopback
+            ///         host, or a bind/listen failure; std::invalid_argument for a malformed host.
             void listen()
             {
                 if (m_config.transport != TransportType::HTTP &&
@@ -416,7 +486,10 @@ namespace mcp
             /// @return The port, or -1 before listen().
             int port() const { return m_httpServer.getListeningPort(); }
 
-            /// @brief Stop server — closes all pending SSE queues before stopping.
+            /// @brief Stop serving: close all SSE queues (ending their streams), then stop the
+            ///        HTTP server. No-op if not running; called by the destructor.
+            /// @note Blocks until the HTTP reactor thread has stopped; handlers already running
+            ///       on worker threads are not waited for here.
             void stop()
             {
                 if (!m_running.exchange(false))
@@ -436,10 +509,17 @@ namespace mcp
                 m_httpServer.stop();
             }
 
-            /// @brief Process a JSON-RPC message or batch (STDIO mode)
+            /// @brief Process a JSON-RPC message or batch (STDIO mode; works with any transport).
+            ///
+            /// Handlers run synchronously on the calling thread. All messages share the
+            /// session "" (see get_client_capabilities("")). initialize is rejected
+            /// inside a batch.
             /// @param jsonRpcMessage JSON-RPC message (or batch array) string
             /// @return JSON-RPC response string; empty when no response is due
-            ///         (notifications, or a batch made only of notifications)
+            ///         (notifications, or a batch made only of notifications). Parse errors
+            ///         yield a -32700 response.
+            /// @note May be called concurrently from several threads (handlers must then be
+            ///       thread-safe); needed for notifications/cancelled to reach a running request.
             std::string processMessage(const std::string& jsonRpcMessage)
             {
                 json body;
@@ -546,7 +626,7 @@ namespace mcp
             std::chrono::steady_clock::time_point m_rateLimitLastPrune{std::chrono::steady_clock::now()};
             std::mutex m_rateLimitMutex;
 
-            // Cancellation tokens: JSON-RPC request id → cancel flag (set by notifications/cancelled)
+            // Cancellation tokens: [session, JSON-RPC request id] → cancel flag (set by notifications/cancelled)
             std::map<json, std::shared_ptr<std::atomic<bool>>> m_pendingCancellations;
             mutable std::mutex m_pendingMutex;
 
@@ -1636,8 +1716,9 @@ namespace mcp
                 }
             }
 
-            /// @brief Run a cancellable handler with its token registered under the
-            /// request's JSON-RPC id, so notifications/cancelled{requestId} can find it.
+            /// @brief Run a cancellable handler with its token registered under
+            /// (current session, JSON-RPC id), so notifications/cancelled{requestId} from
+            /// the same session can find it.
             json invokeCancellable(const CancellableMethodHandler& handler, const JsonRpcId& id,
                                    const json& params)
             {
