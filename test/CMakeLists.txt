@@ -58,11 +58,6 @@ set(FUNCTIONAL_TESTS
   http_methods_test
 )
 
-# MCP functional tests disabled until HttpServer API is implemented
-# if(TARGET nlohmann_json::nlohmann_json)
-#   list(APPEND FUNCTIONAL_TESTS mcp_integration_test)
-# endif()
-
 foreach(testname ${FUNCTIONAL_TESTS})
   add_executable(${testname} "functional/${testname}.cc" "functional/utils.h")
   target_link_libraries(${testname} ${GTEST_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
