@@ -41,7 +41,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -54,7 +54,7 @@ jobs:
       # Optional dependency: builds the MCP server's JWT validation path and its tests.
       - name: Checkout jwt-cpp
         if: matrix.jwt
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Thalhammer/jwt-cpp
           ref: v0.7.1
@@ -133,7 +133,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -176,7 +176,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Doxygen
         run: |
