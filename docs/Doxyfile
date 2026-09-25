@@ -1,9 +1,9 @@
 # Doxygen configuration for the SocketsHpp public API.
-# Run from the repository root:  doxygen docs/Doxyfile   (HTML goes to docs/api/)
+# Run from the repository root:  doxygen docs/Doxyfile
 # CI runs this with WARN_AS_ERROR so every public/protected entity stays documented.
 PROJECT_NAME           = SocketsHpp
 PROJECT_BRIEF          = "Header-only C++17 sockets, HTTP/1.1, SSE and MCP"
-OUTPUT_DIRECTORY       = docs/api
+OUTPUT_DIRECTORY       = build/docs
 INPUT                  = include
 RECURSIVE              = YES
 FILE_PATTERNS          = *.h *.hpp
