@@ -647,6 +647,185 @@ TEST_F(HttpClientTest, NoFileDescriptorLeak)
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Redirects and scheme handling
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    void reply(int fd, const std::string& status, const std::string& extraHeaders, const std::string& body)
+    {
+        writeAll(fd, "HTTP/1.1 " + status + "\r\n" + extraHeaders + "Content-Length: " +
+                         std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+    }
+
+    /// Echo the raw request back as the body.
+    void echo(int fd, const std::string& req) { reply(fd, "200 OK", "", req); }
+}  // namespace
+
+TEST(HttpClientRedirectTest, FollowsRelativeRedirect)
+{
+    ScriptedServer server([](int fd, const std::string& req, const std::string& target) {
+        if (pathOf(target) == "/old/page")
+            reply(fd, "302 Found", "Location: new?x=1\r\n", "moved");
+        else
+            echo(fd, req);
+    });
+    ASSERT_TRUE(server.ok());
+    HttpClient client;
+    HttpClientResponse response;
+    ASSERT_TRUE(client.get(server.url("/old/page"), response));
+    EXPECT_EQ(response.code, 200);
+    EXPECT_EQ(response.body.rfind("GET /old/new?x=1 HTTP/1.1\r\n", 0), 0u) << response.body;
+}
+
+TEST(HttpClientRedirectTest, SeeOtherSwitchesPostToGetWithoutBody)
+{
+    ScriptedServer server([](int fd, const std::string& req, const std::string& target) {
+        if (pathOf(target) == "/submit")
+            reply(fd, "303 See Other", "Location: /result\r\n", "");
+        else
+            echo(fd, req);
+    });
+    ASSERT_TRUE(server.ok());
+    HttpClient client;
+    HttpClientResponse response;
+    ASSERT_TRUE(client.post(server.url("/submit"), "payload", response));
+    EXPECT_EQ(response.body.rfind("GET /result HTTP/1.1\r\n", 0), 0u) << response.body;
+    EXPECT_EQ(lowerCopy(response.body).find("content-length"), std::string::npos);
+    EXPECT_EQ(response.body.find("payload"), std::string::npos);
+}
+
+TEST(HttpClientRedirectTest, TemporaryRedirectKeepsMethodAndBody)
+{
+    ScriptedServer server([](int fd, const std::string& req, const std::string& target) {
+        if (pathOf(target) == "/a")
+            reply(fd, "307 Temporary Redirect", "Location: /b\r\n", "");
+        else
+            echo(fd, req);
+    });
+    ASSERT_TRUE(server.ok());
+    HttpClient client;
+    HttpClientResponse response;
+    ASSERT_TRUE(client.post(server.url("/a"), "payload", response));
+    EXPECT_EQ(response.body.rfind("POST /b HTTP/1.1\r\n", 0), 0u) << response.body;
+    EXPECT_NE(response.body.find("\r\n\r\npayload"), std::string::npos) << response.body;
+}
+
+TEST(HttpClientRedirectTest, RedirectLoopStopsAtLimit)
+{
+    std::atomic<int> hits{0};
+    ScriptedServer server([&](int fd, const std::string&, const std::string&) {
+        ++hits;
+        reply(fd, "302 Found", "Location: /loop\r\n", "");
+    });
+    ASSERT_TRUE(server.ok());
+    HttpClient client;
+    client.setMaxRedirects(3);
+    HttpClientResponse response;
+    EXPECT_FALSE(client.get(server.url("/loop"), response));
+    EXPECT_EQ(hits.load(), 4);  // original request + 3 redirects
+}
+
+TEST(HttpClientRedirectTest, DisabledReturnsRedirectResponse)
+{
+    ScriptedServer server([](int fd, const std::string&, const std::string&) {
+        reply(fd, "301 Moved Permanently", "Location: /elsewhere\r\n", "moved");
+    });
+    ASSERT_TRUE(server.ok());
+    HttpClient client;
+    client.setFollowRedirects(false);
+    HttpClientResponse response;
+    ASSERT_TRUE(client.get(server.url("/x"), response));
+    EXPECT_EQ(response.code, 301);
+    EXPECT_EQ(response.getHeader("location"), "/elsewhere");
+    EXPECT_EQ(response.body, "moved");
+}
+
+TEST(HttpClientRedirectTest, CredentialsDroppedOnCrossOriginRedirectOnly)
+{
+    ScriptedServer target([](int fd, const std::string& req, const std::string&) { echo(fd, req); });
+    ASSERT_TRUE(target.ok());
+    const std::string elsewhere = target.url("/landing");
+    ScriptedServer origin([&](int fd, const std::string& req, const std::string& t) {
+        if (pathOf(t) == "/same")
+            reply(fd, "302 Found", "Location: /echo\r\n", "");
+        else if (pathOf(t) == "/cross")
+            reply(fd, "302 Found", "Location: " + elsewhere + "\r\n", "");
+        else
+            echo(fd, req);
+    });
+    ASSERT_TRUE(origin.ok());
+
+    HttpClient client;
+    HttpClientRequest same;
+    same.method = METHOD_GET;
+    same.uri = origin.url("/same");
+    same.setHeader("Authorization", "Bearer secret");
+    HttpClientResponse r1;
+    ASSERT_TRUE(client.send(same, r1));
+    EXPECT_NE(lowerCopy(r1.body).find("\r\nauthorization: bearer secret\r\n"), std::string::npos) << r1.body;
+
+    HttpClientRequest cross;
+    cross.method = METHOD_GET;
+    cross.uri = origin.url("/cross");
+    cross.setHeader("Authorization", "Bearer secret");
+    cross.setHeader("Cookie", "sid=1");
+    HttpClientResponse r2;
+    ASSERT_TRUE(client.send(cross, r2));
+    EXPECT_EQ(r2.body.rfind("GET /landing HTTP/1.1\r\n", 0), 0u) << r2.body;
+    EXPECT_EQ(lowerCopy(r2.body).find("authorization"), std::string::npos) << r2.body;
+    EXPECT_EQ(lowerCopy(r2.body).find("cookie"), std::string::npos) << r2.body;
+    // Host must be recomputed for the new origin.
+    EXPECT_NE(r2.body.find("\r\nHost: 127.0.0.1:" + std::to_string(target.port()) + "\r\n"), std::string::npos)
+        << r2.body;
+}
+
+TEST(HttpClientRedirectTest, StreamingCallbackSeesOnlyFinalResponse)
+{
+    ScriptedServer server([](int fd, const std::string&, const std::string& target) {
+        if (pathOf(target) == "/start")
+            reply(fd, "302 Found", "Location: /final\r\n", "REDIRECT-BODY");
+        else
+            reply(fd, "200 OK", "", "FINAL-BODY");
+    });
+    ASSERT_TRUE(server.ok());
+    HttpClient client;
+    HttpClientResponse response;
+    std::string streamed;
+    response.chunkCallback = [&](const std::string& data) { streamed += data; };
+    ASSERT_TRUE(client.get(server.url("/start"), response));
+    EXPECT_EQ(streamed, "FINAL-BODY");
+}
+
+TEST(HttpClientSchemeTest, HttpsIsRejectedNotSentInCleartext)
+{
+    ScriptedServer server([](int fd, const std::string& req, const std::string&) { echo(fd, req); });
+    ASSERT_TRUE(server.ok());
+    HttpClient client;
+    HttpClientResponse response;
+    EXPECT_FALSE(client.get("https://127.0.0.1:" + std::to_string(server.port()) + "/", response));
+    EXPECT_TRUE(server.requests().empty()) << "no bytes may be sent for an https URL";
+}
+
+TEST(HttpClientSchemeTest, RedirectToHttpsIsNotFollowedInCleartext)
+{
+    std::atomic<int> hits{0};
+    ScriptedServer server([&](int fd, const std::string&, const std::string&) {
+        const int n = ++hits;
+        if (n == 1)
+            reply(fd, "301 Moved Permanently",
+                  "Location: https://127.0.0.1:" + std::to_string(0) + "/secure\r\n", "");
+        else
+            reply(fd, "200 OK", "", "should not happen");
+    });
+    ASSERT_TRUE(server.ok());
+    HttpClient client;
+    HttpClientResponse response;
+    EXPECT_FALSE(client.get(server.url("/"), response));
+    EXPECT_EQ(hits.load(), 1);
+}
+
 TEST(HttpClientIPv6Test, BracketedIPv6Host)
 {
     ScriptedServer server(defaultHandler, AF_INET6);

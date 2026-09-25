@@ -88,6 +88,19 @@ namespace http
                 return true;
             }
 
+            /// Remove every header whose name matches case-insensitively.
+            template <typename Map>
+            inline void eraseHeader(Map& headers, const std::string& name)
+            {
+                for (auto it = headers.begin(); it != headers.end();)
+                {
+                    if (iequals(it->first, name))
+                        it = headers.erase(it);
+                    else
+                        ++it;
+                }
+            }
+
             /// Find a header by name, case-insensitively. Exact-case match is tried first.
             template <typename Map>
             inline auto findHeader(Map& headers, const std::string& name) -> decltype(headers.begin())
@@ -342,6 +355,43 @@ namespace http
                     return true;
                 }
             };
+
+            inline bool isRedirectStatus(int code)
+            {
+                return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+            }
+
+            inline bool sameOrigin(const ParsedUrl& a, const ParsedUrl& b)
+            {
+                return a.scheme == b.scheme && asciiLower(a.host) == asciiLower(b.host) && a.port == b.port;
+            }
+
+            /// Resolve a Location header against the URL of the request that produced it
+            /// (absolute URL, scheme-relative "//host/path", absolute path, or relative path).
+            inline std::string resolveLocation(const ParsedUrl& base, const std::string& location)
+            {
+                if (location.find("://") != std::string::npos)
+                {
+                    return location;
+                }
+                const std::string authority = base.scheme + "://" + base.hostHeader();
+                if (location.compare(0, 2, "//") == 0)
+                {
+                    return base.scheme + ":" + location;
+                }
+                if (!location.empty() && location[0] == '/')
+                {
+                    return authority + location;
+                }
+                if (!location.empty() && location[0] == '?')
+                {
+                    return authority + base.path + location;
+                }
+                // Relative path: replace the last segment of the base path.
+                const size_t slash = base.path.rfind('/');
+                const std::string dir = (slash == std::string::npos) ? "/" : base.path.substr(0, slash + 1);
+                return authority + dir + location;
+            }
         }  // namespace detail
 
         struct HttpClientRequest
@@ -421,7 +471,7 @@ namespace http
             std::string m_userAgent = "SocketsHpp/1.1";
             int m_connectTimeoutMs = 10000;  // 10 seconds; <= 0 means OS default (blocking)
             int m_readTimeoutMs = 30000;     // 30 seconds; <= 0 means no timeout
-            bool m_followRedirects = true;   // NOTE: redirects are not implemented yet
+            bool m_followRedirects = true;   // follow 301/302/303/307/308 (see send())
             int m_maxRedirects = 10;
             /// Upper bound on a response body accumulated into HttpClientResponse::body,
             /// and on any single chunk of a chunked response.
@@ -469,13 +519,114 @@ namespace http
                 return send(request, response);
             }
 
-            // Send custom request
+            /// Send a request. Redirects (301/302/303/307/308 with a Location header) are
+            /// followed up to setMaxRedirects() times unless disabled with
+            /// setFollowRedirects(false):
+            ///  - 303, and 301/302 for methods other than GET/HEAD, switch to GET without
+            ///    a body; 307/308 repeat the original method and body.
+            ///  - Authorization, Cookie and Proxy-Authorization are dropped when the
+            ///    redirect leaves the original host/port.
+            /// Streaming callbacks (chunkCallback/onComplete) only see the final response.
+            /// Only plain "http" URLs are supported; https (TLS) is rejected rather than
+            /// sent in cleartext.
             bool send(HttpClientRequest& request, HttpClientResponse& response)
+            {
+                if (!m_followRedirects || m_maxRedirects <= 0)
+                {
+                    return sendOnce(request, response);
+                }
+
+                // Deliver streaming callbacks only for the final (non-redirect) response.
+                auto userChunk = response.chunkCallback;
+                auto userComplete = response.onComplete;
+                auto restore = [&]() {
+                    response.chunkCallback = userChunk;
+                    response.onComplete = userComplete;
+                };
+                if (userChunk)
+                {
+                    response.chunkCallback = [&response, userChunk](const std::string& data) {
+                        if (!detail::isRedirectStatus(response.code))
+                            userChunk(data);
+                    };
+                }
+                if (userComplete)
+                {
+                    response.onComplete = [&response, userComplete]() {
+                        if (!detail::isRedirectStatus(response.code))
+                            userComplete();
+                    };
+                }
+
+                HttpClientRequest current = request;
+                for (int hop = 0;; ++hop)
+                {
+                    const bool ok = sendOnce(current, response);
+                    const std::string location = response.getHeader("Location");
+                    if (!ok || !detail::isRedirectStatus(response.code) || location.empty())
+                    {
+                        restore();
+                        return ok;
+                    }
+                    if (hop >= m_maxRedirects)
+                    {
+                        LOG_ERROR("HttpClient: Too many redirects (max %d)", m_maxRedirects);
+                        restore();
+                        return false;
+                    }
+
+                    detail::ParsedUrl from;
+                    from.parse(current.uri);
+                    const std::string next = detail::resolveLocation(from, location);
+                    detail::ParsedUrl to;
+                    if (!to.parse(next))
+                    {
+                        LOG_ERROR("HttpClient: Invalid redirect Location: %s", location.c_str());
+                        restore();
+                        return false;
+                    }
+
+                    // Rebuild the request for the next hop.
+                    detail::eraseHeader(current.headers, HOST);  // recomputed for the new URL
+                    if (response.code == 303 ||
+                        ((response.code == 301 || response.code == 302) &&
+                         current.method != METHOD_GET && current.method != METHOD_HEAD))
+                    {
+                        if (current.method != METHOD_HEAD)
+                        {
+                            current.method = METHOD_GET;
+                        }
+                        current.body.clear();
+                        detail::eraseHeader(current.headers, CONTENT_LENGTH);
+                        detail::eraseHeader(current.headers, CONTENT_TYPE);
+                        detail::eraseHeader(current.headers, TRANSFER_ENCODING);
+                    }
+                    if (!detail::sameOrigin(from, to))
+                    {
+                        detail::eraseHeader(current.headers, "Authorization");
+                        detail::eraseHeader(current.headers, "Proxy-Authorization");
+                        detail::eraseHeader(current.headers, "Cookie");
+                    }
+                    current.uri = next;
+                }
+            }
+
+        protected:
+            /// Send a single request/response exchange (no redirect handling).
+            bool sendOnce(HttpClientRequest& request, HttpClientResponse& response)
             {
                 detail::ParsedUrl url;
                 if (!url.parse(request.uri))
                 {
                     LOG_ERROR("HttpClient: Failed to parse URL: %s", request.uri.c_str());
+                    return false;
+                }
+                if (url.scheme != "http")
+                {
+                    // No TLS support: never send an https request (and its credentials)
+                    // in cleartext.
+                    LOG_ERROR("HttpClient: Unsupported URL scheme '%s' (only http is supported)",
+                              url.scheme.c_str());
                     return false;
                 }
 
@@ -546,7 +697,6 @@ namespace http
                 return receiveResponse(socket, response, request.method);
             }
 
-        protected:
             // ---------------------------------------------------------------------
             // Active socket tracking (for cancel()/SSEClient::close())
             // ---------------------------------------------------------------------
