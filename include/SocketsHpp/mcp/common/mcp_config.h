@@ -6,9 +6,11 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -158,7 +160,7 @@ namespace mcp
                 CAPABILITY_TOKEN  // X-MCP-Capability-Token header (backport from FMcpNativeTransport)
             } type = Type::NONE;
             
-            std::string headerName = "Authorization";  // For Bearer: "Authorization", for API key: "x-api-key"
+            std::string headerName = "Authorization";  // For Bearer: "Authorization", for API key: "x-api-key" (matched case-insensitively)
             std::optional<std::string> secretOrPublicKey;  // For validation
             
             // Custom validator function
@@ -168,8 +170,13 @@ namespace mcp
         // Security / transport hardening (backports from FMcpNativeTransport)
         /// Allow binding to non-loopback addresses (SSRF guard — default: false = loopback only)
         bool allowNonLoopback = false;
-        /// Max requests per IP per minute (0 = disabled). Backport of token-bucket rate limiting.
+        /// Max requests per client per minute (0 = disabled). Clients are keyed by TCP
+        /// peer address.
         int maxRequestsPerMinute = 0;
+        /// Trust the X-Forwarded-For header for identifying clients (rate limiting).
+        /// Enable ONLY when the server is reachable exclusively through a reverse proxy
+        /// that overwrites/appends X-Forwarded-For; otherwise clients can spoof it.
+        bool trustProxyHeaders = false;
         /// Seconds before SSE stream write callback returns keepalive comment (0 = use 30s default).
         int sseWriteDeadlineSeconds = 30;
 
@@ -286,9 +293,9 @@ namespace mcp
     /// @brief Client-side MCP configuration
     struct ClientConfig
     {
-        TransportType transport;
+        TransportType transport = TransportType::STDIO;
         StdioConfig stdio;   // Used if transport == STDIO
-        HttpConfig http;     // Used if transport == HTTP
+        HttpConfig http;     // Used if transport == HTTP or HTTP_STREAMABLE
         
         // Retry settings
         int maxRetries = 3;
@@ -299,6 +306,7 @@ namespace mcp
         int readTimeoutSeconds = 30;
 
         /// @brief Load from VS Code mcp.json server configuration
+        /// @throws std::invalid_argument for an unknown "type"
         static ClientConfig fromJson(const json& j)
         {
             ClientConfig config;
@@ -318,6 +326,10 @@ namespace mcp
             {
                 config.transport = TransportType::HTTP_STREAMABLE;
                 config.http = HttpConfig::fromJson(j);
+            }
+            else
+            {
+                throw std::invalid_argument("Unknown MCP transport type: " + type);
             }
             
             return config;

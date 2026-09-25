@@ -5,6 +5,8 @@
 #include <SocketsHpp/mcp/common/mcp_config.h>
 #include <nlohmann/json.hpp>
 
+#include <stdexcept>
+
 using namespace SocketsHpp::mcp;
 using json = nlohmann::json;
 
@@ -209,6 +211,22 @@ TEST(MCPConfigTest, ClientConfigFromJsonHttpStreamableAlias) {
     json server_json = {{"type", "http-streamable"}, {"url", "http://localhost:3601/mcp"}};
     auto config = ClientConfig::fromJson(server_json);
     EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
+}
+
+TEST(MCPConfigTest, ClientConfigDefaultTransportInitialized) {
+    ClientConfig config;
+    EXPECT_EQ(config.transport, TransportType::STDIO);
+}
+
+TEST(MCPConfigTest, ClientConfigFromJsonUnknownTypeThrows) {
+    json server_json = {{"type", "websocket"}, {"url", "ws://localhost/mcp"}};
+    EXPECT_THROW(ClientConfig::fromJson(server_json), std::invalid_argument);
+}
+
+TEST(MCPConfigTest, ServerConfigProxyHeadersNotTrustedByDefault) {
+    ServerConfig config;
+    EXPECT_FALSE(config.trustProxyHeaders);
+    EXPECT_EQ(config.maxRequestsPerMinute, 0);
 }
 
 int main(int argc, char **argv) {

@@ -5,7 +5,10 @@
 #include <SocketsHpp/config.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <variant>
 
@@ -81,11 +84,72 @@ namespace http
             }
         };
 
+        /// @brief JSON-RPC 2.0 message id.
+        ///
+        /// - std::monostate : the "id" member is absent (a notification, or a
+        ///                    response whose id could not be determined)
+        /// - std::string    : string id
+        /// - std::int64_t   : integer id (full 64-bit range, no narrowing)
+        /// - std::nullptr_t : explicit "id": null
+        using JsonRpcId = std::variant<std::monostate, std::string, std::int64_t, std::nullptr_t>;
+
+        /// @brief Returns true if the id holds a value (string, integer or explicit null).
+        inline bool jsonRpcIdPresent(const JsonRpcId& id)
+        {
+            return !std::holds_alternative<std::monostate>(id);
+        }
+
+        /// @brief Convert a JSON value to a JsonRpcId.
+        /// @return false if the value is not a valid JSON-RPC id (string, integer, null).
+        inline bool jsonRpcIdFromJson(const json& j, JsonRpcId& out)
+        {
+            if (j.is_string())
+            {
+                out = j.get<std::string>();
+                return true;
+            }
+            if (j.is_number_unsigned())
+            {
+                auto u = j.get<std::uint64_t>();
+                if (u > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()))
+                {
+                    return false;
+                }
+                out = static_cast<std::int64_t>(u);
+                return true;
+            }
+            if (j.is_number_integer())
+            {
+                out = j.get<std::int64_t>();
+                return true;
+            }
+            if (j.is_null())
+            {
+                out = nullptr;
+                return true;
+            }
+            return false;
+        }
+
+        /// @brief Convert a JsonRpcId to JSON. An absent id (monostate) maps to null.
+        inline json jsonRpcIdToJson(const JsonRpcId& id)
+        {
+            if (auto s = std::get_if<std::string>(&id))
+            {
+                return *s;
+            }
+            if (auto n = std::get_if<std::int64_t>(&id))
+            {
+                return *n;
+            }
+            return nullptr;
+        }
+
         /// @brief JSON-RPC 2.0 request
         struct JsonRpcRequest
         {
             std::string jsonrpc = "2.0";
-            std::variant<std::string, int, std::nullptr_t> id; // Can be string, number, or null
+            JsonRpcId id; // absent (monostate), string, integer, or null
             std::string method;
             std::optional<json> params;
 
@@ -96,22 +160,11 @@ namespace http
                     {"method", method}
                 };
 
-                // Handle different ID types
-                std::visit([&j](auto&& arg) {
-                    using T = std::decay_t<decltype(arg)>;
-                    if constexpr (std::is_same_v<T, std::string>)
-                    {
-                        j["id"] = arg;
-                    }
-                    else if constexpr (std::is_same_v<T, int>)
-                    {
-                        j["id"] = arg;
-                    }
-                    else if constexpr (std::is_same_v<T, std::nullptr_t>)
-                    {
-                        j["id"] = nullptr;
-                    }
-                }, id);
+                // Absent id is omitted (serializes as a notification)
+                if (jsonRpcIdPresent(id))
+                {
+                    j["id"] = jsonRpcIdToJson(id);
+                }
 
                 if (params.has_value())
                 {
@@ -134,20 +187,12 @@ namespace http
                 req.jsonrpc = j.value("jsonrpc", "2.0");
                 req.method = j.at("method").get<std::string>();
 
-                // Parse ID
+                // Parse ID (absent stays std::monostate)
                 if (j.contains("id"))
                 {
-                    if (j["id"].is_string())
+                    if (!jsonRpcIdFromJson(j["id"], req.id))
                     {
-                        req.id = j["id"].get<std::string>();
-                    }
-                    else if (j["id"].is_number_integer())
-                    {
-                        req.id = j["id"].get<int>();
-                    }
-                    else if (j["id"].is_null())
-                    {
-                        req.id = nullptr;
+                        throw std::invalid_argument("JSON-RPC id must be a string, integer or null");
                     }
                 }
 
@@ -159,9 +204,11 @@ namespace http
                 return req;
             }
 
+            /// @brief True if the message carried an "id" member (including "id": null).
+            /// A request without an id is a notification.
             bool hasId() const
             {
-                return !std::holds_alternative<std::nullptr_t>(id);
+                return jsonRpcIdPresent(id);
             }
         };
 
@@ -213,7 +260,7 @@ namespace http
         struct JsonRpcResponse
         {
             std::string jsonrpc = "2.0";
-            std::variant<std::string, int, std::nullptr_t> id;
+            JsonRpcId id;
             std::optional<json> result;
             std::optional<JsonRpcError> error;
 
@@ -223,22 +270,8 @@ namespace http
                     {"jsonrpc", jsonrpc}
                 };
 
-                // Handle different ID types
-                std::visit([&j](auto&& arg) {
-                    using T = std::decay_t<decltype(arg)>;
-                    if constexpr (std::is_same_v<T, std::string>)
-                    {
-                        j["id"] = arg;
-                    }
-                    else if constexpr (std::is_same_v<T, int>)
-                    {
-                        j["id"] = arg;
-                    }
-                    else if constexpr (std::is_same_v<T, std::nullptr_t>)
-                    {
-                        j["id"] = nullptr;
-                    }
-                }, id);
+                // A response always carries an id; unknown/absent id is null
+                j["id"] = jsonRpcIdToJson(id);
 
                 if (error.has_value())
                 {
@@ -271,17 +304,9 @@ namespace http
                 // Parse ID
                 if (j.contains("id"))
                 {
-                    if (j["id"].is_string())
+                    if (!jsonRpcIdFromJson(j["id"], resp.id))
                     {
-                        resp.id = j["id"].get<std::string>();
-                    }
-                    else if (j["id"].is_number_integer())
-                    {
-                        resp.id = j["id"].get<int>();
-                    }
-                    else if (j["id"].is_null())
-                    {
-                        resp.id = nullptr;
+                        throw std::invalid_argument("JSON-RPC id must be a string, integer or null");
                     }
                 }
 
@@ -297,7 +322,7 @@ namespace http
                 return resp;
             }
 
-            static JsonRpcResponse success(const std::variant<std::string, int, std::nullptr_t>& id, const json& result)
+            static JsonRpcResponse success(const JsonRpcId& id, const json& result)
             {
                 JsonRpcResponse resp;
                 resp.id = id;
@@ -305,7 +330,7 @@ namespace http
                 return resp;
             }
 
-            static JsonRpcResponse failure(const std::variant<std::string, int, std::nullptr_t>& id, const JsonRpcError& error)
+            static JsonRpcResponse failure(const JsonRpcId& id, const JsonRpcError& error)
             {
                 JsonRpcResponse resp;
                 resp.id = id;
