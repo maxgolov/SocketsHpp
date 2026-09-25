@@ -392,6 +392,18 @@ TEST(JsonRpcTest, IdHelpersRoundTrip) {
     EXPECT_TRUE(jsonRpcIdToJson(JsonRpcId{}).is_null());
 }
 
+
+TEST(JsonRpcResponseTest, ResponseWithoutResultOrErrorIsRejected)
+{
+    EXPECT_THROW(JsonRpcResponse::parse(R"({"jsonrpc":"2.0","id":1})"), std::invalid_argument);
+}
+
+TEST(JsonRpcErrorTest, DefaultConstructedCodeIsZero)
+{
+    JsonRpcError e;
+    EXPECT_EQ(e.code, 0);
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

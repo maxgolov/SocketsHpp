@@ -622,11 +622,12 @@ namespace http
             ///  - Authorization, Cookie and Proxy-Authorization are dropped when the
             ///    redirect leaves the original scheme/host/port.
             ///  - Relative Location values are resolved against the current URL.
-            /// Streaming callbacks (chunkCallback/onComplete) only see the final response.
+            /// Streaming callbacks (chunkCallback/onComplete) only see the final response
+            /// (which may itself be a 3xx that is not followed, e.g. without Location).
             /// Only plain "http" URLs are supported; https (TLS) is rejected rather than
             /// sent in cleartext.
-            /// @param request Request to send. Default headers are added to it in place when
-            ///        redirects are disabled; with redirect following a copy is sent.
+            /// @param request Request to send. It is not modified: default headers (Host,
+            ///        User-Agent, ...) are added to the copy that is sent.
             /// @param response Receives the (final) response; see HttpClientResponse.
             /// @return true if a complete response was received, whatever its status code.
             ///         false on an invalid or non-http URL, DNS/connect failure, send/receive
@@ -634,41 +635,59 @@ namespace http
             ///         an invalid redirect Location or too many redirects (errors are logged).
             bool send(HttpClientRequest& request, HttpClientResponse& response)
             {
+                HttpClientRequest current = request;  // never modify the caller's request
                 if (!m_followRedirects || m_maxRedirects <= 0)
                 {
-                    return sendOnce(request, response);
+                    return sendOnce(current, response);
                 }
 
-                // Deliver streaming callbacks only for the final (non-redirect) response.
+                // Streaming callbacks must only see the final response. Output of a
+                // redirect response is held back and delivered only if that response
+                // turns out to be final (a 3xx that is not followed).
                 auto userChunk = response.chunkCallback;
                 auto userComplete = response.onComplete;
+                std::string heldBody;
+                bool heldComplete = false;
                 auto restore = [&]() {
                     response.chunkCallback = userChunk;
                     response.onComplete = userComplete;
                 };
                 if (userChunk)
                 {
-                    response.chunkCallback = [&response, userChunk](const std::string& data) {
-                        if (!detail::isRedirectStatus(response.code))
+                    response.chunkCallback = [&response, &heldBody, userChunk](const std::string& data) {
+                        if (detail::isRedirectStatus(response.code))
+                            heldBody += data;
+                        else
                             userChunk(data);
                     };
                 }
                 if (userComplete)
                 {
-                    response.onComplete = [&response, userComplete]() {
-                        if (!detail::isRedirectStatus(response.code))
+                    response.onComplete = [&response, &heldComplete, userComplete]() {
+                        if (detail::isRedirectStatus(response.code))
+                            heldComplete = true;
+                        else
                             userComplete();
                     };
                 }
 
-                HttpClientRequest current = request;
                 for (int hop = 0;; ++hop)
                 {
+                    heldBody.clear();
+                    heldComplete = false;
                     const bool ok = sendOnce(current, response);
                     const std::string location = response.getHeader("Location");
                     if (!ok || !detail::isRedirectStatus(response.code) || location.empty())
                     {
                         restore();
+                        if (ok && detail::isRedirectStatus(response.code))
+                        {
+                            // A redirect we do not follow is the final response.
+                            if (userChunk && !heldBody.empty())
+                                userChunk(heldBody);
+                            if (userComplete && heldComplete)
+                                userComplete();
+                        }
                         return ok;
                     }
                     if (hop >= m_maxRedirects)

@@ -798,6 +798,47 @@ TEST(HttpClientRedirectTest, StreamingCallbackSeesOnlyFinalResponse)
     EXPECT_EQ(streamed, "FINAL-BODY");
 }
 
+TEST(HttpClientRedirectTest, UnfollowedRedirectIsDeliveredToStreamingCallbacks)
+{
+    // A 3xx without Location is the final response: its body and completion must
+    // reach the streaming callbacks even though redirect following is on.
+    ScriptedServer moved([](int fd, const std::string&, const std::string&) {
+        reply(fd, "302 Found", "", "no location here");
+    });
+    ASSERT_TRUE(moved.ok());
+    HttpClient client;
+    HttpClientResponse response;
+    std::string streamed;
+    bool completed = false;
+    response.chunkCallback = [&](const std::string& data) { streamed += data; };
+    response.onComplete = [&]() { completed = true; };
+    ASSERT_TRUE(client.get(moved.url("/"), response));
+    EXPECT_EQ(response.code, 302);
+    EXPECT_EQ(streamed, "no location here");
+    EXPECT_TRUE(completed);
+}
+
+TEST(HttpClientRequestTest, SendDoesNotModifyTheCallersRequest)
+{
+    ScriptedServer server([](int fd, const std::string& req, const std::string&) { echo(fd, req); });
+    ASSERT_TRUE(server.ok());
+    for (bool follow : {true, false})
+    {
+        HttpClient client;
+        client.setFollowRedirects(follow);
+        HttpClientRequest request;
+        request.method = METHOD_POST;
+        request.uri = server.url("/x");
+        request.body = "payload";
+        request.setHeader("X-Custom", "1");
+        const auto headersBefore = request.headers;
+        HttpClientResponse response;
+        ASSERT_TRUE(client.send(request, response));
+        EXPECT_EQ(request.headers, headersBefore) << "follow=" << follow;
+        EXPECT_NE(lowerCopy(response.body).find("\r\nhost: "), std::string::npos) << "Host still sent";
+    }
+}
+
 TEST(HttpClientSchemeTest, HttpsIsRejectedNotSentInCleartext)
 {
     ScriptedServer server([](int fd, const std::string& req, const std::string&) { echo(fd, req); });
@@ -1008,6 +1049,49 @@ TEST(SSEClientTest, RequestHeadersSentOnEveryConnectAndCannotOverrideAccept)
         EXPECT_EQ(req.find("accept: application/json"), std::string::npos) << reqs[i];
         EXPECT_EQ(req.find("session="), std::string::npos) << "session id must not be in the URL";
     }
+}
+
+TEST(SSEClientTest, ConnectAfterCloseKeepsAutoReconnect)
+{
+    std::atomic<int> connections{0};
+    ScriptedServer server([&](int fd, const std::string&, const std::string&) {
+        ++connections;
+        // One event, then end the stream so the client has to reconnect.
+        writeAll(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nretry: 10\ndata: x\n\n");
+    });
+    ASSERT_TRUE(server.ok());
+
+    SSEClient client;
+    client.setAutoReconnect(true, 10);
+    for (int round = 0; round < 2; ++round)
+    {
+        const int before = connections.load();
+        int events = 0;
+        client.connect(server.url("/events"), [&](const SSEEvent&) {
+            if (++events == 2)
+                client.close();  // after one reconnect
+        });
+        EXPECT_EQ(events, 2) << "round " << round;
+        EXPECT_GE(connections.load() - before, 2) << "round " << round << " did not reconnect";
+    }
+}
+
+TEST(SSEClientTest, RequestHeaderNamesAreCaseInsensitive)
+{
+    ScriptedServer server([](int fd, const std::string&, const std::string&) {
+        writeAll(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: x\n\n");
+    });
+    ASSERT_TRUE(server.ok());
+    SSEClient client;
+    client.setRequestHeader("authorization", "Bearer old");
+    client.setRequestHeader("Authorization", "Bearer new");
+    client.connect(server.url("/events"), [&](const SSEEvent&) {});
+    auto reqs = server.requests();
+    ASSERT_EQ(reqs.size(), 1u);
+    const std::string req = lowerCopy(reqs[0]);
+    EXPECT_NE(req.find("authorization: bearer new"), std::string::npos) << reqs[0];
+    EXPECT_EQ(req.find("bearer old"), std::string::npos) << reqs[0];
+    EXPECT_TRUE(client.getLastEventId().empty());
 }
 
 TEST(SSEClientTest, ReconnectRetriesAfterConnectFailureAndCloseStopsBackoff)

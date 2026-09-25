@@ -23,8 +23,7 @@ namespace http
         struct JsonRpcError
         {
             /// @brief Error code (see the factory functions for the standard codes).
-            /// @note Not initialized by default construction.
-            int code;
+            int code = 0;
             /// @brief Short error description.
             std::string message;
             /// @brief Optional additional error information ("data" member).
@@ -371,13 +370,14 @@ namespace http
                 return toJson().dump();
             }
 
-            /// @brief Parse a response from JSON text. "error" wins over "result"; neither
-            /// is required (both then stay unset).
+            /// @brief Parse a response from JSON text. "error" wins over "result"; one of
+            /// them is required.
             /// @param jsonStr JSON object text.
             /// @return The response; id stays std::monostate when "id" is absent.
             /// @throws nlohmann::json::exception on invalid JSON, a non-object value, or a
             ///         malformed "error" object.
-            /// @throws std::invalid_argument if "id" is not a string, integer or null.
+            /// @throws std::invalid_argument if "id" is not a string, integer or null, or
+            ///         if the response has neither "result" nor "error".
             static JsonRpcResponse parse(const std::string& jsonStr)
             {
                 json j = json::parse(jsonStr);
@@ -401,6 +401,10 @@ namespace http
                 else if (j.contains("result"))
                 {
                     resp.result = j["result"];
+                }
+                else
+                {
+                    throw std::invalid_argument("JSON-RPC response must contain \"result\" or \"error\"");
                 }
 
                 return resp;

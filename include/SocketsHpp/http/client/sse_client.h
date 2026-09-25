@@ -296,13 +296,14 @@ namespace http
             ///         ended without error, or if the stream was stopped by close() after
             ///         connecting at least once; false otherwise (always false on a non-200
             ///         status, which is never retried).
-            /// @note Resets a previous close(), but not the auto-reconnect flag that close()
-            ///       cleared: call setAutoReconnect() again before reconnecting a closed client.
+            /// @note Resets a previous close() and any server "retry:" value from an
+            ///       earlier stream; the auto-reconnect setting is kept.
             bool connect(const std::string& url, EventCallback onEvent, ErrorCallback onError = nullptr)
             {
                 m_eventCallback = onEvent;
                 m_errorCallback = onError;
                 m_url = url;
+                m_serverRetry = -1;
                 m_closed = false;
                 clearCancel();
                 return run();
@@ -331,7 +332,7 @@ namespace http
 
             /// @brief Add a header sent with every stream request (including reconnects),
             /// e.g. Authorization or Mcp-Session-Id. Replaces an existing header of the
-            /// same (exact-case) name. Accept and Cache-Control are always set by the client,
+            /// same name (compared case-insensitively). Accept and Cache-Control are always set by the client,
             /// and Last-Event-ID is replaced whenever a last event id is known.
             /// @param name Header field name
             /// @param value Header field value
@@ -339,6 +340,7 @@ namespace http
             void setRequestHeader(const std::string& name, const std::string& value)
             {
                 std::lock_guard<std::mutex> lock(m_stateMutex);
+                detail::eraseHeader(m_requestHeaders, name);
                 m_requestHeaders[name] = value;
             }
 
@@ -349,12 +351,11 @@ namespace http
                 m_requestHeaders.clear();
             }
 
-            /// @brief Get current Last-Event-ID
-            /// @return The last id received (or set with setLastEventId())
-            /// @note Not synchronized: the returned reference is only stable while the stream
-            ///       is not running, or when called from the event callback.
-            const std::string& getLastEventId() const
+            /// @brief Get current Last-Event-ID. Thread-safe.
+            /// @return A copy of the last id received (or set with setLastEventId())
+            std::string getLastEventId() const
             {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
                 return m_lastEventId;
             }
 
@@ -365,7 +366,7 @@ namespace http
             /// setMaxReconnectDelay(). A non-200 status or close() stops reconnecting.
             /// @param enable Enable auto-reconnect
             /// @param delay Base reconnection delay in milliseconds. A server "retry:" field
-            ///        replaces it (and stays in effect until the next setAutoReconnect()).
+            ///        overrides it for the rest of the current connect() call.
             void setAutoReconnect(bool enable, int delay = 3000)
             {
                 m_autoReconnect = enable;
@@ -380,12 +381,12 @@ namespace http
             /// @brief Close SSE connection. Thread-safe (also callable from a callback);
             /// unblocks a connect() in progress, including one waiting to reconnect.
             ///
-            /// Disables auto-reconnect, shuts down the active socket and makes further
-            /// requests on this client fail until the next connect(). No more events or
-            /// errors are delivered after it takes effect.
+            /// Stops reconnecting, shuts down the active socket and makes further requests
+            /// on this client fail until the next connect() (the auto-reconnect setting is
+            /// kept for that call). No more events or errors are delivered after it takes
+            /// effect.
             void close()
             {
-                m_autoReconnect = false;
                 m_closed = true;
                 shutdownActiveSocket(true);
                 {
@@ -402,10 +403,11 @@ namespace http
             ErrorCallback m_errorCallback;
             std::atomic<bool> m_autoReconnect{false};
             std::atomic<bool> m_closed{false};
-            std::atomic<int> m_reconnectDelay{3000};  // ms
+            std::atomic<int> m_reconnectDelay{3000};  // ms, from setAutoReconnect()
+            std::atomic<int> m_serverRetry{-1};       // ms from the server's "retry:", -1 = none
             std::atomic<int> m_maxReconnectDelay{60000};  // ms
             SSEParser m_parser;
-            std::mutex m_stateMutex;
+            mutable std::mutex m_stateMutex;
             std::mutex m_waitMutex;
             std::condition_variable m_waitCv;
 
@@ -506,12 +508,13 @@ namespace http
 
                     // Base delay honors the server's retry: field; back off exponentially
                     // on consecutive connection failures.
-                    int64_t delay = std::max(0, m_reconnectDelay.load());
+                    const int baseDelay = m_serverRetry >= 0 ? m_serverRetry.load() : m_reconnectDelay.load();
+                    int64_t delay = std::max(0, baseDelay);
                     for (int i = 1; i < consecutiveFailures && delay < m_maxReconnectDelay; ++i)
                     {
                         delay *= 2;
                     }
-                    delay = std::min<int64_t>(delay, std::max(m_reconnectDelay.load(), m_maxReconnectDelay.load()));
+                    delay = std::min<int64_t>(delay, std::max(baseDelay, m_maxReconnectDelay.load()));
                     if (!waitBeforeReconnect(static_cast<int>(delay)))
                     {
                         break;
@@ -541,7 +544,7 @@ namespace http
                     // Update retry delay if specified
                     if (event.retry >= 0)
                     {
-                        m_reconnectDelay = event.retry;
+                        m_serverRetry = event.retry;
                     }
 
                     // Dispatch only events with data (empty data buffer => no dispatch)
