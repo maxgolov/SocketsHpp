@@ -1,339 +1,171 @@
-# HTTP/1.1 Feature Implementation Status
+# Feature Overview
 
-Modern cross-platform C++17 HTTP library with enterprise features, MCP support, and streaming capabilities.
+What SocketsHpp implements today, what it deliberately leaves out, and the limits to
+keep in mind. For usage see the [README](../README.md); for MCP details see
+[MCP_IMPLEMENTATION.md](MCP_IMPLEMENTATION.md).
 
-## Implementation Summary
+## Sockets and event loop
 
-**HTTP/1.1 Compliance:** ~75% (Core + Streaming + Enterprise)  
-**MCP Protocol:** 100% Complete  
-**Total Tests:** 231 (100% passing)  
-**Platforms:** Windows x64/ARM64, Linux x64/ARM64, macOS
+- `net::utils::Socket`, `SocketAddr`, `SocketParams`, `ScopedSocket`: BSD sockets and
+  WinSock behind one API; TCP and UDP over IPv4/IPv6; Unix domain sockets on POSIX and
+  on Windows SDKs that provide `<afunix.h>`.
+- `net::utils::Reactor`: one event thread per server using epoll (Linux), kqueue
+  (macOS) or `WSAEventSelect` + `WSAWaitForMultipleEvents` (Windows, at most 64 sockets
+  per reactor).
+- `net::common::SocketServer` (TCP, UDP and Unix domain, callback based) and
+  `net::tcp::TcpServer` (message handler returning the reply).
+- `net::server::ThreadPoolServer`: a small wrapper around `BS::thread_pool`.
 
-## Core Capabilities
+## HTTP server (`http::server::HttpServer`)
 
-### Implemented Features ✅
+Protocol handling:
 
-**HTTP Methods:**
-- GET, POST, DELETE, OPTIONS - Full client and server support
-- HEAD, PUT, PATCH - Client support, server routes functional
-- TRACE, CONNECT - Constants defined only
+- HTTP/1.1 and HTTP/1.0 requests; keep-alive (HTTP/1.1 default, `Connection` honoured)
+  and pipelined requests on one connection, answered in order.
+- Any method token is passed to handlers; `HEAD` is served as `GET` without a body.
+- Request bodies with `Content-Length` or `Transfer-Encoding: chunked` (chunk
+  extensions and trailer fields are accepted and discarded); `Expect: 100-continue`.
+- Responses with `Content-Length`, or chunked streaming via `send_chunk_stream()`;
+  1xx/204/304 responses never carry a body.
+- Strict parsing to avoid request smuggling: `Transfer-Encoding` together with
+  `Content-Length`, repeated `Content-Length` or `Host`, invalid lengths, unknown
+  transfer codings (501), `Transfer-Encoding` on HTTP/1.0, control characters in the
+  request line or header values, and malformed chunk framing are all rejected.
+- Limits: request line URI 8 KB, header section 8 KB and body 2 MB by default
+  (`setRequestLimits()`; 431 / 413), header names 256 bytes, header values 8 KB, at
+  most 100 query parameters.
+- Error responses for malformed requests (400, 413, 417, 431, 501, 505) are generated
+  by the server before any handler runs.
 
-**Message Handling:**
-- Content-Length and Transfer-Encoding: chunked
-- Request/response body parsing
-- Header field parsing (key-value pairs)
-- URL parsing with query string support
-- Query parameter parsing with URL decoding
+Application features:
 
-**Connection Management:**
-- Connection: keep-alive (server maintains connections)
-- Connection: close
-- Configurable timeouts (client and server)
-- Note: No connection pooling (each client request uses new connection)
+- Prefix routing with longest-match precedence and fall-through (see the README's
+  routing rules), owned (`route()`) or referenced (`addHandler()`) callbacks.
+- `HttpRequest` helpers: case-insensitive `get_header_value()` / `has_header()`,
+  URL-decoding `parse_query()`, `Accept` parsing with q-values (`accepts()`,
+  `get_accepted_types()`).
+- CORS headers and preflight (`enableCors()`, `setCorsOrigin()`, `setCorsHeaders()`).
+- Session manager with timeouts and optional event history (used by the MCP server).
+- Server-Sent Events: `SSEEvent` formatting (CR/LF-safe fields, multi-line data),
+  automatic `Cache-Control: no-cache` and `X-Accel-Buffering: no`.
+- Optional worker pool (`enableThreadPool()`) so handlers and stream callbacks do not
+  block the reactor.
+- `HttpFileServer`: static files from a document root with percent-decoding,
+  path-traversal and symlink containment checks, `index.html` for extension-less paths
+  and MIME types by extension. Files are read fully into memory.
 
-**Content Negotiation:**
-- Accept header parsing with quality values (q=)
-- Accept-Encoding with quality values
-- Content-Type and Content-Encoding headers
-- HTTP status codes: 100-510 (all major codes defined)
+Server helpers (opt-in headers, applied from your handlers):
 
-**Enterprise Features (71 tests):**
-- **Proxy Awareness (24 tests)** - X-Forwarded-For/Proto/Host, RFC 7239 Forwarded header, configurable trust modes
-- **Authentication (20 tests)** - Bearer tokens, API keys, Basic auth with WWW-Authenticate challenges
-- **Compression Framework (27 tests)** - Pluggable strategy pattern, Windows Compression API (MSZIP, XPRESS, LZMS)
+- `authentication.h`: `BearerTokenAuth`, `ApiKeyAuth`, `BasicAuth`, and
+  `AuthenticationMiddleware` (tries strategies in order, sets 401 body and
+  `WWW-Authenticate` challenges).
+- `compression.h`: `CompressionRegistry`, `CompressionStrategy` and
+  `CompressionMiddleware` (`Accept-Encoding` q-value negotiation, content-type and
+  minimum-size filters, bounded request decompression). **No codec is bundled**:
+  register your own (for example zlib for `gzip`):
 
-**Real-Time Streaming:**
-- Server-Sent Events (SSE) - WHATWG-compliant (17 parser tests)
-- Event stream resumption with Last-Event-ID
-- Chunked transfer encoding with callbacks
+  ```cpp
+  #include <SocketsHpp/http/server/compression.h>
+  #include <memory>
 
-**MCP Support (48 tests):**
-- JSON-RPC 2.0 layer (20 tests)
-- SSE transport for bidirectional communication
-- Session management with resumability (11 tests)
-- CORS configuration
+  using namespace SocketsHpp::http::server;
 
-**Utilities:**
-- Base64 encoding/decoding - RFC 4648 compliant (21 tests)
-- Socket addressing - IPv4, IPv6, Unix domain
-- Cross-platform reactor pattern (epoll/kqueue/IOCP)
+  std::vector<uint8_t> myGzip(const std::vector<uint8_t>& in, int level);
+  std::vector<uint8_t> myGunzip(const std::vector<uint8_t>& in);
 
-### Not Implemented
-
-**Caching (RFC 7234):**
-- Cache-Control, ETag, If-None-Match, Last-Modified
-- Reason: Application-level concern, better handled by reverse proxies (nginx, Varnish)
-
-**Range Requests (RFC 7233):**
-- 206 Partial Content, byte-range-spec
-- Planned: Phase 2 feature for large file serving
-
-**Connection Pooling:**
-- Client creates new connection per request
-- Reason: Simplicity, most use cases involve reverse proxies with connection pooling
-- Workaround: Deploy behind nginx/HAProxy for connection reuse
-
-**Request Pipelining:**
-- Multiple requests without waiting for responses
-- Reason: HTTP/2 makes this obsolete, complex to implement correctly
-
-**Trailer Headers:**
-- Headers after chunked body
-- Reason: Rarely used, low priority
-
-### External Solutions Required
-
-**HTTPS/TLS:**
-- SocketsHpp provides HTTP only
-- **Solution:** Deploy behind reverse proxy (nginx, Caddy, HAProxy)
-- **Example nginx config:**
-  ```nginx
-  server {
-      listen 443 ssl;
-      ssl_certificate /path/to/cert.pem;
-      ssl_certificate_key /path/to/key.pem;
-      
-      location / {
-          proxy_pass http://localhost:8080;
-          proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-      }
+  void registerGzip()
+  {
+      CompressionRegistry::instance().registerStrategy(
+          std::make_shared<CompressionStrategy>("gzip", myGzip, myGunzip));
   }
   ```
 
-**Gzip/Brotli Compression:**
-- Framework implemented, users must add compression libraries
-- **Solution 1:** Use nginx for compression
+  Test codecs (`rle`, `identity`) are in `compression_simple.h`; Windows-only
+  `mszip`/`xpress`/`lzms` via the Windows Compression API are in
+  `compression_windows.h` (not standard HTTP content-codings).
+- `proxy_aware.h`: `TrustProxyConfig` (none / all / specific proxies) and
+  `ProxyAwareHelpers` for the real client IP, scheme and host from `X-Forwarded-*`,
+  `X-Real-IP` and RFC 7239 `Forwarded`, honoured only from trusted peers.
+
+## HTTP clients (`http::client`)
+
+- `HttpClient`: `get()`, `post()` and `send()` for any method; connect and read
+  timeouts; redirect following (301/302/303/307/308, method rewriting, credentials
+  stripped across origins); chunked, `Content-Length` and read-until-close bodies;
+  streaming via `chunkCallback`; response size cap; `cancel()` from another thread;
+  bracketed IPv6 hosts.
+- `SSEClient`: WHATWG-conformant SSE parsing (`SSEParser`), extra request headers,
+  `Last-Event-ID` tracking, auto-reconnect with server `retry:` and exponential
+  backoff, thread-safe `close()`.
+- `http::common::UrlParser` for `scheme://host:port/path?query` (IPv6 aware).
+
+## MCP and JSON-RPC
+
+- JSON-RPC 2.0 requests, notifications, responses, batches and standard error codes;
+  ids as string, 64-bit integer or null.
+- `mcp::server::MCPServer`: MCP 2024-11-05 (HTTP + SSE) and 2025-03-26 (Streamable
+  HTTP) over HTTP, plus `processMessage()` for STDIO; version negotiation, sessions,
+  server push (`push_event`, `push_log`, `push_progress`), resumability with
+  `Last-Event-ID`, cancellation, `logging/setLevel`, Bearer / API key / capability-token
+  auth (JWT with jwt-cpp), per-client rate limiting, CORS, `/health`, and a
+  loopback-only bind guard.
+- `mcp::client::MCPClient`: HTTP and Streamable HTTP transports, tools / prompts /
+  resources helpers, notification handlers over SSE. No STDIO client.
+
+## Utilities
+
+- `utils::Base64` (RFC 4648, strict decoding) - see
+  [include/SocketsHpp/utils/README.md](../include/SocketsHpp/utils/README.md).
+- Logging hooks: `LOG_*` macros compiled out by default, `HAVE_CONSOLE_LOG` for stdout.
+
+## Not implemented
+
+| Feature | Notes |
+|---------|-------|
+| TLS / HTTPS | Neither server nor client. Terminate TLS in a reverse proxy; the client refuses `https://` URLs. |
+| HTTP/2, HTTP/3, WebSocket | HTTP/1.x only. SSE covers server push. |
+| Client connection reuse | Every `HttpClient` request opens and closes its own connection. |
+| Built-in compression codecs | Framework only; bring zlib/brotli/zstd or compress in the proxy. |
+| Caching / conditional requests | No `ETag`, `If-None-Match`, `If-Modified-Since` handling. |
+| Range requests | No `206 Partial Content`. |
+| Multipart / form parsing | Bodies are delivered raw in `HttpRequest::content`. |
+| Global middleware chain | Auth, compression and proxy helpers are called from handlers. |
+| Connection timeouts on the server | Idle or slow connections are not timed out by the server; use a reverse proxy for slowloris protection. |
+| Host header validation | Duplicate `Host` is rejected, but the value is not checked. |
+
+## Limits and deployment advice
+
+- One reactor thread per server. Without `enableThreadPool()`, a slow handler or a
+  blocking stream callback stalls all connections of that server.
+- On Windows a reactor watches at most 64 sockets.
+- Request bodies are buffered in memory (bounded by `setRequestLimits()`), as are
+  static files served by `HttpFileServer`.
+- For internet-facing services, run behind nginx, Caddy or HAProxy for TLS, timeouts,
+  compression and load balancing, and use `TrustProxyConfig` so the application still
+  sees the real client:
+
   ```nginx
-  gzip on;
-  gzip_types application/json text/plain;
-  ```
-- **Solution 2:** Register compression strategy in code:
-  ```cpp
-  #include <zlib.h>
-  CompressionRegistry::instance().registerStrategy("gzip", 
-      [](const std::vector<uint8_t>& input, int level) {
-          // Use zlib compress2()
-      },
-      [](const std::vector<uint8_t>& input) {
-          // Use zlib uncompress()
-      });
+  location / {
+      proxy_pass http://127.0.0.1:8080;
+      proxy_http_version 1.1;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_buffering off;   # needed for SSE
+  }
   ```
 
-**Rate Limiting:**
-- Not implemented (application-level concern)
-- **Solution:** nginx limit_req or application-level middleware
+## Tests
 
-## Model Context Protocol (MCP)
-
-SocketsHpp provides complete MCP support via HTTP with Server-Sent Events transport.
-
-### MCP Components (100% Complete, 48 tests)
-
-**Transport Layer:**
-- SSE streaming (bidirectional: HTTP POST + SSE response)
-- Session management with resumability (Last-Event-ID support)
-- CORS for web clients
-- Query parameter parsing for session initialization
-- Connection keep-alive for long-lived streams
-
-**JSON-RPC 2.0 (20 tests):**
-- Request/response/notification parsing
-- Variant ID handling (string/int/null)
-- Standard error codes (-32700 to -32603)
-- MCP error codes (-32000 to -32099)
-- Batch request support
-
-**Server Components (11 tests):**
-- Method registry
-- Authentication (Bearer JWT, API Key, Custom)
-- CORS configuration
-- Session timeout management
-
-**Client Components (17 tests):**
-- WHATWG-compliant SSE parser
-- Auto-reconnection with Last-Event-ID
-- HTTP client for JSON-RPC requests
-- Notification handling
-
-### MCP Example
-
-```cpp
-#include <SocketsHpp/mcp/server/mcp_server.h>
-
-MCPServer server("127.0.0.1", 3000);
-
-// Register tool
-server.registerTool({
-    .name = "calculate",
-    .description = "Perform calculations",
-    .inputSchema = R"({"type": "object", "properties": {"expr": {"type": "string"}}})"
-}, [](const nlohmann::json& args) -> nlohmann::json {
-    return {{"result", evaluate(args["expr"])}};
-});
-
-// Register resource
-server.registerResource({
-    .uri = "file:///data/users.json",
-    .name = "User Database"
-}, []() -> std::string {
-    return readUsersFromDatabase();
-});
-
-server.start();
-```
-
-**Reference:** [MCP Specification](https://modelcontextprotocol.io/)
-
-## Test Coverage
-
-**Total:** 231 tests (100% passing on Windows x64, Linux x64/ARM64, macOS)
-
-**By Category:**
-- Core HTTP/Sockets: 94 tests (URL parsing, socket addressing, HTTP basics)
-- Enterprise Features: 71 tests
-  - Proxy awareness: 24 tests
-  - Authentication: 20 tests
-  - Compression: 27 tests
-- MCP/Streaming: 66 tests
-  - JSON-RPC: 20 tests
-  - SSE parser: 17 tests
-  - MCP config: 11 tests
-  - HTTP methods: 9 tests
-  - Streaming: 7 tests
-  - Base64: 21 tests (utility)
-
-## Planned Features
-
-### Phase 1: Near-Term (Next 3-6 months)
-
-**Multipart Form-Data Support**
-- Priority: HIGH
-- Use Case: File uploads, form submissions
-- Implementation Plan:
-  - Boundary detection and parsing
-  - Stream-based file handling (avoid loading entire file in memory)
-  - Callback interface: `onFileStart`, `onFileChunk`, `onFileEnd`
-  - Optional temporary directory storage
-  - Content-Disposition header parsing
-  - Example:
-    ```cpp
-    server.setMultipartHandler([](const MultipartFile& file) {
-        if (file.size > 100*1024*1024) return false; // Reject large files
-        
-        // Option 1: Stream to disk
-        std::ofstream out("/tmp/" + file.filename);
-        file.streamTo(out);
-        
-        // Option 2: Process in memory
-        std::vector<uint8_t> data = file.readAll();
-    });
-    ```
-
-**Range Request Support (RFC 7233)**
-- Priority: MEDIUM
-- Use Case: Video streaming, large file downloads, resume capability
-- Status codes: 206 Partial Content, 416 Range Not Satisfiable
-- Accept-Ranges header
-- Content-Range response
-
-**ETag/Conditional Requests**
-- Priority: LOW
-- Use Case: Cache validation, bandwidth optimization
-- Headers: If-None-Match, If-Modified-Since
-- Status codes: 304 Not Modified, 412 Precondition Failed
-
-### Phase 2: Future Considerations
-
-**WebSocket Support**
-- Bidirectional full-duplex communication
-- Use Case: Real-time applications beyond SSE
-- Note: SSE + HTTP POST currently handles most MCP use cases
-
-**HTTP/2 Support**
-- Multiplexing, server push, header compression
-- Significant architectural change
-- Consider after HTTP/1.1 feature completeness
-
-**Connection Pooling (Client)**
-- Reuse connections across requests
-- Benefit diminishes when using reverse proxies
-
-### Not Planned
-
-**Built-in TLS/HTTPS**
-- Rationale: Better handled by battle-tested reverse proxies
-- Avoids OpenSSL dependency and certificate management complexity
-
-**Caching Layer**
-- Rationale: Application-specific, better suited for CDNs/proxies
-
-**Request Pipelining**
-- Rationale: Deprecated in HTTP/2 favor
-
-## Architecture Notes
-
-### Design Principles
-- **Header-Only:** Zero compilation required
-- **Minimal Dependencies:** C++17 stdlib + system sockets only
-- **Platform Abstractions:** Single codebase for Windows/Linux/macOS
-- **Pluggable:** Authentication, compression use strategy pattern
-- **Production-Ready:** Enterprise features with comprehensive tests
-
-### Limitations
-
-**Performance:**
-- Single-threaded reactor per server
-- No zero-copy optimizations
-- Suitable for: <10K concurrent connections
-
-**Security:**
-- No built-in rate limiting (use nginx)
-- No request smuggling prevention
-- Host header validation not enforced
-- Deploy behind reverse proxy for production
-
-**Scalability:**
-- No built-in load balancing
-- No distributed session management
-- Use nginx/HAProxy for horizontal scaling
-
-### Recommended Deployment
-
-```
-Internet → nginx (HTTPS, compression, rate limiting, caching)
-         → SocketsHpp App (business logic, MCP endpoints)
-```
-
-Benefits:
-- nginx handles TLS termination
-- nginx provides gzip/brotli compression
-- nginx implements rate limiting
-- nginx serves static files efficiently
-- SocketsHpp focuses on application logic
-
-## Contributing
-
-See unimplemented features above. When contributing:
-1. Add tests first (TDD approach)
-2. Ensure cross-platform compatibility
-3. Update this document
-4. Follow existing code style
+The suite has 500+ GoogleTest cases (unit and functional) plus header
+self-containment and header-only link checks; see [test/README.md](../test/README.md).
+CI runs it on Ubuntu (GCC, Clang, GCC with ASan/UBSan, Clang with jwt-cpp), macOS,
+Windows (MSVC) and MinGW-w64 under Wine.
 
 ## References
 
-**RFCs:**
-- [RFC 7230-7235](https://datatracker.ietf.org/doc/html/rfc7230) - HTTP/1.1
-- [RFC 4648](https://datatracker.ietf.org/doc/html/rfc4648) - Base64 (implemented)
-- [RFC 7239](https://datatracker.ietf.org/doc/html/rfc7239) - Forwarded Header (implemented)
-
-**Specifications:**
-- [WHATWG SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html) - Server-Sent Events (implemented)
-- [JSON-RPC 2.0](https://www.jsonrpc.org/specification) - (implemented)
-- [MCP Specification](https://modelcontextprotocol.io/) - Model Context Protocol (implemented)
-
----
-
-**Version:** 2.0.0  
-**Last Updated:** November 2025  
-**Maintainer:** SocketsHpp Team
+- [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) / [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112) - HTTP semantics and HTTP/1.1
+- [RFC 7239](https://www.rfc-editor.org/rfc/rfc7239) - `Forwarded` header
+- [RFC 4648](https://www.rfc-editor.org/rfc/rfc4648) - Base64
+- [WHATWG Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+- [JSON-RPC 2.0](https://www.jsonrpc.org/specification)
+- [Model Context Protocol](https://modelcontextprotocol.io/)

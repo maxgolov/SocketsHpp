@@ -1,124 +1,79 @@
 # Full-Featured HTTP Server
 
-This example combines all three enterprise features into a single production-ready server:
+Combines two of the server helpers in one program:
 
-1. **Proxy Awareness** - Extract real client information behind reverse proxies
-2. **Authentication** - Multi-strategy authentication (Bearer, API Key, Basic)
-3. **Compression** - Automatic content compression
+1. **Proxy awareness**: `TrustProxyConfig` + `ProxyAwareHelpers` recover the real
+   client IP, scheme and host behind a trusted reverse proxy.
+2. **Authentication**: Bearer tokens and API keys, checked in the handlers by a
+   `checkAuth()` helper (as in [example 07](../07-authentication/)).
 
-## Features
-
-- Trust proxy configuration with IP whitelisting
-- Multi-strategy authentication chain
-- Automatic compression with content negotiation
-- Public and protected endpoints
-- JSON API responses
-- Comprehensive request logging
+It does not use compression or Basic authentication.
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake --build build --target full-featured-server
 ```
 
 ## Running
 
 ```bash
-./full-featured-server
+./build/examples/09-full-featured/full-featured-server
 ```
 
-The server will listen on `http://localhost:8080`.
+The server listens on port 8080 on all IPv4 interfaces.
+
+## Routes
+
+| Route | Auth | Response |
+|-------|------|----------|
+| `/` (and any unknown path) | none | HTML page with the proxy-aware client IP, scheme, host and URI |
+| `/api/protected` | Bearer token or API key | JSON with the user, the proxy-aware client IP and `"authenticated": true`; 401 with `WWW-Authenticate: Bearer` otherwise |
+| `/api/service` | Bearer token or API key | JSON with the identity; 401 otherwise |
 
 ## Testing
 
-### Public endpoint (no auth, no compression)
 ```bash
-curl http://localhost:8080/public
-```
+curl http://localhost:8080/
 
-### Authenticated API request
-```bash
-curl -H "Authorization: Bearer secret_token_123" \
-     http://localhost:8080/api/user
-```
+curl -H "Authorization: Bearer secret_token_123" http://localhost:8080/api/protected
 
-### Authenticated + Compressed response
-```bash
-curl -H "Authorization: Bearer secret_token_123" \
-     -H "Accept-Encoding: rle" \
-     http://localhost:8080/api/data
-```
+curl -H "X-API-Key: api_key_abc" http://localhost:8080/api/service
 
-### All features combined (proxy + auth + compression)
-```bash
+# Proxy headers + auth. Honoured because the request comes from 127.0.0.1,
+# which is a trusted proxy in this example.
 curl -H "X-Forwarded-For: 203.0.113.42" \
      -H "X-Forwarded-Proto: https" \
      -H "Authorization: Bearer secret_token_123" \
-     -H "Accept-Encoding: rle" \
-     http://localhost:8080/api/data
+     http://localhost:8080/api/protected
+# {"user": "user1","endpoint": "/api/protected","clientIP": "203.0.113.42","authenticated": true}
+
+curl -i http://localhost:8080/api/protected   # 401
 ```
 
-### API key authentication
-```bash
-curl -H "X-API-Key: api_key_abc" \
-     http://localhost:8080/api/user
-```
-
-### Basic authentication
-```bash
-curl -u alice:password123 \
-     http://localhost:8080/api/user
-```
-
-## Architecture
-
-The server demonstrates a typical production deployment:
+## Request flow
 
 ```
-[Client] → [nginx/HAProxy] → [This Server]
-            ↓
-         X-Forwarded-For: client_ip
-         X-Forwarded-Proto: https
-            ↓
-       [Proxy Awareness]
-            ↓
-       [Authentication]
-            ↓
-       [Route Handler]
-            ↓
-       [Compression]
-            ↓
-       [Response]
+[Client] -> [nginx / HAProxy] -> [This server]
+                 |
+          X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host
+                 |
+          ProxyAwareHelpers (only if the peer is a trusted proxy)
+                 |
+          checkAuth() in the /api/* handlers
+                 |
+          JSON / HTML response
 ```
 
-## Security Configuration
+## Configuration
 
-**Proxy Trust:**
-- Only trusts specific proxy IPs (127.0.0.1 by default)
-- Prevents header forgery attacks
+- Trusted proxies: `127.0.0.1`, `10.0.0.1`, `172.16.0.1` (`TrustMode::TrustSpecific`).
+  Forwarded headers from any other peer are ignored.
+- Credentials: Bearer `secret_token_123` (user1) and `admin_token_456` (admin);
+  API key `api_key_abc` (service1).
 
-**Authentication:**
-- Tries all strategies in order
-- Returns 401 for protected endpoints
-- Logs successful authentications
-
-**Compression:**
-- Only compresses responses > 500 bytes
-- Respects client Accept-Encoding preferences
-- Adds Vary: Accept-Encoding header
-
-## Valid Credentials
-
-Same as authentication example:
-
-**Bearer Tokens:**
-- `secret_token_123` → user1
-- `admin_token_456` → admin
-
-**API Keys:**
-- `api_key_abc` → service1
-
-**Basic Auth:**
-- alice:password123
+To add compression, see [example 08](../08-compression/); for the library's
+authentication strategies, see the [main README](../../README.md#authentication).

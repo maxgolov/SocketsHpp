@@ -1,64 +1,103 @@
-# Example 10: TypeScript Interop (ModelContext Protocol)
+# Example 10: TypeScript Interop (JSON-RPC / MCP-style)
 
-This example demonstrates interoperability between:
-- **SocketsHpp C++ MCP server/client**
-- **TypeScript MCP server/client** (using Vercel AI SDK ModelContext Protocol)
+C++ and TypeScript programs talking MCP-style JSON-RPC 2.0 over plain HTTP POST:
 
-All tools implement a `get_weather` handler that returns a random weather kind.
+- `cpp_server.cpp`: a JSON-RPC endpoint at `http://127.0.0.1:3000/mcp`, written as an
+  `HttpServer` route. It answers `initialize`, `tools/list` and `tools/call` for a
+  `get_weather` tool that returns a random condition. (This is not the library's
+  `MCPServer`; see [docs/MCP_IMPLEMENTATION.md](../../docs/MCP_IMPLEMENTATION.md) for
+  that.)
+- `cpp_client.cpp`: uses `HttpClient::post()` to call `initialize`, `tools/list` and
+  `tools/call` (`greet` with `{"name": "Alice"}`) on the TypeScript server at
+  `http://localhost:3001/mcp`.
+- `ts_server/server.ts`: Node.js JSON-RPC server on port 3001 with `get_weather` and
+  `greet` tools.
+- `ts_client/client.ts`: calls the C++ server (`initialize`, `tools/list`,
+  `tools/call get_weather`).
+- `ts_client/client-ai.ts`: optional; lets an OpenAI model (Vercel AI SDK) call the
+  C++ server's tools. Needs an OpenAI API key.
 
-## Directory Structure
 ```
 10-typescript-interop/
-  .env.example           # Copy to .env for API keys
-  cpp_server.cpp         # Minimal MCP server using SocketsHpp
-  cpp_client.cpp         # Minimal MCP client using SocketsHpp
-  ts_server/             # TypeScript MCP server implementation
-  ts_client/             # TypeScript MCP client implementation
+  cpp_server.cpp   cpp_client.cpp   CMakeLists.txt
+  demo.sh          demo.ps1         # build everything and run both directions
+  ts_server/       ts_client/       # Node.js projects (package.json, *.ts)
 ```
 
-## Running the Interop Example
+## Prerequisites
 
-### Prerequisites
-- C++17 compiler (for SocketsHpp)
-- Node.js v18+
-- NPM
+- A C++17 compiler and CMake (see the [main README](../../README.md))
+- Node.js 18+ and npm
 
-### .env File
-Copy `.env.example` to `.env` and put your API keys there (not checked in).
+## Building the C++ programs
 
-### 1. Launch C++ MCP server (port 3000)
-```
-g++ -std=c++17 cpp_server.cpp -o cpp_server -I../../include/ && ./cpp_server
-```
+From the repository root:
 
-### 2. Run TypeScript client against C++ server
-```
-cd ts_client && npm install && npx tsx client.ts
+```bash
+cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake --build build --target cpp_server cpp_client
 ```
 
-### 3. Launch TypeScript server (port 3001)
-```
-cd ts_server && npm install && npx tsx server.ts
+The binaries are `build/examples/10-typescript-interop/cpp_server` and `cpp_client`.
+Without CMake, from this directory:
+
+```bash
+g++ -std=c++17 -I../../include -I../../external -I../../external/nlohmann-json/single_include \
+    cpp_server.cpp -o cpp_server -pthread
+g++ -std=c++17 -I../../include -I../../external -I../../external/nlohmann-json/single_include \
+    cpp_client.cpp -o cpp_client -pthread
 ```
 
-### 4. Run C++ client against TypeScript server
+`demo.sh` / `demo.ps1` build the C++ programs with this directory's own
+`CMakeLists.txt` (into `./build`), install the npm dependencies and run both demos.
+
+## Running
+
+### TypeScript client -> C++ server
+
+```bash
+./build/examples/10-typescript-interop/cpp_server      # from the repository root; port 3000
+cd examples/10-typescript-interop/ts_client && npm install && npx tsx client.ts
 ```
-g++ -std=c++17 cpp_client.cpp -o cpp_client -I../../include/ && ./cpp_client
+
+### C++ client -> TypeScript server
+
+```bash
+cd examples/10-typescript-interop/ts_server && npm install && npx tsx server.ts   # port 3001
+./build/examples/10-typescript-interop/cpp_client      # from the repository root
 ```
 
+### AI client (optional)
 
-## Security
-- Ensure your `.env` is **never** committed to version control (use `.gitignore`).
+```bash
+cd examples/10-typescript-interop/ts_client
+OPENAI_API_KEY=sk-... npx tsx client-ai.ts
+```
 
----
+`client-ai.ts` also loads a `.env` file three directories above its working directory
+(the repository root when run from `ts_client/`); `client.ts` and `server.ts` load
+`../.env` but need no variables. Keep any `.env` file out of version control.
 
 ## Protocol
-- Both client and server use ModelContext Protocol (JSON-RPC over HTTP).
-- API: `{ "tool": "get_weather", ... } => { "kind": "rainy"|...}`
 
----
+Every call is a JSON-RPC 2.0 request in an HTTP POST body, answered with a JSON-RPC
+response, for example:
+
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+ "params": {"name": "get_weather", "arguments": {}}}
+```
+
+```json
+{"jsonrpc": "2.0", "id": 1,
+ "result": {"content": [{"type": "text", "text": "Weather: rainy"}]}}
+```
+
+The C++ server also answers CORS preflight (`OPTIONS`) and returns 405 for other
+methods; errors are reported as JSON-RPC error `-32603` with HTTP status 500.
 
 ## References
-- [ModelContext Protocol Spec](https://github.com/vercel/ai/blob/main/packages/core/src/protocol/schema.ts)
-- [SocketsHpp Project](https://github.com/maxgolov/SocketsHpp)
+
+- [Model Context Protocol](https://modelcontextprotocol.io/)
+- [JSON-RPC 2.0](https://www.jsonrpc.org/specification)
 - [Vercel AI SDK](https://sdk.vercel.ai/)

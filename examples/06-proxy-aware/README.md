@@ -1,49 +1,54 @@
 # Proxy-Aware HTTP Server
 
-This example demonstrates how to use `ProxyAwareHelpers` to extract real client information when your server is behind a reverse proxy (nginx, Apache, HAProxy, load balancer).
+Uses `ProxyAwareHelpers` to recover the original client IP, scheme and host when the
+server runs behind a reverse proxy (nginx, Apache, HAProxy, a load balancer).
 
 ## Features
 
-- Trust proxy configuration (security-first)
-- X-Forwarded-* header support
-- RFC 7239 Forwarded header support
-- Real client IP extraction
-- Protocol detection (HTTP/HTTPS)
-- Host header extraction
+- `TrustProxyConfig` with an explicit list of trusted proxies (`127.0.0.1`,
+  `10.0.0.1`, `172.16.0.1`)
+- `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Real-IP` and RFC 7239
+  `Forwarded` headers, honoured only when the direct peer is a trusted proxy
+- One route (`/`, which also catches every other path) returning an HTML page with the
+  derived client IP, scheme, host, "secure" flag, the direct peer address and all
+  request headers; each request is also logged to the console
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake --build build --target proxy-aware-server
 ```
 
 ## Running
 
 ```bash
-./proxy-aware-server
+./build/examples/06-proxy-aware/proxy-aware-server
 ```
 
-The server will listen on `http://localhost:8080`.
+The server listens on port 8080 on all IPv4 interfaces (the `"localhost"` passed to
+`HttpServer` is only the `Server` header name).
 
 ## Testing
 
-### Basic request
 ```bash
+# Direct request: shows your own address
 curl http://localhost:8080/
-```
 
-### With proxy headers
-```bash
+# Simulated proxy headers. They are honoured because curl connects from 127.0.0.1,
+# which is in the trusted list.
 curl -H "X-Forwarded-For: 203.0.113.42" \
      -H "X-Forwarded-Proto: https" \
      -H "X-Forwarded-Host: example.com" \
      http://localhost:8080/
 ```
 
+A request from an untrusted address with the same headers reports the direct
+connection instead.
+
 ### nginx configuration
-Add this to your nginx config to forward headers:
 
 ```nginx
 location / {
@@ -55,6 +60,7 @@ location / {
 }
 ```
 
-## Security Note
+## Security note
 
-Always use `TrustMode::TrustSpecific` in production and whitelist only your trusted proxy IPs. Using `TrustMode::TrustAll` allows clients to forge headers.
+Use `TrustMode::TrustSpecific` (what `addTrustedProxy()` selects) in production and list
+only your proxies. `TrustMode::TrustAll` lets any client forge its address and scheme.
