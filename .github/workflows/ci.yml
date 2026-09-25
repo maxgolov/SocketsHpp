@@ -146,8 +146,10 @@ jobs:
       # First Wine invocation bootstraps a prefix (registry, fake explorer.exe, ...).
       # Doing that here, outside any test run, keeps that one-time cost off the
       # 5s default gtest_discover_tests timeout for whichever test happens to run first.
+      # wine64 isn't on PATH as a bare command on this runner image, same as the
+      # Configure step below has to resolve it explicitly.
       - name: Warm up Wine prefix
-        run: xvfb-run -a wine64 wineboot --init
+        run: xvfb-run -a "$(command -v wine64 || echo /usr/lib/wine/wine64)" wineboot --init
 
       - name: Build GoogleTest for MinGW
         run: |
