@@ -7,7 +7,7 @@ Header-only RFC 4648 compliant base64 encoding and decoding implementation.
 - **Header-only** - No compilation required, just include and use
 - **RFC 4648 compliant** - Standard base64 encoding/decoding
 - **Zero dependencies** - Uses only C++ standard library
-- **Exception safety** - Throws `std::invalid_argument` for malformed input
+- **Exception safety** - Throws `std::invalid_argument` for malformed input (decoding is strict: padded standard alphabet only, length a multiple of 4, `=` only as the final 1-2 characters, canonical trailing bits, no whitespace; `is_valid()` applies the same rules)
 - **Multiple interfaces** - Class-based and namespace-based APIs
 - **Full test coverage** - 21 comprehensive unit tests
 

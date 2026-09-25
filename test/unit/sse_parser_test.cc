@@ -236,6 +236,225 @@ TEST(SSEParserTest, EmptyId) {
     
     // Empty ID should be empty in the event
     auto events2 = parser.parseChunk("id:\ndata: event2\n\n");
-    
+
+    ASSERT_EQ(events2.size(), 1u);
     EXPECT_TRUE(events2[0].id.empty());
+    EXPECT_TRUE(events2[0].hasId);  // present-but-empty id resets Last-Event-ID
+}
+
+// ---------------------------------------------------------------------------
+// WHATWG spec conformance: line endings
+// ---------------------------------------------------------------------------
+
+namespace {
+// Feed a stream to a fresh parser in pieces of `step` bytes and collect events.
+std::vector<SSEEvent> feed(const std::string& stream, size_t step)
+{
+    SSEParser parser;
+    std::vector<SSEEvent> all;
+    for (size_t i = 0; i < stream.size(); i += step)
+    {
+        auto evs = parser.parseChunk(stream.substr(i, step));
+        all.insert(all.end(), evs.begin(), evs.end());
+    }
+    return all;
+}
+}  // namespace
+
+TEST(SSEParserTest, CRLFLineEndings) {
+    SSEParser parser;
+    auto events = parser.parseChunk("event: a\r\ndata: one\r\ndata: two\r\n\r\ndata: three\r\n\r\n");
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0].event, "a");
+    EXPECT_EQ(events[0].data, "one\ntwo");
+    EXPECT_EQ(events[1].data, "three");
+}
+
+TEST(SSEParserTest, LoneCRLineEndings) {
+    SSEParser parser;
+    auto events = parser.parseChunk("data: one\rdata: two\r\rdata: three\r\r");
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0].data, "one\ntwo");
+    EXPECT_EQ(events[1].data, "three");
+}
+
+TEST(SSEParserTest, MixedLineEndings) {
+    SSEParser parser;
+    auto events = parser.parseChunk("data: a\rdata: b\ndata: c\r\n\n" "data: d\n\r\n" "data: e\r\r\n");
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_EQ(events[0].data, "a\nb\nc");
+    EXPECT_EQ(events[1].data, "d");
+    EXPECT_EQ(events[2].data, "e");
+}
+
+TEST(SSEParserTest, CRAtChunkEndFollowedByLF) {
+    SSEParser parser;
+    // A CRLF split across chunks must count as one line ending, not two.
+    auto e1 = parser.parseChunk("data: a\r");
+    EXPECT_TRUE(e1.empty());
+    auto e2 = parser.parseChunk("\ndata: b\r");
+    EXPECT_TRUE(e2.empty());  // no blank line seen yet
+    auto e3 = parser.parseChunk("\n\r");
+    ASSERT_EQ(e3.size(), 1u);  // blank line terminated by the lone CR
+    EXPECT_EQ(e3[0].data, "a\nb");
+    auto e4 = parser.parseChunk("\ndata: c\n\n");  // LF completing that CRLF is swallowed
+    ASSERT_EQ(e4.size(), 1u);
+    EXPECT_EQ(e4[0].data, "c");
+}
+
+TEST(SSEParserTest, CRAtChunkEndFollowedByCR) {
+    SSEParser parser;
+    EXPECT_TRUE(parser.parseChunk("data: x\r").empty());
+    auto events = parser.parseChunk("\r");
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].data, "x");
+}
+
+TEST(SSEParserTest, ByteByByteMatchesWholeStream) {
+    const std::string stream =
+        "\xEF\xBB\xBF"
+        ": comment\r\n"
+        "id: 1\r\n"
+        "event: e\r"
+        "data: first\r\n"
+        "data:second\n"
+        "\r\n"
+        "retry: 250\n"
+        "data\r"
+        "\r"
+        "data: last\r\n"
+        "\r\n";
+    for (size_t step : {size_t(1), size_t(2), size_t(3), size_t(7), stream.size()})
+    {
+        auto events = feed(stream, step);
+        ASSERT_EQ(events.size(), 3u) << "step=" << step;
+        EXPECT_EQ(events[0].id, "1");
+        EXPECT_EQ(events[0].event, "e");
+        EXPECT_EQ(events[0].data, "first\nsecond");
+        EXPECT_EQ(events[1].retry, 250);
+        EXPECT_TRUE(events[1].hasData);
+        EXPECT_EQ(events[1].data, "");
+        EXPECT_EQ(events[2].data, "last");
+    }
+}
+
+TEST(SSEParserTest, LeadingBOMStripped) {
+    auto events = feed("\xEF\xBB\xBF" "data: x\n\n", 1);
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].data, "x");
+
+    // A partial BOM is not stripped: it becomes part of the first field name,
+    // which is then unknown and ignored.
+    SSEParser parser;
+    auto evs = parser.parseChunk("\xEF" "data: y\n\ndata: z\n\n");
+    ASSERT_EQ(evs.size(), 1u);
+    EXPECT_EQ(evs[0].data, "z");
+}
+
+TEST(SSEParserTest, ResetClearsPendingState) {
+    SSEParser parser;
+    parser.parseChunk("data: partial\ndata: more\r");
+    parser.reset();
+    // After reset nothing is pending: the leading LF is a blank line, then "fresh".
+    auto events = parser.parseChunk("\ndata: fresh\n\n");
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].data, "fresh");
+}
+
+// ---------------------------------------------------------------------------
+// WHATWG spec conformance: fields
+// ---------------------------------------------------------------------------
+
+TEST(SSEParserTest, RetryDigitsOnly) {
+    SSEParser parser;
+    const char* invalid[] = {"retry: 12a\n\n", "retry: -1\n\n", "retry: 1.5\n\n", "retry:  100\n\n",
+                             "retry: +5\n\n",  "retry:\n\n",    "retry\n\n",      "retry: 99999999999999999999\n\n",
+                             "retry: 100 \n\n"};
+    for (const char* s : invalid)
+    {
+        auto events = parser.parseChunk(s);
+        EXPECT_TRUE(events.empty()) << "input: " << s;  // retry ignored => nothing to report
+    }
+    auto ok = parser.parseChunk("retry:0\n\nretry: 007\n\n");
+    ASSERT_EQ(ok.size(), 2u);
+    EXPECT_EQ(ok[0].retry, 0);
+    EXPECT_EQ(ok[1].retry, 7);
+    EXPECT_FALSE(ok[0].isValid());  // no data => not to be dispatched
+}
+
+TEST(SSEParserTest, EmptyIdResetsLastEventId) {
+    SSEParser parser;
+    auto events = parser.parseChunk("id\ndata: x\n\nid:\n\n");
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_TRUE(events[0].hasId);
+    EXPECT_EQ(events[0].id, "");
+    EXPECT_TRUE(events[1].hasId);  // id-only block is still reported so a client can reset
+    EXPECT_FALSE(events[1].isValid());
+}
+
+TEST(SSEParserTest, IdWithNullIgnored) {
+    SSEParser parser;
+    std::string chunk = std::string("id: a") + '\0' + "b\ndata: x\n\n";
+    auto events = parser.parseChunk(chunk);
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_FALSE(events[0].hasId);
+    EXPECT_EQ(events[0].id, "");
+}
+
+TEST(SSEParserTest, SingleLeadingSpaceStripped) {
+    SSEParser parser;
+    auto events = parser.parseChunk("data:  two spaces\ndata:none\ndata: \n\nevent:  e\ndata: y\n\n");
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0].data, " two spaces\nnone\n");
+    EXPECT_EQ(events[1].event, " e");
+}
+
+TEST(SSEParserTest, FieldWithoutColon) {
+    SSEParser parser;
+    auto events = parser.parseChunk("data\ndata\n\n");
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_TRUE(events[0].hasData);
+    EXPECT_EQ(events[0].data, "\n");
+}
+
+TEST(SSEParserTest, OnlyOneTrailingNewlineRemoved) {
+    SSEParser parser;
+    auto events = parser.parseChunk("data: a\ndata:\ndata:\n\n");
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].data, "a\n\n");
+}
+
+TEST(SSEParserTest, NoDataNoDispatch) {
+    SSEParser parser;
+    auto events = parser.parseChunk("event: only-type\n\n: just a comment\n\nfoo: bar\n\n\n\n");
+    EXPECT_TRUE(events.empty());
+}
+
+TEST(SSEParserTest, CommentLineWithColonInside) {
+    SSEParser parser;
+    auto events = parser.parseChunk(":data: not data\ndata: real\n\n");
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].data, "real");
+}
+
+TEST(SSEParserTest, FieldNamesAreCaseSensitive) {
+    SSEParser parser;
+    auto events = parser.parseChunk("Data: nope\nunknown: x\ndata: yes\n\n");
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].data, "yes");
+}
+
+TEST(SSEParserTest, EventTypeDoesNotLeakIntoNextEvent) {
+    SSEParser parser;
+    auto events = parser.parseChunk("event: custom\ndata: 1\n\ndata: 2\n\n");
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0].event, "custom");
+    EXPECT_TRUE(events[1].event.empty());
+}
+
+TEST(SSEParserTest, IncompleteEventNotDispatched) {
+    SSEParser parser;
+    // No trailing blank line: the event must stay pending.
+    EXPECT_TRUE(parser.parseChunk("data: pending\n").empty());
+    EXPECT_TRUE(parser.parseChunk("data: still").empty());
 }
