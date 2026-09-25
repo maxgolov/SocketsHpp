@@ -26,24 +26,32 @@ inline void* win_input(const void* p) noexcept { return const_cast<void*>(p); }
 }  // namespace detail
 
 /**
- * @brief Windows Compression API implementation (MSZIP/LZMS).
+ * @brief Windows Compression API implementation (MSZIP/XPRESS/XPRESS_HUFF/LZMS).
  * 
- * Uses Windows built-in compression available since Windows 8/Server 2012.
- * Supports MSZIP (DEFLATE variant), XPRESS, XPRESS_HUFF, and LZMS.
+ * Uses Windows built-in compression (Cabinet.dll) available since Windows
+ * 8/Server 2012. Only available when _WIN32 is defined.
+ * @note The output uses the Compression API's own buffered format; it is not
+ *       interchangeable with gzip/deflate/br HTTP content-codings.
  */
 class WindowsCompression
 {
 public:
+    /// @brief Compression API algorithm.
     enum Algorithm
     {
-        MSZIP = COMPRESS_ALGORITHM_MSZIP,           // DEFLATE variant
-        XPRESS = COMPRESS_ALGORITHM_XPRESS,         // LZ77-based
-        XPRESS_HUFF = COMPRESS_ALGORITHM_XPRESS_HUFF, // LZ77 + Huffman
-        LZMS = COMPRESS_ALGORITHM_LZMS              // LZMA-based
+        MSZIP = COMPRESS_ALGORITHM_MSZIP,           ///< DEFLATE variant
+        XPRESS = COMPRESS_ALGORITHM_XPRESS,         ///< LZ77-based
+        XPRESS_HUFF = COMPRESS_ALGORITHM_XPRESS_HUFF, ///< LZ77 + Huffman
+        LZMS = COMPRESS_ALGORITHM_LZMS              ///< LZMA-based
     };
 
     /**
      * @brief Compress data using Windows Compression API.
+     * @param input Data to compress
+     * @param level Ignored (the API has no level setting)
+     * @param algorithm Algorithm to use
+     * @return Compressed data; empty for empty input
+     * @throws std::runtime_error if the API fails
      */
     static std::vector<uint8_t> compress(
         const std::vector<uint8_t>& input,
@@ -104,6 +112,12 @@ public:
 
     /**
      * @brief Decompress data using Windows Compression API.
+     * @param input Compressed data (from compress() with the same algorithm)
+     * @param algorithm Algorithm the data was compressed with
+     * @param maxOutputSize Maximum decompressed size; checked before allocating
+     * @return Decompressed data; empty for empty input
+     * @throws std::length_error if the output would exceed @p maxOutputSize
+     * @throws std::runtime_error if the API fails
      */
     static std::vector<uint8_t> decompress(
         const std::vector<uint8_t>& input,
@@ -172,7 +186,10 @@ public:
 };
 
 /**
- * @brief Register Windows compression strategies with the registry.
+ * @brief Register Windows compression strategies with the registry: "mszip",
+ *        "xpress" and "lzms", each with a bounded decompressor.
+ * @note These names are not standard HTTP content-codings, so browsers will not
+ *       request them. Not thread-safe (see CompressionRegistry).
  */
 inline void registerWindowsCompression()
 {

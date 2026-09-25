@@ -30,27 +30,38 @@ namespace http
          *   server.start();
          * @endcode
          *
-         * Requests are percent-decoded, stripped of their query string and resolved
-         * inside the document root; paths escaping the root, absolute paths, NUL bytes
-         * and non-regular files are refused (404). A path without an extension maps to
-         * its index.html. The Content-Type is chosen from the file extension. Files are
-         * read into memory in full, so this is meant for small static assets.
+         * Requests are stripped of their query string and fragment, percent-decoded
+         * (malformed escapes or NUL bytes: 400) and resolved inside the document root;
+         * paths escaping the root, absolute paths and non-regular files are refused
+         * (404). A path containing no '.' at all is treated as a directory and maps to
+         * its index.html. The Content-Type is chosen from the (case-sensitive) file
+         * extension, defaulting to text/plain. Files are read into memory in full, so
+         * this is meant for small static assets.
+         *
+         * @note The file endpoint answers every request that reaches it (200, 400 or
+         *       404), so other routes registered on "/" after it never run.
          */
         class HttpFileServer : public HttpServer
         {
 
         protected:
-            std::filesystem::path m_documentRoot;  // Document root directory
-            bool m_pathTraversalProtection = true; // Path traversal protection enabled by default
+            std::filesystem::path m_documentRoot;  ///< Absolute document root directory.
+            bool m_pathTraversalProtection = true; ///< Refuse paths resolving outside m_documentRoot (default on).
 
         public:
             /**
-             * @brief Create the server and start listening on host:port (0 = ephemeral,
-             *        see getListeningPort()). Files are not served until
-             *        InitializeFileEndpoint() is called.
+             * @brief Create the server and bind a listening socket on all IPv4
+             *        interfaces (port 0 = ephemeral, see getListeningPort()). Requests
+             *        are served after start(); files are served only once
+             *        InitializeFileEndpoint() has been called.
+             * @note @p host is not a bind address: it only forms the "Server" header
+             *       ("host:port"). Use addListeningPort(host, port) to bind a specific
+             *       address in addition.
              * @param host Name used in the "Server" response header
              * @param port Port to listen on (all IPv4 interfaces)
-             * @param docRoot Directory to serve files from (default: current directory)
+             * @param docRoot Directory to serve files from (default: current directory);
+             *        made absolute against the current working directory now.
+             * @throws std::runtime_error if the port cannot be bound or listened on.
              */
             HttpFileServer(const std::string& host = "127.0.0.1", int port = 3333, const std::string& docRoot = ".")
                 : HttpServer()
@@ -62,6 +73,7 @@ namespace http
                 addListeningPort(port);
             };
 
+            /// @brief Stop the server (joining the reactor) before the file endpoint is destroyed.
             virtual ~HttpFileServer()
             {
                 // Stop the reactor before ServeFile/mime_types_ are destroyed:
@@ -71,7 +83,9 @@ namespace http
 
             /**
              * @brief Set the document root directory for serving files
-             * @param docRoot Path to document root (defaults to current directory)
+             * @param docRoot Path to document root; a relative path is made absolute
+             *        against the current working directory now.
+             * @note Not synchronized with request handling: call before start().
              */
             void setDocumentRoot(const std::string& docRoot)
             {
@@ -81,6 +95,8 @@ namespace http
             /**
              * @brief Enable or disable path traversal protection
              * @param enabled If true, prevent access to files outside document root
+             * @warning Disabling allows ".." segments and symlinks to reach any regular
+             *          file the process can read. Call before start().
              */
             void setPathTraversalProtection(bool enabled)
             {
@@ -91,7 +107,9 @@ namespace http
              * @brief Serve static files for every request not claimed by a more specific
              *        route. Routes are matched longest-prefix first, so this "/" endpoint
              *        can be registered before or after your own routes.
-             * @param server should be this object
+             * @param server should be this object (the route is added to @p server but
+             *        uses this object's handler and document root)
+             * @note Call once, before start().
              */
             void InitializeFileEndpoint(HttpFileServer& server) { server[root_endpt_] = ServeFile; }
 
@@ -245,14 +263,10 @@ namespace http
 
         private:
             /**
-             * Return whether a file is found whose location is searched for relative to
-             * the document root. If the file is valid, fill result with
-             * the file data/information required to display it on a webpage
-             * @param name of the file to look for,
-             * @param resulting file information, necessary for displaying them on a
-             * webpage
-             * @returns whether a file was found and result filled with display
-             * information
+             * @brief Read a file below the document root into memory.
+             * @param fileNameUrl Decoded path relative to the document root
+             * @param result Receives the whole file content
+             * @return true if the path passed validateFilePath() and the file was opened
              */
             bool FileGetSuccess(const std::string& fileNameUrl, std::vector<char>& result)
             {
@@ -280,9 +294,9 @@ namespace http
             };
 
             /**
-             * Returns the extension of a file
-             * @param name of the file
-             * @returns file extension type under HTTP protocol
+             * @brief Map a file name's extension (text after the last '.') to a MIME type.
+             * @param filename File name or path
+             * @return The MIME type, or text/plain if the extension is unknown
              */
             std::string GetMimeContentType(const std::string& filename)
             {
@@ -292,9 +306,10 @@ namespace http
             };
 
             /**
-             * Returns the standardized name of a file by removing backslashes, and
-             * assuming index.html is the wanted file if a directory is given
-             * @param name of the file
+             * @brief Drop one trailing '/' and, if the path contains no '.', treat it as
+             *        a directory and append "/index.html".
+             * @param name Decoded request path
+             * @return The file path to look up
              */
             std::string GetFileName(std::string name)
             {
@@ -311,12 +326,8 @@ namespace http
             }
 
             /**
-             * Sets the response object with the correct file data based on the requested
-             * file address, or return 404 error if a file isn't found
-             * @param req is the HTTP request, which we use to figure out the response to
-             * send
-             * @param resp is the HTTP response we want to send to the frontend, including
-             * file data
+             * @brief Route handler serving the file named by the request URI: 200 with
+             *        the file content, 400 for a malformed path, 404 otherwise.
              */
             HttpRequestCallback ServeFile{
                 [&](HttpRequest const& req, HttpResponse& resp) {
@@ -355,7 +366,7 @@ namespace http
                   return 404;
                 } };
 
-            // Maps file extensions to their HTTP-compatible mime file type
+            /// @brief Maps file extensions (lower case, matched case-sensitively) to MIME types.
             const std::unordered_map<std::string, std::string> mime_types_ = {
                 // Text
                 {"css", "text/css"},
@@ -393,7 +404,7 @@ namespace http
                 {"tar", "application/x-tar"},
                 {"gz", "application/gzip"},
             };
-            const std::string root_endpt_ = "/";
+            const std::string root_endpt_ = "/";  ///< Route prefix used by InitializeFileEndpoint().
         };
     }
 }

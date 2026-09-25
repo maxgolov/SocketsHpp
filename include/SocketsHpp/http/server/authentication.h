@@ -22,11 +22,12 @@ namespace http
          */
         struct AuthResult
         {
-            bool authenticated = false;
-            std::string userId;
-            std::unordered_map<std::string, std::string> claims;
-            std::string error;
+            bool authenticated = false;  ///< true if the credentials were accepted.
+            std::string userId;          ///< Authenticated user identifier (success only).
+            std::unordered_map<std::string, std::string> claims;  ///< Optional attributes of the user (success only).
+            std::string error;           ///< Human-readable failure reason (failure only).
 
+            /// @brief Successful result for @p user with no claims.
             static AuthResult success(const std::string& user)
             {
                 AuthResult result;
@@ -35,6 +36,7 @@ namespace http
                 return result;
             }
 
+            /// @brief Successful result for @p user carrying @p userClaims.
             static AuthResult success(const std::string& user,
                                      const std::unordered_map<std::string, std::string>& userClaims)
             {
@@ -45,6 +47,7 @@ namespace http
                 return result;
             }
 
+            /// @brief Failed result with reason @p err.
             static AuthResult failure(const std::string& err)
             {
                 AuthResult result;
@@ -53,6 +56,7 @@ namespace http
                 return result;
             }
 
+            /// @brief Same as #authenticated (implicit conversion).
             operator bool() const { return authenticated; }
         };
 
@@ -101,6 +105,8 @@ namespace http
          * @brief Base class for authentication strategies.
          * 
          * Implement this interface to create custom authentication mechanisms.
+         * @tparam RequestType Request type providing has_header(name) and
+         *         get_header_value(name), e.g. HttpRequest.
          */
         template<typename RequestType>
         class AuthenticationStrategy
@@ -122,6 +128,7 @@ namespace http
 
             /**
              * @brief Get the WWW-Authenticate challenge for 401 responses.
+             * @return schemeName() unless overridden.
              */
             virtual std::string getChallenge() const
             {
@@ -132,12 +139,14 @@ namespace http
         /**
          * @brief Bearer token authentication (RFC 6750).
          * 
-         * Validates tokens from "Authorization: Bearer <token>" header.
+         * Validates tokens from the "Authorization: Bearer TOKEN" header. The scheme
+         * name is matched case-insensitively.
          */
         template<typename RequestType>
         class BearerTokenAuth : public AuthenticationStrategy<RequestType>
         {
         public:
+            /// @brief Checks a bearer token and returns the outcome.
             using ValidatorFunc = std::function<AuthResult(const std::string& token)>;
 
         private:
@@ -145,11 +154,17 @@ namespace http
             std::string m_realm;
 
         public:
+            /// @param validator Called with the (non-empty) token; must be thread-safe
+            ///        if requests are handled concurrently.
+            /// @param realm Realm reported in the WWW-Authenticate challenge.
             explicit BearerTokenAuth(ValidatorFunc validator, std::string realm = "API")
                 : m_validator(std::move(validator)), m_realm(std::move(realm))
             {
             }
 
+            /// @brief Extract the bearer token and pass it to the validator.
+            /// @return The validator's result, or a failure if the header is missing,
+            ///         uses another scheme, or carries an empty token.
             AuthResult authenticate(const RequestType& req) override
             {
                 // Extract Authorization header using duck-typed interface
@@ -176,8 +191,10 @@ namespace http
                 return m_validator(token);
             }
 
+            /// @brief Returns "Bearer".
             std::string schemeName() const override { return "Bearer"; }
 
+            /// @brief Returns `Bearer realm="<realm>"`.
             std::string getChallenge() const override
             {
                 return "Bearer realm=\"" + m_realm + "\"";
@@ -193,6 +210,7 @@ namespace http
         class ApiKeyAuth : public AuthenticationStrategy<RequestType>
         {
         public:
+            /// @brief Checks an API key and returns the outcome.
             using ValidatorFunc = std::function<AuthResult(const std::string& apiKey)>;
 
         private:
@@ -200,11 +218,18 @@ namespace http
             ValidatorFunc m_validator;
 
         public:
+            /// @param headerName Header carrying the key, e.g. "X-API-Key" (looked up
+            ///        case-insensitively when RequestType is HttpRequest).
+            /// @param validator Called with the (non-empty) header value; must be
+            ///        thread-safe if requests are handled concurrently.
             ApiKeyAuth(std::string headerName, ValidatorFunc validator)
                 : m_headerName(std::move(headerName)), m_validator(std::move(validator))
             {
             }
 
+            /// @brief Read the API key header and pass its value to the validator.
+            /// @return The validator's result, or a failure if the header is missing
+            ///         or empty.
             AuthResult authenticate(const RequestType& req) override
             {
                 // Extract API key header using duck-typed interface
@@ -224,8 +249,10 @@ namespace http
                 return m_validator(apiKey);
             }
 
+            /// @brief Returns "API-Key" (not a registered HTTP auth scheme).
             std::string schemeName() const override { return "API-Key"; }
 
+            /// @brief Returns `API-Key header="<headerName>"`.
             std::string getChallenge() const override
             {
                 return "API-Key header=\"" + m_headerName + "\"";
@@ -235,12 +262,15 @@ namespace http
         /**
          * @brief HTTP Basic Authentication (RFC 7617).
          * 
-         * Validates username/password from "Authorization: Basic <base64>" header.
+         * Validates username/password from the "Authorization: Basic BASE64" header
+         * (scheme matched case-insensitively). The decoded credentials are split at
+         * the first ':'.
          */
         template<typename RequestType>
         class BasicAuth : public AuthenticationStrategy<RequestType>
         {
         public:
+            /// @brief Checks a username/password pair and returns the outcome.
             using ValidatorFunc = std::function<AuthResult(
                 const std::string& username, const std::string& password)>;
 
@@ -249,11 +279,18 @@ namespace http
             std::string m_realm;
 
         public:
+            /// @param validator Called with the decoded username and password; must be
+            ///        thread-safe if requests are handled concurrently. Compare secrets
+            ///        in constant time.
+            /// @param realm Realm reported in the WWW-Authenticate challenge.
             explicit BasicAuth(ValidatorFunc validator, std::string realm = "Restricted")
                 : m_validator(std::move(validator)), m_realm(std::move(realm))
             {
             }
 
+            /// @brief Decode the Basic credentials and pass them to the validator.
+            /// @return The validator's result, or a failure if the header is missing,
+            ///         uses another scheme, is not valid base64, or has no ':'.
             AuthResult authenticate(const RequestType& req) override
             {
                 // Extract Authorization header using duck-typed interface
@@ -296,8 +333,10 @@ namespace http
                 return m_validator(username, password);
             }
 
+            /// @brief Returns "Basic".
             std::string schemeName() const override { return "Basic"; }
 
+            /// @brief Returns `Basic realm="<realm>"`.
             std::string getChallenge() const override
             {
                 return "Basic realm=\"" + m_realm + "\"";
@@ -309,12 +348,22 @@ namespace http
          * 
          * Tries multiple authentication strategies in order until one succeeds.
          * Useful for supporting multiple authentication methods (e.g., Bearer + API Key).
+         * Call authenticate() at the start of a request handler.
+         *
+         * @note Configure (addStrategy() etc.) before serving; authenticate() itself
+         *       only reads the configuration, so concurrent calls are safe as long as
+         *       the strategies and callback are thread-safe.
+         * @tparam RequestType Request type (see AuthenticationStrategy).
+         * @tparam ResponseType Response type providing set_header() and set_content(),
+         *         e.g. HttpResponse.
          */
         template<typename RequestType, typename ResponseType>
         class AuthenticationMiddleware
         {
         public:
+            /// @brief Shared pointer to a strategy.
             using StrategyPtr = std::shared_ptr<AuthenticationStrategy<RequestType>>;
+            /// @brief Called with the request and the successful result.
             using AuthCallback = std::function<void(RequestType&, const AuthResult&)>;
 
         private:
@@ -323,6 +372,7 @@ namespace http
             bool m_requireAuth;
 
         public:
+            /// @brief Create a middleware with no strategies that requires authentication.
             AuthenticationMiddleware() : m_requireAuth(true) {}
 
             /**
@@ -344,8 +394,9 @@ namespace http
             }
 
             /**
-             * @brief Set whether authentication is required.
+             * @brief Set whether authentication is required (default true).
              * If false, allows unauthenticated requests but still attempts auth.
+             * If true and no strategy is configured, every request is rejected.
              */
             void setRequireAuth(bool require)
             {
@@ -354,9 +405,18 @@ namespace http
 
             /**
              * @brief Authenticate a request.
+             *
+             * Strategies are tried in order; the first success invokes the
+             * authenticated callback and returns true. If all fail and auth is
+             * required, a combined WWW-Authenticate header (all challenges) and a JSON
+             * error body are set on @p res.
              * @param req HTTP request
              * @param res HTTP response (modified if auth fails)
              * @return true if authenticated (or auth not required), false otherwise
+             * @warning The status code is not set. With HttpServer, a handler that sets
+             *          this body and returns 0 answers 200, so return 401 on false.
+             *          With no strategies and auth required, false is returned without
+             *          touching @p res.
              */
             bool authenticate(RequestType& req, ResponseType& res)
             {
@@ -411,7 +471,7 @@ namespace http
             }
 
             /**
-             * @brief Get the most recent authentication result.
+             * @brief Get the configured strategies, in the order they are tried.
              */
             const std::vector<StrategyPtr>& getStrategies() const
             {
