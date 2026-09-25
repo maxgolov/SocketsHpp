@@ -262,6 +262,106 @@ namespace
         EXPECT_EQ(peer.toString().rfind("[::1]:", 0), 0u);
     }
 
+    // recvfrom() into a default-constructed SocketAddr must not truncate an
+    // IPv6 peer address (the in/out length used to be sizeof(sockaddr)).
+    TEST_F(SocketBasicTest, UdpLoopbackRoundTrip_IPv6)
+    {
+        SKIP_IF_NO_IPV6();
+        ScopedSocket receiver(AF_INET6, SOCK_DGRAM, 0);
+        if (receiver.get().bind(SocketAddr("[::1]:0")) != 0)
+            GTEST_SKIP() << "IPv6 loopback is not configured on this host";
+        SocketAddr bound;
+        ASSERT_TRUE(receiver.get().getsockname(bound));
+        ASSERT_GT(bound.port(), 0);
+
+        ScopedSocket sender(AF_INET6, SOCK_DGRAM, 0);
+        ASSERT_EQ(sender.get().bind(SocketAddr("[::1]:0")), 0);
+        SocketAddr senderAddr;
+        ASSERT_TRUE(sender.get().getsockname(senderAddr));
+
+        const std::string msg = "datagram6";
+        ASSERT_EQ(sender.get().sendto(msg.data(), msg.size(), 0, bound), static_cast<int>(msg.size()));
+
+        char buf[32] = {};
+        SocketAddr from;
+        int n = receiver.get().recvfrom(buf, sizeof(buf), 0, from);
+        ASSERT_EQ(n, static_cast<int>(msg.size()));
+        EXPECT_EQ(std::string(buf, n), msg);
+        EXPECT_EQ(from.toString(), senderAddr.toString());
+    }
+
+    namespace
+    {
+        struct TcpPair
+        {
+            ScopedSocket client{AF_INET, SOCK_STREAM, 0};
+            ScopedSocket server{Socket()};
+
+            bool open()
+            {
+                ScopedSocket listener(AF_INET, SOCK_STREAM, 0);
+                if (listener.get().bind(SocketAddr("127.0.0.1:0")) != 0 || !listener.get().listen(1))
+                    return false;
+                SocketAddr bound;
+                if (!listener.get().getsockname(bound) || !client.get().connect(bound))
+                    return false;
+                Socket accepted;
+                SocketAddr peer;
+                if (!listener.get().accept(accepted, peer))
+                    return false;
+                server = ScopedSocket(std::move(accepted));
+                return true;
+            }
+        };
+    }  // namespace
+
+    TEST_F(SocketBasicTest, WriteAllReportsWouldBlock)
+    {
+        TcpPair pair;
+        ASSERT_TRUE(pair.open());
+        pair.server.get().setNonBlocking();
+
+        // Much larger than any socket buffer; the peer never reads.
+        std::string big(32 * 1024 * 1024, 'x');
+        int err = -1;
+        size_t sent = pair.server.get().writeall(big, &err);
+        EXPECT_LT(sent, big.size());
+        EXPECT_NE(err, 0);
+        EXPECT_TRUE(Socket::isWouldBlock(err)) << "err=" << err;
+    }
+
+    TEST_F(SocketBasicTest, WriteAllReportsHardErrorAfterPeerReset)
+    {
+        TcpPair pair;
+        ASSERT_TRUE(pair.open());
+
+        // Abortive close: SO_LINGER {on, 0} makes close() send RST.
+        struct linger lg;
+        lg.l_onoff = 1;
+        lg.l_linger = 0;
+        ASSERT_EQ(::setsockopt(pair.client.get().m_sock, SOL_SOCKET, SO_LINGER,
+                      reinterpret_cast<const char*>(&lg), sizeof(lg)),
+            0);
+        pair.client.close();
+
+        // Blocking recv returns once the RST has been processed.
+        char c;
+        EXPECT_LT(pair.server.get().recv(&c, 1), 0);
+
+        std::string data(1024, 'y');
+        int err = 0;
+        size_t sent = 0;
+        // The first send after a reset may still be accepted on some stacks;
+        // a subsequent one must fail with a hard error.
+        for (int i = 0; i < 3 && err == 0; i++)
+        {
+            sent = pair.server.get().writeall(data, &err);
+        }
+        EXPECT_LT(sent, data.size());
+        EXPECT_NE(err, 0);
+        EXPECT_FALSE(Socket::isWouldBlock(err)) << "err=" << err;
+    }
+
     TEST_F(SocketBasicTest, SendOnInvalidArgsReturnsZero)
     {
         ScopedSocket sock(AF_INET, SOCK_STREAM, 0);

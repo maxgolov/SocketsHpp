@@ -89,11 +89,11 @@ namespace net
                 server_socket = Socket(server_socket_params);
 
                 // Default lambda here implements an echo server
-                onRequest = [this](Connection& conn) {
+                onRequest = [](Connection& conn) {
                     conn.state.insert(SocketServer::Connection::Responding);
                 };
 
-                onResponse = [this](Connection&) {
+                onResponse = [](Connection&) {
                     // Empty response
                 };
 
@@ -125,15 +125,54 @@ namespace net
                     bind_address.toString().c_str());
             }
 
+            SocketServer(SocketServer const&) = delete;
+            SocketServer& operator=(SocketServer const&) = delete;
+
+            /**
+             * @brief Destructor. Stops the server if Stop() was not called, so that
+             * destroying a started server never terminates the process on a joinable
+             * thread and does not leak sockets.
+             */
+            virtual ~SocketServer() { Stop(); }
+
             /**
              * @brief Start server.
              */
             void Start() { reactor.start(); }
 
             /**
-             * @brief Stop server.
+             * @brief Stop server: stop the event loop, close the server socket and
+             * all accepted client connections. Safe to call more than once.
              */
-            void Stop() { reactor.stop(); }
+            void Stop()
+            {
+                // Joins the reactor thread, then closes the bound server socket
+                // (the first socket registered with the reactor).
+                reactor.stop();
+                {
+                    LOCKGUARD(connections_mutex);
+                    for (auto& kv : connections)
+                    {
+                        Socket& csocket = kv.second.socket;
+                        if (!csocket.invalid() && (csocket != server_socket))
+                        {
+                            csocket.close();
+                        }
+                    }
+                    connections.clear();
+                }
+                if (is_bound)
+                {
+                    // Already closed by reactor.stop()
+                    server_socket.m_sock = Socket::Invalid;
+                    is_bound = false;
+                }
+                else if (!server_socket.invalid())
+                {
+                    // Bind failed: socket was never handed to the reactor.
+                    server_socket.close();
+                }
+            }
 
             /**
              * @brief Handle Reactor::State::Acceptable event.
@@ -186,45 +225,44 @@ namespace net
                         // TCP or Unix domain connection.
                         Connection& conn_tcp = it->second;
                         ReadStreamBuffer(conn_tcp);
-                        onRequest(conn_tcp);
+                        // Only hand actual data to the request handler; a wakeup
+                        // that produced no data (EWOULDBLOCK) or EOF is not a request.
+                        if (!conn_tcp.request_buffer.empty())
+                        {
+                            onRequest(conn_tcp);
+                        }
                         HandleConnection(conn_tcp);
                         return;
                     }
                 }
-                // UDP datagram connection (not found in connections map)
-                // For UDP, we need to store the connection temporarily to handle async response.
-                // Create a unique pseudo-socket identifier using server socket + client address hash.
+
+                if (server_socket_params.type == SOCK_STREAM)
+                {
+                    // Stale event for a stream socket that has already been closed.
+                    return;
+                }
+
+                // UDP datagram: each datagram is handled as a short-lived connection
+                // bound to the server socket. It is not stored in `connections`:
+                // the response (if any) is sent synchronously with sendto(), and the
+                // server socket must never be closed by per-datagram handling.
                 Connection conn_udp;
-                    conn_udp.socket = socket;  // Server socket
-                    conn_udp.state = { Connection::Receiving };
-                    
-                    // Read datagram and capture client address
-                    ReadDatagramBuffer(conn_udp);
-                    
-                    if (conn_udp.state.count(Connection::Receiving))
-                    {
-                        // Store connection in map for async handling
-                        // Use a pseudo-socket based on client address hash
-                        Socket pseudo_socket;
-                        pseudo_socket.m_sock = static_cast<Socket::Type>(
-                            std::hash<std::string>{}(conn_udp.client.toString()));
-                        
-                        LOCKGUARD(connections_mutex);
-                        Connection& stored_conn = connections[pseudo_socket];
-                        stored_conn = conn_udp;
-                        stored_conn.socket = socket;  // Keep real server socket
-                        
-                        // Process request
-                        onRequest(stored_conn);
-                        HandleConnection(stored_conn);
-                        
-                        // For UDP, if response is ready, send immediately and cleanup
-                        if (stored_conn.state.count(Connection::Responding))
-                        {
-                            WriteResponseBuffer(stored_conn);
-                            connections.erase(pseudo_socket);
-                        }
-                    }
+                conn_udp.socket = socket;  // Server socket
+                conn_udp.state = { Connection::Idle };
+
+                // Read datagram and capture client address
+                ReadDatagramBuffer(conn_udp);
+                if (!conn_udp.state.count(Connection::Receiving))
+                {
+                    return;
+                }
+
+                LOCKGUARD(connections_mutex);
+                onRequest(conn_udp);
+                if (conn_udp.state.count(Connection::Responding))
+                {
+                    WriteResponseBuffer(conn_udp);
+                }
             }
 
             /**
@@ -253,6 +291,11 @@ namespace net
             virtual void onSocketClosed(Socket socket) override
             {
                 LOG_TRACE("Server: closing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
+                if (server_socket_params.type != SOCK_STREAM)
+                {
+                    // UDP: the reactor reports the server socket itself on shutdown.
+                    return;
+                }
                 LOCKGUARD(connections_mutex);
                 auto it = connections.find(socket);
                 if (it != connections.end())
@@ -273,20 +316,56 @@ namespace net
              */
             virtual void ReadStreamBuffer(Connection& conn_tcp)
             {
+                // Read what is available without blocking. Distinguish:
+                // - data           -> Receiving
+                // - recv() == 0    -> EOF (peer closed): Closing
+                // - hard error     -> Closing
+                // - EWOULDBLOCK    -> spurious wakeup: nothing to do
+                static constexpr size_t kChunkSize = 4096;
+                static constexpr size_t kMaxReadPerEvent = 64 * 1024;
                 conn_tcp.request_buffer.clear();
-                conn_tcp.request_buffer.resize(4096, 0);
-                size_t size = conn_tcp.socket.readall(conn_tcp.request_buffer);
-                if (size > 0)
+                char chunk[kChunkSize];
+                bool eof = false;
+                int hardError = 0;
+                while (conn_tcp.request_buffer.size() < kMaxReadPerEvent)
                 {
-                    LOG_TRACE("Server: [%s] stream read %zu bytes", CLID(conn_tcp), size);
-                    conn_tcp.request_buffer.resize(size);
+                    int n = conn_tcp.socket.recv(chunk, sizeof(chunk));
+                    if (n > 0)
+                    {
+                        conn_tcp.request_buffer.append(chunk, static_cast<size_t>(n));
+                        continue;
+                    }
+                    if (n == 0)
+                    {
+                        eof = true;
+                        break;
+                    }
+                    int err = conn_tcp.socket.error();
+#ifndef _WIN32
+                    if (err == EINTR)
+                    {
+                        continue;
+                    }
+#endif
+                    if (!Socket::isWouldBlock(err))
+                    {
+                        hardError = err;
+                    }
+                    break;
+                }
+
+                if (!conn_tcp.request_buffer.empty())
+                {
+                    LOG_TRACE("Server: [%s] stream read %zu bytes", CLID(conn_tcp), conn_tcp.request_buffer.size());
                     // Handle connection: process request_buffer
                     conn_tcp.state.insert(Connection::Receiving);
                 }
-                else
+                if (eof || (hardError != 0))
                 {
-                    conn_tcp.request_buffer.resize(0);
-                    LOG_ERROR("Server: [%s] failed to read client stream, errno=%d", CLID(conn_tcp), errno);
+                    LOG_TRACE("Server: [%s] client stream closed (eof=%d, error=%d)", CLID(conn_tcp),
+                        static_cast<int>(eof), hardError);
+                    // Any data read above is still processed (and responded to)
+                    // before the connection is closed.
                     conn_tcp.state.insert(Connection::Closing);
                 }
             }
@@ -306,7 +385,7 @@ namespace net
                     conn_udp.client);
                 if (size > 0)
                 {
-                    LOG_ERROR("Server: [%s] datagram read %d bytes", CLID(conn_udp), size);
+                    LOG_TRACE("Server: [%s] datagram read %d bytes", CLID(conn_udp), size);
                     conn_udp.request_buffer.resize(size);
                     // Handle connection: process request_buffer
                     conn_udp.state.insert(Connection::Receiving);
@@ -314,7 +393,7 @@ namespace net
                 else
                 {
                     conn_udp.request_buffer.resize(0);
-                    LOG_ERROR("Server: [%s] failed to read client datagram", CLID(conn_udp));
+                    LOG_TRACE("Server: failed to read client datagram, error=%d", conn_udp.socket.error());
                 }
             }
 
@@ -350,9 +429,21 @@ namespace net
                     return false;
                 }
 
-                // Handle TCP and Unix Domain response
-                reactor.addSocket(conn.socket, Reactor::Writable);
-                total_bytes_sent = conn.socket.writeall(conn.response_buffer);
+                // Handle TCP and Unix Domain response.
+                // Keep Closed armed so that a peer reset is still observed.
+                reactor.addSocket(conn.socket, Reactor::Writable | Reactor::Closed);
+                int sendError = 0;
+                total_bytes_sent = conn.socket.writeall(conn.response_buffer, &sendError);
+                if ((sendError != 0) && !Socket::isWouldBlock(sendError))
+                {
+                    // Hard error (EPIPE, ECONNRESET, ...): the peer is gone. Drop the
+                    // pending response and close instead of re-arming Writable forever.
+                    LOG_WARN("Server: [%s] send failed, error=%d; closing connection", CLID(conn), sendError);
+                    conn.response_buffer.clear();
+                    conn.state.erase(Connection::Responding);
+                    conn.state.insert(Connection::Closing);
+                    return false;
+                }
                 if (conn.response_buffer.size() != total_bytes_sent)
                 {
                     conn.response_buffer.erase(0, total_bytes_sent);

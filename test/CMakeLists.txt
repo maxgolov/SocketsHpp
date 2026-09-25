@@ -25,6 +25,7 @@ set(UNIT_TESTS
   authentication_test
   compression_test
   sse_parser_test
+  thread_pool_server_test
 )
 
 # MCP unit tests (require nlohmann-json)
@@ -54,6 +55,8 @@ endforeach()
 set(FUNCTIONAL_TESTS
   sockets_test
   sockets_udp_test
+  socket_server_test
+  tcp_server_test
   http_server_test
   http_streaming_test
   http_methods_test

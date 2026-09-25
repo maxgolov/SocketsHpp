@@ -194,6 +194,160 @@ namespace testing
     }
 #endif
 
+    // Scheme prefix handling
+    TEST_F(SocketAddrTest, Scheme_TcpWithPort)
+    {
+        SocketAddr addr("tcp://127.0.0.1:8080");
+        EXPECT_EQ(addr.toString(), "127.0.0.1:8080");
+        EXPECT_EQ(addr.port(), 8080);
+        EXPECT_FALSE(addr.isUnixDomain);
+    }
+
+    TEST_F(SocketAddrTest, Scheme_TcpWithoutPort)
+    {
+        SocketAddr addr("tcp://127.0.0.1");
+        EXPECT_EQ(addr.toString(), "127.0.0.1:0");
+        EXPECT_EQ(addr.port(), 0);
+    }
+
+    TEST_F(SocketAddrTest, Scheme_UdpIPv6WithPort)
+    {
+        SocketAddr addr("udp://[::1]:5353");
+        EXPECT_EQ(addr.toString(), "[::1]:5353");
+        EXPECT_EQ(addr.port(), 5353);
+    }
+
+    TEST_F(SocketAddrTest, IPv4_NoPort)
+    {
+        SocketAddr addr("10.1.2.3");
+        EXPECT_EQ(addr.toString(), "10.1.2.3:0");
+    }
+
+    // Unbracketed IPv6 literals carry no port
+    TEST_F(SocketAddrTest, IPv6_BareLoopback)
+    {
+        SocketAddr addr("::1");
+        EXPECT_EQ(addr.toString(), "[::1]:0");
+        EXPECT_EQ(addr.port(), 0);
+    }
+
+    TEST_F(SocketAddrTest, IPv6_BareLinkLocal)
+    {
+        SocketAddr addr("fe80::1");
+        EXPECT_EQ(addr.toString(), "[fe80::1]:0");
+    }
+
+    TEST_F(SocketAddrTest, IPv6_BareFullAddressKeepsLastGroup)
+    {
+        // The last group must not be mistaken for a port.
+        SocketAddr addr("2001:db8::8080");
+        EXPECT_EQ(addr.toString(), "[2001:db8::8080]:0");
+    }
+
+    TEST_F(SocketAddrTest, IPv6_BracketedNoPort)
+    {
+        SocketAddr addr("[::1]");
+        EXPECT_EQ(addr.toString(), "[::1]:0");
+    }
+
+    TEST_F(SocketAddrTest, IPv6_Invalid)
+    {
+        EXPECT_THROW(SocketAddr("[::1"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("[::1]8080"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("[::zz]:80"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("1:2:3:4:5:6:7:8:9"), std::invalid_argument);
+    }
+
+    // Port validation
+    TEST_F(SocketAddrTest, Port_NonNumericRejected)
+    {
+        EXPECT_THROW(SocketAddr("127.0.0.1:http"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("127.0.0.1:80x"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("127.0.0.1:-1"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("127.0.0.1: 80"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("127.0.0.1:"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("[::1]:abc"), std::invalid_argument);
+    }
+
+    TEST_F(SocketAddrTest, Port_OutOfRangeRejected)
+    {
+        EXPECT_THROW(SocketAddr("127.0.0.1:65536"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("127.0.0.1:99999"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("127.0.0.1:123456"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("[::1]:70000"), std::invalid_argument);
+    }
+
+    TEST_F(SocketAddrTest, Port_Boundaries)
+    {
+        EXPECT_EQ(SocketAddr("127.0.0.1:0").port(), 0);
+        EXPECT_EQ(SocketAddr("127.0.0.1:65535").port(), 65535);
+        EXPECT_EQ(SocketAddr("127.0.0.1:00080").port(), 80);
+    }
+
+    TEST_F(SocketAddrTest, InvalidHostRejected)
+    {
+        // Empty host is rejected without a DNS lookup.
+        EXPECT_THROW(SocketAddr(":8080"), std::invalid_argument);
+        EXPECT_THROW(SocketAddr("tcp://:8080"), std::invalid_argument);
+    }
+
+    // Numeric-port constructors
+    TEST_F(SocketAddrTest, HostAndPortConstructor)
+    {
+        EXPECT_EQ(SocketAddr("127.0.0.1", 8080).toString(), "127.0.0.1:8080");
+        EXPECT_EQ(SocketAddr("tcp://127.0.0.1", 81).toString(), "127.0.0.1:81");
+        EXPECT_EQ(SocketAddr("::1", 8080).toString(), "[::1]:8080");
+        EXPECT_EQ(SocketAddr("[::1]", 8080).toString(), "[::1]:8080");
+    }
+
+    TEST_F(SocketAddrTest, NumericConstructorZeroInitializes)
+    {
+        SocketAddr addr(SocketAddr::Loopback, 1234);
+        EXPECT_EQ(addr.toString(), "127.0.0.1:1234");
+        EXPECT_FALSE(addr.isUnixDomain);
+        for (size_t i = 0; i < sizeof(addr.m_data_in.sin_zero); i++)
+        {
+            EXPECT_EQ(addr.m_data_in.sin_zero[i], 0);
+        }
+        EXPECT_EQ(addr.size(), sizeof(sockaddr_in));
+    }
+
+    TEST_F(SocketAddrTest, CapacityCoversIPv6)
+    {
+        EXPECT_GE(SocketAddr::capacity(), sizeof(sockaddr_in6));
+        EXPECT_LE(SocketAddr::capacity(), sizeof(SocketAddr));
+    }
+
+#ifdef HAVE_UNIX_DOMAIN
+    TEST_F(SocketAddrTest, UnixDomain_PathIsStored)
+    {
+        SocketAddr addr("/tmp/test.sock", true);
+        EXPECT_TRUE(addr.isUnixDomain);
+        EXPECT_EQ(addr.m_data_un.sun_family, AF_UNIX);
+        EXPECT_EQ(addr.toString(), "/tmp/test.sock");
+    }
+
+    TEST_F(SocketAddrTest, UnixDomain_SchemeIsStripped)
+    {
+        SocketAddr addr("unix:///tmp/test.sock", true);
+        EXPECT_TRUE(addr.isUnixDomain);
+        EXPECT_EQ(addr.toString(), "/tmp/test.sock");
+    }
+
+    TEST_F(SocketAddrTest, UnixDomain_SchemeImpliesUnixDomain)
+    {
+        SocketAddr addr("unix:///tmp/implied.sock");
+        EXPECT_TRUE(addr.isUnixDomain);
+        EXPECT_EQ(addr.toString(), "/tmp/implied.sock");
+    }
+
+    TEST_F(SocketAddrTest, UnixDomain_PathTooLong)
+    {
+        std::string long_path(200, 'a');
+        EXPECT_THROW(SocketAddr(long_path.c_str(), true), std::invalid_argument);
+    }
+#endif
+
     // Comparison and equality tests
     TEST_F(SocketAddrTest, Equality_SameAddress)
     {
