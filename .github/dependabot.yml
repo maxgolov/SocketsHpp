@@ -4,11 +4,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+  # The TypeScript side of examples/10-typescript-interop (official MCP SDK).
+  # One grouped PR per month; CI runs the interop test against it.
   - package-ecosystem: npm
-    directory: /examples/10-typescript-interop/ts_client
+    directory: /examples/10-typescript-interop/ts
     schedule:
       interval: monthly
-  - package-ecosystem: npm
-    directory: /examples/10-typescript-interop/ts_server
-    schedule:
-      interval: monthly
+    groups:
+      typescript-interop:
+        patterns: ["*"]

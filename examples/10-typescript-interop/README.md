@@ -1,103 +1,69 @@
-# Example 10: TypeScript Interop (JSON-RPC / MCP-style)
+# Example 10: MCP interop with the official TypeScript SDK
 
-C++ and TypeScript programs talking MCP-style JSON-RPC 2.0 over plain HTTP POST:
+This example checks SocketsHpp's MCP implementation against the official
+[`@modelcontextprotocol/sdk`](https://www.npmjs.com/package/@modelcontextprotocol/sdk)
+over the Streamable HTTP transport, in both directions:
 
-- `cpp_server.cpp`: a JSON-RPC endpoint at `http://127.0.0.1:3000/mcp`, written as an
-  `HttpServer` route. It answers `initialize`, `tools/list` and `tools/call` for a
-  `get_weather` tool that returns a random condition. (This is not the library's
-  `MCPServer`; see [docs/MCP_IMPLEMENTATION.md](../../docs/MCP_IMPLEMENTATION.md) for
-  that.)
-- `cpp_client.cpp`: uses `HttpClient::post()` to call `initialize`, `tools/list` and
-  `tools/call` (`greet` with `{"name": "Alice"}`) on the TypeScript server at
-  `http://localhost:3001/mcp`.
-- `ts_server/server.ts`: Node.js JSON-RPC server on port 3001 with `get_weather` and
-  `greet` tools.
-- `ts_client/client.ts`: calls the C++ server (`initialize`, `tools/list`,
-  `tools/call get_weather`).
-- `ts_client/client-ai.ts`: optional; lets an OpenAI model (Vercel AI SDK) call the
-  C++ server's tools. Needs an OpenAI API key.
+| Direction | Client | Server |
+|-----------|--------|--------|
+| 1 | `ts/client.ts` (TypeScript SDK `Client`) | `cpp_server` (SocketsHpp `MCPServer`) |
+| 2 | `cpp_client` (SocketsHpp `MCPClient`) | `ts/server.ts` (TypeScript SDK `McpServer`) |
+
+Both servers expose the same two tools, `get_weather` and `greet` (`{ "name": string }`).
+Each client initializes a session, lists the tools, calls both and checks the results,
+then terminates the session (HTTP `DELETE`). A client exits non-zero if any step fails.
+CI runs both directions on every push (`typescript-interop` job).
+
+## Layout
 
 ```
 10-typescript-interop/
-  cpp_server.cpp   cpp_client.cpp   CMakeLists.txt
-  demo.sh          demo.ps1         # build everything and run both directions
-  ts_server/       ts_client/       # Node.js projects (package.json, *.ts)
+├── cpp_server.cpp     SocketsHpp MCP server   (default http://127.0.0.1:3000/mcp)
+├── cpp_client.cpp     SocketsHpp MCP client   (default http://127.0.0.1:3001/mcp)
+├── run-interop.sh     builds, installs and runs both directions
+└── ts/
+    ├── server.ts      TypeScript SDK server   (default http://127.0.0.1:3001/mcp)
+    ├── client.ts      TypeScript SDK client   (default http://127.0.0.1:3000/mcp)
+    ├── package.json   pinned via package-lock.json; kept current by Dependabot
+    └── tsconfig.json
 ```
 
-## Prerequisites
+## Requirements
 
-- A C++17 compiler and CMake (see the [main README](../../README.md))
-- Node.js 18+ and npm
+- CMake 3.14+ and a C++17 compiler
+- Node.js 18 or newer
 
-## Building the C++ programs
-
-From the repository root:
+## Run everything
 
 ```bash
+./run-interop.sh                    # builds cpp_server/cpp_client into build-interop/
+./run-interop.sh build/examples/10-typescript-interop   # or reuse an existing build
+```
+
+## Run each side by hand
+
+```bash
+# Build the C++ programs (from the repository root)
 cmake -S . -B build -DBUILD_EXAMPLES=ON
 cmake --build build --target cpp_server cpp_client
+
+# Install the TypeScript dependencies
+cd examples/10-typescript-interop/ts
+npm ci
+
+# Direction 1: TypeScript client -> C++ server
+../../../build/examples/10-typescript-interop/cpp_server 3000 &
+npm run client -- http://127.0.0.1:3000/mcp
+
+# Direction 2: C++ client -> TypeScript server
+npm run server -- 3001 &
+../../../build/examples/10-typescript-interop/cpp_client http://127.0.0.1:3001/mcp
 ```
 
-The binaries are `build/examples/10-typescript-interop/cpp_server` and `cpp_client`.
-Without CMake, from this directory:
+Stop the background servers with `kill %1 %2` (or Ctrl+C in their terminals).
 
-```bash
-g++ -std=c++17 -I../../include -I../../external -I../../external/nlohmann-json/single_include \
-    cpp_server.cpp -o cpp_server -pthread
-g++ -std=c++17 -I../../include -I../../external -I../../external/nlohmann-json/single_include \
-    cpp_client.cpp -o cpp_client -pthread
-```
+## Protocol version
 
-`demo.sh` / `demo.ps1` build the C++ programs with this directory's own
-`CMakeLists.txt` (into `./build`), install the npm dependencies and run both demos.
-
-## Running
-
-### TypeScript client -> C++ server
-
-```bash
-./build/examples/10-typescript-interop/cpp_server      # from the repository root; port 3000
-cd examples/10-typescript-interop/ts_client && npm install && npx tsx client.ts
-```
-
-### C++ client -> TypeScript server
-
-```bash
-cd examples/10-typescript-interop/ts_server && npm install && npx tsx server.ts   # port 3001
-./build/examples/10-typescript-interop/cpp_client      # from the repository root
-```
-
-### AI client (optional)
-
-```bash
-cd examples/10-typescript-interop/ts_client
-OPENAI_API_KEY=sk-... npx tsx client-ai.ts
-```
-
-`client-ai.ts` also loads a `.env` file three directories above its working directory
-(the repository root when run from `ts_client/`); `client.ts` and `server.ts` load
-`../.env` but need no variables. Keep any `.env` file out of version control.
-
-## Protocol
-
-Every call is a JSON-RPC 2.0 request in an HTTP POST body, answered with a JSON-RPC
-response, for example:
-
-```json
-{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
- "params": {"name": "get_weather", "arguments": {}}}
-```
-
-```json
-{"jsonrpc": "2.0", "id": 1,
- "result": {"content": [{"type": "text", "text": "Weather: rainy"}]}}
-```
-
-The C++ server also answers CORS preflight (`OPTIONS`) and returns 405 for other
-methods; errors are reported as JSON-RPC error `-32603` with HTTP status 500.
-
-## References
-
-- [Model Context Protocol](https://modelcontextprotocol.io/)
-- [JSON-RPC 2.0](https://www.jsonrpc.org/specification)
-- [Vercel AI SDK](https://sdk.vercel.ai/)
+The TypeScript SDK offers its latest protocol version; SocketsHpp answers with
+`2025-03-26` (Streamable HTTP), which the SDK accepts. Both clients print the
+negotiated version.
