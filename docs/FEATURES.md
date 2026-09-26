@@ -31,10 +31,10 @@ Protocol handling:
   `Content-Length`, repeated `Content-Length` or `Host`, invalid lengths, unknown
   transfer codings (501), `Transfer-Encoding` on HTTP/1.0, control characters in the
   request line or header values, and malformed chunk framing are all rejected.
-- Limits: request line URI 8 KB, header section 8 KB and body 2 MB by default
+- Limits: request line URI 8 KB (414, fixed), header section 8 KB and body 2 MB by default
   (`setRequestLimits()`; 431 / 413), header names 256 bytes, header values 8 KB, at
   most 100 query parameters.
-- Error responses for malformed requests (400, 413, 417, 431, 501, 505) are generated
+- Error responses for malformed requests (400, 413, 414, 417, 431, 501, 505) are generated
   by the server before any handler runs.
 
 Application features:
@@ -137,7 +137,8 @@ Server helpers (opt-in headers, applied from your handlers):
 
 - One reactor thread per server. Without `enableThreadPool()`, a slow handler or a
   blocking stream callback stalls all connections of that server.
-- On Windows a reactor watches at most 64 sockets.
+- On Windows a reactor watches at most 64 sockets (listening sockets included);
+  further connections are accepted and closed immediately.
 - Request bodies are buffered in memory (bounded by `setRequestLimits()`), as are
   static files served by `HttpFileServer`.
 - For internet-facing services, run behind nginx, Caddy or HAProxy for TLS, timeouts,

@@ -6,13 +6,19 @@ HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protoc
 
 ## Features
 
-- **Header-only**: nothing to compile or link beyond the system socket library;
-  `#include <sockets.hpp>` (or individual headers under `SocketsHpp/`).
+- **Header-only**: nothing to compile or link beyond the system socket library and
+  threads; `#include <sockets.hpp>` (or individual headers under `SocketsHpp/`).
+  `sockets.hpp` covers sockets, `SocketServer`, `HttpServer`/`HttpFileServer`,
+  `HttpClient`/`SSEClient`, MCP and Base64; include `net/tcp/tcp.h`,
+  `net/server/thread_pool_server.h`, `http/server/authentication.h`,
+  `http/server/compression*.h` and `http/server/proxy_aware.h` explicitly.
 - **Sockets**: thin RAII-friendly wrappers over BSD sockets / WinSock (TCP, UDP,
   IPv4/IPv6, Unix domain sockets), a generic `SocketServer` and a small
   `net::tcp::TcpServer`.
 - **Event reactor**: epoll on Linux, kqueue on macOS, `WSAEventSelect` /
-  `WSAWaitForMultipleEvents` on Windows.
+  `WSAWaitForMultipleEvents` on Windows (at most 64 sockets per server there, see
+  [Limits](#limits-and-platform-notes)). Other POSIX systems (FreeBSD, ...) have no
+  reactor backend.
 - **HTTP/1.1 server** (`HttpServer`): prefix routing, keep-alive, pipelining,
   chunked request bodies, `Expect: 100-continue`, HEAD, CORS, request size limits,
   strict request parsing (ambiguous `Content-Length` / `Transfer-Encoding` framing is
@@ -29,7 +35,8 @@ HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protoc
   variant for 2024-11-05 clients, or JSON-RPC over your own STDIO loop) and `MCPClient`
   (HTTP transports), tested against the official MCP TypeScript SDK in both directions.
 - **Tested**: 500+ GoogleTest cases in CI on Ubuntu (GCC, Clang, ASan/UBSan),
-  macOS (Clang), Windows (MSVC) and MinGW-w64 (under Wine).
+  macOS (Clang), Windows (MSVC) and MinGW-w64 (under Wine), plus MCP interop with the
+  TypeScript SDK and the vcpkg port.
 
 What it is not: there is no TLS (put a reverse proxy such as nginx in front for
 HTTPS, or use it for plain-HTTP/loopback services), no HTTP/2, no WebSocket, and no
@@ -47,7 +54,7 @@ Extensively refactored and extended since. See [LICENSE](./LICENSE).
 
 | Dependency | Needed by | Notes |
 |------------|-----------|-------|
-| C++17 compiler | everything | MSVC 2019+, GCC 8+, Clang 7+ |
+| C++17 compiler | everything | CI uses current GCC, Clang, AppleClang and MSVC (VS 2022); older compilers may work. GCC 8 / Clang 7 with libstdc++ need `-lstdc++fs` (`std::filesystem` in `http_file_server.h`, included by `sockets.hpp`) |
 | System sockets + threads | everything | `ws2_32` on Windows, pthreads elsewhere (the CMake target adds both) |
 | [BS::thread_pool](https://github.com/bshoshany/thread-pool) 5.x | `http_server.h` (and everything that includes it) | Bundled as `external/BS_thread_pool.hpp`; always required, even if you never call `enableThreadPool()` |
 | [nlohmann/json](https://github.com/nlohmann/json) | MCP headers, `json_rpc.h`, and the umbrella `sockets.hpp` | Git submodule `external/nlohmann-json`, or any installed copy |
@@ -109,10 +116,13 @@ config attaches `nlohmann_json::nlohmann_json` automatically when
 `find_package(nlohmann_json)` succeeds, and `jwt-cpp` when the library was installed
 with it.
 
-### vcpkg (overlay port)
+### vcpkg (git registry or overlay port)
 
-A port lives in [`ports/socketshpp`](ports/socketshpp/README.md). It is not in the
-vcpkg registry, so use it as an overlay port in manifest mode:
+SocketsHpp is not in the official vcpkg registry. This repository is a vcpkg **git
+registry** and also contains the port in [`ports/socketshpp`](ports/socketshpp/README.md),
+so use either a `vcpkg-configuration.json` that lists
+`https://github.com/maxgolov/SocketsHpp` as a registry for `socketshpp` (see
+[docs/INTEGRATION.md](docs/INTEGRATION.md#vcpkg)), or the overlay port from a checkout:
 
 ```json
 {
@@ -128,9 +138,10 @@ cmake -S . -B build \
   -DVCPKG_OVERLAY_PORTS=/path/to/SocketsHpp/ports
 ```
 
-Then `find_package(SocketsHpp CONFIG REQUIRED)` as above. The port depends on
-`nlohmann-json` and `bshoshany-thread-pool` (>= 5.0.0); the optional `jwt` feature
-adds `jwt-cpp`. See [example 11](examples/11-vcpkg-consumption/).
+Then `find_package(SocketsHpp CONFIG REQUIRED)` as above. The port builds the
+SocketsHpp commit pinned in its `portfile.cmake` (not your checkout) and depends on
+`nlohmann-json` and `bshoshany-thread-pool` (v5 API); the optional `jwt` feature adds
+`jwt-cpp`. See [example 11](examples/11-vcpkg-consumption/).
 
 ### Without CMake
 
@@ -143,6 +154,8 @@ g++ -std=c++17 -Iinclude -Iexternal -Iexternal/nlohmann-json/single_include main
 ```
 
 ## Building this repository
+
+Requires CMake 3.20+ for the commands below (3.14+ to consume the library).
 
 ```bash
 git clone --recursive https://github.com/maxgolov/SocketsHpp.git
@@ -157,13 +170,18 @@ Tests need GoogleTest (`find_package(GTest CONFIG)`): for example
 (`-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake`, which also
 provides nlohmann-json and the thread pool from `vcpkg.json`). On multi-config
 generators (Visual Studio) add `--config Debug` to the build and `-C Debug` to ctest.
+On Windows, `cmake --preset windows-default` configures a Ninja Debug build with tests
+and vcpkg at `C:\vcpkg` (`CMakePresets.json`).
+
+The API reference is generated with `doxygen docs/Doxyfile` (output in `build/docs`);
+CI fails on any undocumented public API.
 
 ### CMake options
 
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `SOCKETSHPP_BUILD_TESTS` | `OFF` | Build the unit/functional tests and header checks (needs GoogleTest) |
-| `BUILD_EXAMPLES` | `OFF` | Build `examples/01`-`10` |
+| `BUILD_EXAMPLES` | `OFF` | Build `examples/01`-`10` (example 11 is a separate vcpkg project) |
 | `SOCKETSHPP_WARNINGS_AS_ERRORS` | `OFF` | `-Werror` / `/WX` |
 | `SOCKETSHPP_INSTALL` | `ON` for top-level builds | Generate install rules and the CMake package |
 | `SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL` | `ON` | Install `external/BS_thread_pool.hpp` with the headers |
@@ -178,9 +196,11 @@ generators (Visual Studio) add `--config Debug` to the build and `-C Debug` to c
   (GoogleTest must be built with the same toolchain).
 - **Linux ARM64** with QEMU: see [docs/ARM64.md](docs/ARM64.md).
 
-The helper scripts (`build.cmd`, `build-all.cmd`, `scripts/*.sh`, `scripts/*.ps1`,
-see [scripts/README.md](scripts/README.md)) are convenience wrappers; the plain CMake
-commands above are what CI runs.
+Helper scripts (see [scripts/README.md](scripts/README.md)): `build.sh` (Ninja build
+with tests in `out/`), `build.cmd` (runs `scripts/Build-Windows.ps1`) and
+`scripts/build-linux.sh`. `build-all.cmd` and `scripts/Install-qemu-arm64.ps1` assume
+the checkout is at `C:\build\maxgolov\SocketsHpp` with WSL `Ubuntu-24.04`. CI runs the
+plain CMake commands above.
 
 ## Usage
 
@@ -317,14 +337,41 @@ several ports (`getListeningPorts()`).
 - If no handler takes the request: `OPTIONS` gets 204 when CORS is enabled
   (`enableCors()`, `setCorsOrigin()`, `setCorsHeaders()`) and 405 otherwise; `DELETE`
   with an `Mcp-Session-Id` header terminates that session of the server's built-in
-  session manager; everything else gets 404.
+  session manager (200, or 404 if the id is unknown), and a `DELETE` without that
+  header gets 400; everything else gets 404.
 - `HEAD` is dispatched as `GET` and the body is dropped.
 - `route()` owns the callback. `addHandler(path, HttpRequestCallback&)` and
   `server[path] = callback` store a reference, so that object must outlive the server.
 
 Other knobs: `setRequestLimits(maxHeaderBytes, maxBodyBytes)` (defaults 8 KB / 2 MB;
 oversized requests get 431 / 413), `setKeepalive(false)`, and
-`createSession()` / `validateSession()` / `terminateSession()` / `setSessionTimeout()`.
+`createSession()` / `validateSession()` / `terminateSession()` / `setSessionTimeout()`
+(sessions default to a 1 h timeout and at most 10,000 at a time).
+
+`res.set_content(body, "application/json")` sets the body and its `Content-Type`;
+`set_content(body)` keeps a `Content-Type` set earlier with `set_header()` and
+otherwise uses `text/plain`.
+
+**Lifecycle and errors.** `HttpServer(name, port)` and `addListeningPort()` throw
+`std::runtime_error` if the port cannot be bound. Configure ports, routes, limits,
+CORS and the thread pool before `start()`; they are not synchronized with the
+reactor. A handler that throws gets a 500 response. `stop()` stops the reactor; a
+stopped server cannot be restarted (create a new one), and open client connections are
+closed when the server object is destroyed.
+
+**Static files.** `HttpFileServer` serves a directory:
+
+```cpp
+#include <SocketsHpp/http/server/http_file_server.h>
+
+SocketsHpp::http::server::HttpFileServer files("files", 8080, "./public");
+files.InitializeFileEndpoint(files);  // required: registers the "/" file route
+files.start();
+```
+
+As with `HttpServer(name, port)`, the first argument only names the `Server` header
+(`files:8080`); the server listens on all IPv4 interfaces. Its default name,
+`"127.0.0.1"`, does not restrict the bind address.
 
 ### Streaming and Server-Sent Events
 
@@ -369,6 +416,11 @@ then run concurrently and must be thread-safe; requests on one connection are st
 processed in order. `disableThreadPool()` / `isThreadPoolEnabled()` are available. The
 pool is `BS::thread_pool` from the bundled header, which `http_server.h` always includes.
 
+Size the pool for the number of concurrent streams: a stream callback that blocks (like
+the `sleep_for` above) holds a worker for that time, so more open streams than
+workers delay every other request. `MCPServer::listen()` uses a fixed pool of 4
+workers, so MCP handlers run concurrently and must be thread-safe.
+
 ### HTTP client
 
 ```cpp
@@ -400,6 +452,10 @@ int main()
 
 - Only `http://` URLs work: `https://` is rejected (the call returns false) instead of
   being sent in cleartext.
+- Defaults: 10 s connect timeout and 30 s per `recv`/`send` (DNS resolution is not
+  covered by the timeouts). Failures return `false` without a reason; define
+  `HAVE_CONSOLE_LOG` (or your own `LOG_ERROR`) to see why. `post()` sends no
+  `Content-Type`; use `send()` with `setContentType()` when the server needs one.
 - Redirects (301/302/303/307/308) are followed up to 10 hops (`setMaxRedirects()`,
   `setFollowRedirects(false)`). 303, and 301/302 for methods other than GET/HEAD, switch
   to GET without a body; `Authorization`, `Cookie` and `Proxy-Authorization` are dropped
@@ -649,7 +705,7 @@ int main()
 }
 ```
 
-## Platform notes
+## Limits and platform notes
 
 | Platform | Reactor | Notes |
 |----------|---------|-------|
@@ -658,8 +714,17 @@ int main()
 | Windows (x64; ARM64 not in CI) | `WSAEventSelect` + `WSAWaitForMultipleEvents` | MSVC x64 in CI; MinGW-w64 via `cmake/toolchains/mingw-w64-x86_64.cmake` (tests under Wine) |
 
 - On Windows a reactor waits on at most 64 event handles (`WSA_MAXIMUM_WAIT_EVENTS`),
-  so one server handles roughly 64 sockets at a time (listening sockets included).
+  so one server handles at most 64 sockets at a time, listening sockets included.
+  Further connections are accepted and closed immediately (logged with `LOG_WARN`).
+  Keep Windows servers behind a proxy, or well below 64 concurrent connections.
   WinSock is initialized automatically.
+- Other POSIX systems (FreeBSD, ...) have no reactor backend and are not supported.
+- `addListeningPort(port)` binds IPv4 only; use `addListeningPort("::1", port)` (or
+  `"::"`) for IPv6.
+- `TrustProxyConfig` matches exact proxy IP addresses (no CIDR ranges).
+- Protocol limits are compile-time constants in `SocketsHpp/config.h` (request
+  target 8 KB, listen backlog 10, query keys/values 256/4096 bytes, reactor poll
+  interval, ...); `setRequestLimits()` adjusts the header/body limits at run time.
 - Unix domain sockets are available on POSIX systems and on Windows when the SDK
   provides `<afunix.h>` (Windows 10 SDK 17063 or later).
 - Logging is compiled out by default. Define `HAVE_CONSOLE_LOG` to print to stdout,
@@ -694,7 +759,7 @@ See [examples/README.md](examples/README.md). Build them with
 | [08-compression](examples/08-compression/) | Large HTML response (compression is not wired in) |
 | [09-full-featured](examples/09-full-featured/) | Proxy awareness + authentication |
 | [10-typescript-interop](examples/10-typescript-interop/) | MCP interop in both directions with the official TypeScript SDK over Streamable HTTP (run in CI) |
-| [11-vcpkg-consumption](examples/11-vcpkg-consumption/) | Consuming the vcpkg overlay port with `find_package` |
+| [11-vcpkg-consumption](examples/11-vcpkg-consumption/) | Consuming SocketsHpp through the vcpkg port (overlay or git registry) with `find_package` |
 
 ## Documentation
 
@@ -702,6 +767,7 @@ See [examples/README.md](examples/README.md). Build them with
 - [docs/INTEGRATION.md](docs/INTEGRATION.md) - adding SocketsHpp to a project
 - [docs/MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md) - MCP server/client guide
 - [docs/ARM64.md](docs/ARM64.md) - ARM64 cross-compilation and QEMU testing
+- API reference: `doxygen docs/Doxyfile` (output in `build/docs`)
 - [test/README.md](test/README.md) - test suites and how to run them
 - [include/SocketsHpp/utils/README.md](include/SocketsHpp/utils/README.md) - Base64 utility
 - [ports/socketshpp/README.md](ports/socketshpp/README.md) - vcpkg port

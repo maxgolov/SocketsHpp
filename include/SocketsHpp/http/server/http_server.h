@@ -861,11 +861,20 @@ namespace http
 
             /// @brief Replace the body and set the Content-Type header.
             /// @param content Response body content
-            /// @param contentType MIME type (defaults to CONTENT_TYPE_TEXT)
-            void set_content(const std::string& content, const std::string& contentType = CONTENT_TYPE_TEXT)
+            /// @param contentType MIME type, e.g. "application/json"
+            void set_content(const std::string& content, const std::string& contentType)
             {
                 body = content;
                 headers[constants::CONTENT_TYPE] = contentType;
+            }
+
+            /// @brief Replace the body. A Content-Type already set (e.g. with set_header())
+            ///        is kept; otherwise it becomes CONTENT_TYPE_TEXT.
+            /// @param content Response body content
+            void set_content(const std::string& content)
+            {
+                body = content;
+                headers.emplace(constants::CONTENT_TYPE, CONTENT_TYPE_TEXT);
             }
 
             /// @brief Replace the response body. Unlike set_content(), Content-Type is
@@ -3004,7 +3013,8 @@ namespace http
 
                     // SSE-specific headers
                     auto contentType = conn.response.headers.find(CONTENT_TYPE);
-                    if (contentType != conn.response.headers.end() && contentType->second == CONTENT_TYPE_SSE)
+                    if (contentType != conn.response.headers.end() &&
+                        contentType->second.compare(0, std::char_traits<char>::length(CONTENT_TYPE_SSE), CONTENT_TYPE_SSE) == 0)
                     {
                         conn.response.headers[constants::CACHE_CONTROL] = constants::CACHE_CONTROL_NO_CACHE;
                         conn.response.headers[constants::X_ACCEL_BUFFERING] = "no";  // Disable nginx buffering

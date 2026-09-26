@@ -72,7 +72,7 @@ PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 cd "$PROJECT_ROOT"
 
-# Initialize git submodules (simple-uri-parser, nlohmann-json)
+# Initialize git submodules (nlohmann-json)
 echo -e "${CYAN}Initializing git submodules...${NC}"
 git submodule update --init --recursive
 
@@ -190,7 +190,6 @@ if [ "$BUILD_EXAMPLES" = true ]; then
         echo -e "${YELLOW}Warning: Some examples were not built. Check CMakeLists.txt configuration.${NC}"
     fi
     
-    echo -e "\n${YELLOW}Note: Examples 03-09 require API updates and are temporarily disabled.${NC}"
     echo -e "${YELLOW}Note: Examples require manual testing. See examples/README.md for usage.${NC}"
 fi
 

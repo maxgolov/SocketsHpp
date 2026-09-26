@@ -75,7 +75,8 @@ Builds and tests the project on Linux (including WSL).
 - CMake
 - Ninja Build System
 - GCC/G++ or Clang
-- Google Test
+
+GoogleTest is not installed; install it first (`sudo apt-get install libgtest-dev`).
 
 **Usage:**
 
@@ -97,6 +98,9 @@ chmod +x scripts/build-linux.sh
 
 # Verbose output
 ./scripts/build-linux.sh --verbose
+
+# Also build the examples
+./scripts/build-linux.sh --build-examples
 
 # Combine options
 ./scripts/build-linux.sh --release --clean --verbose
@@ -140,10 +144,9 @@ chmod +x scripts/build-arm64.sh
 ```
 
 **Output:**
-- Build directory: `build-arm64/`
+- Build directory: `build/linux-arm64/`
 - All binaries are ARM64 (aarch64) ELF executables
 - Tests run via QEMU emulation (transparent to CTest)
-- **Test Results:** 78/78 tests pass (1 disabled test)
 
 ## Quick Start
 
@@ -236,7 +239,7 @@ chmod +x scripts/build-linux.sh
 ### Windows
 
 ```powershell
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+cmake -B build -S . -DSOCKETSHPP_BUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
 cmake --build build --config Debug
 cd build
 ctest -C Debug --output-on-failure
@@ -245,7 +248,7 @@ ctest -C Debug --output-on-failure
 ### Linux
 
 ```bash
-cmake -B build -S .
+cmake -B build -S . -DSOCKETSHPP_BUILD_TESTS=ON
 cmake --build build -j$(nproc)
 cd build
 ctest --output-on-failure

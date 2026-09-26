@@ -48,3 +48,4 @@ vcpkg_installed/
 # Environment variables
 .env
 .claude/worktrees/
+.claude/settings.local.json

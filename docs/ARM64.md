@@ -26,8 +26,9 @@ The script:
 - checks for the cross-compiler and QEMU;
 - clones GoogleTest v1.14.0 and installs an ARM64 build of it into `.arm64-env/`;
 - writes the toolchain file `.arm64-env/arm64-toolchain.cmake`;
-- (re)generates the helper scripts `./build-arm64.sh` and `./test-arm64.sh` in the
-  repository root.
+- (re)generates the helper scripts `./build-arm64.sh` (tracked in the repository;
+  the setup script rewrites it identically) and `./test-arm64.sh` in the repository
+  root.
 
 `.arm64-env/` survives clean builds; delete it to start over.
 
@@ -50,9 +51,8 @@ QEMU_LD_PREFIX=/usr/aarch64-linux-gnu ctest --test-dir build/linux-arm64 --outpu
 `CMAKE_CROSSCOMPILING_EMULATOR` makes both GoogleTest's test discovery (at build time)
 and ctest run the ARM64 binaries through QEMU.
 
-The generated `./build-arm64.sh` configures the same build directory but without
-`-DSOCKETSHPP_BUILD_TESTS=ON`, so it builds no tests unless you add that option to it;
-`./test-arm64.sh` then runs ctest in `build/linux-arm64` with `QEMU_LD_PREFIX` set.
+`./build-arm64.sh` configures and builds `build/linux-arm64` with tests enabled;
+`./test-arm64.sh` then runs ctest there with `QEMU_LD_PREFIX` set.
 
 ### Checking and running binaries
 
@@ -77,8 +77,8 @@ Test binaries are in `build/linux-arm64/test/<name>` and examples in
 | Tests are slow | Expected under emulation (several times slower than native). Build a single target with `--target <name>` while iterating. |
 | Tests using IPv6 are skipped | The host (or container) has no IPv6 loopback; this is reported as "Skipped", not a failure. |
 
-`scripts/build-arm64.sh` is an older WSL-oriented variant of this flow; the steps
-above are the reference.
+`scripts/build-arm64.sh` is an older WSL-oriented variant of this flow (GoogleTest in
+`/tmp/gtest-arm64`, always builds tests); the steps above are the reference.
 
 ## Windows on ARM64
 

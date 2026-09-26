@@ -3,8 +3,9 @@
 //
 // MCP SERVER — SocketsHpp
 //
-// Implements MCP 2024-11-05 (HTTP + persistent SSE) and MCP 2025-03-26
-// (Streamable HTTP) over the SocketsHpp HTTP server. The STDIO transport is
+// Implements MCP 2025-03-26 (Streamable HTTP) and a POST-based transport for
+// protocol version 2024-11-05 (not the legacy SSE `endpoint`-event handshake) over
+// the SocketsHpp HTTP server. The STDIO transport is
 // supported only through MCPServer::processMessage(), driven by the caller: the
 // server never reads stdin itself and never binds a port in STDIO mode.
 // (MCPClient does not support STDIO.)
@@ -110,7 +111,9 @@ namespace mcp
         /// Transports (ServerConfig::transport):
         ///   - TransportType::STDIO — caller-driven: pass each message to processMessage().
         ///     The server never reads stdin and never binds a port.
-        ///   - TransportType::HTTP — POST + persistent SSE GET stream (MCP 2024-11-05).
+        ///   - TransportType::HTTP — protocol version 2024-11-05: requests and responses on
+        ///     POST, notifications on a GET SSE stream opened after initialize. This is not
+        ///     the legacy HTTP+SSE `endpoint`-event handshake.
         ///   - TransportType::HTTP_STREAMABLE — Streamable HTTP POST, optional GET stream
         ///     (MCP 2025-03-26).
         /// HTTP transports serve ServerConfig::endpoint (POST, GET, DELETE, OPTIONS) and
@@ -121,8 +124,8 @@ namespace mcp
         ///   - "notifications/initialized" → no-op (client ACK after initialize)
         ///   - "notifications/cancelled"   → sets the cancel token of the in-flight request
         ///     whose JSON-RPC id is params.requestId, within the sender's own session
-        ///   - "logging/setLevel"          → sets the minimum level for push_log()
-        ///     (server-wide, not per session)
+        ///   - "logging/setLevel"          → sets the minimum level for push_log() for
+        ///     the session that sent it (default "warning")
         /// "initialize" is handled internally (version negotiation, session creation); a
         /// simple handler registered as "initialize" supplies the result object.
         ///
@@ -1232,8 +1235,9 @@ namespace mcp
             /// @brief Handle HTTP GET request — real SSE push stream (backport from FMcpNativeTransport)
             ///
             /// Uses the per-session blocking event queue shared with push_event().
-            /// The send_chunk_stream callback blocks on the queue (up to writeDeadlineSeconds),
-            /// returning "" to terminate the stream if the session is closed or idle too long.
+            /// The send_chunk_stream callback waits up to 200 ms per call for an event, sends
+            /// an empty SSE comment when idle and ": keepalive" every writeDeadlineSeconds, and
+            /// returns "" (ending the stream) only when the queue is closed or destroyed.
             void handleHttpGet(const HttpRequest& req, HttpResponse& res)
             {
                 applyCorsHeaders(res);

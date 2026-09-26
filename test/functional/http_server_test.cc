@@ -84,6 +84,24 @@ namespace testing
         return payload;
     }
 
+    TEST(HttpResponseTest, SetContentKeepsExplicitContentType)
+    {
+        HttpResponse withHeader;
+        withHeader.set_header("content-type", "text/html");
+        withHeader.set_content("<p>hi</p>");  // no type given: keeps text/html
+        EXPECT_EQ(withHeader.headers["Content-Type"], "text/html");
+        EXPECT_EQ(withHeader.body, "<p>hi</p>");
+
+        HttpResponse plain;
+        plain.set_content("hi");
+        EXPECT_EQ(plain.headers["Content-Type"], CONTENT_TYPE_TEXT);
+
+        HttpResponse overridden;
+        overridden.set_header("Content-Type", "text/html");
+        overridden.set_content("{}", "application/json");
+        EXPECT_EQ(overridden.headers["Content-Type"], "application/json");
+    }
+
     class HttpServerEndToEndTest : public ::testing::TestWithParam<bool>
     {
     };

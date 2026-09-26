@@ -220,6 +220,16 @@ namespace net
                     };
 #endif
 
+                    if (reactor.socketCount() >= Reactor::maxSockets())
+                    {
+                        // Windows: one more socket would make WSAWaitForMultipleEvents()
+                        // fail for every socket, stalling the whole server. Refuse this one.
+                        LOG_WARN("Server: too many connections (%u), refusing a new one",
+                            static_cast<unsigned>(Reactor::maxSockets()));
+                        csocket.close();
+                        return;
+                    }
+
                     LOCKGUARD(connections_mutex);
                     csocket.setNonBlocking();
                     Connection& conn = connections[csocket];

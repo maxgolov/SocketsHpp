@@ -104,6 +104,43 @@ namespace
         server.Stop();
     }
 
+    // Windows: one reactor can wait on at most 64 sockets. Connections beyond that must
+    // be refused; before, WSAWaitForMultipleEvents() failed for every socket and the
+    // server stopped serving everyone, even after the extra clients went away.
+    TEST(SocketServerTest, RefusesConnectionsBeyondReactorLimit)
+    {
+        if (Reactor::maxSockets() == static_cast<size_t>(-1))
+            GTEST_SKIP() << "no per-reactor socket limit on this platform";
+
+        SocketServer server(SocketAddr("127.0.0.1:0"), SocketParams{AF_INET, SOCK_STREAM, 0});
+        ASSERT_TRUE(server.is_bound);
+        installEcho(server);
+        server.Start();
+
+        std::vector<Socket> clients;
+        for (size_t i = 0; i < Reactor::maxSockets() + 8; i++)
+        {
+            clients.emplace_back(server.server_socket_params);
+            ASSERT_TRUE(clients.back().connect(server.address()));
+        }
+        // Listening socket + accepted clients never exceed the limit.
+        EXPECT_TRUE(waitFor([&] { return connectionCount(server) == Reactor::maxSockets() - 1; }));
+
+        for (auto& client : clients)
+            client.close();
+        EXPECT_TRUE(waitFor([&] { return connectionCount(server) == 0; }));
+
+        // The server still works once the extra clients are gone.
+        Socket client(server.server_socket_params);
+        setRecvTimeout(client, 5000);
+        ASSERT_TRUE(client.connect(server.address()));
+        const std::string msg = "still alive";
+        ASSERT_EQ(client.send(msg.data(), msg.size()), static_cast<int>(msg.size()));
+        EXPECT_EQ(recvExactly(client, msg.size()), msg);
+        client.close();
+        server.Stop();
+    }
+
     TEST(SocketServerTest, TcpClientDisconnectRemovesConnection)
     {
         SocketServer server(SocketAddr("127.0.0.1:0"), SocketParams{AF_INET, SOCK_STREAM, 0});

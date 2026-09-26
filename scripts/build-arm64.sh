@@ -33,9 +33,10 @@ echo "ARM64 Cross-Compilation Build"
 echo "========================================"
 echo ""
 
-cd "$(dirname "$0")/.."
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 
-# Initialize git submodules (simple-uri-parser, nlohmann-json)
+# Initialize git submodules (nlohmann-json)
 echo "Initializing git submodules..."
 git submodule update --init --recursive
 
@@ -92,7 +93,7 @@ if [ ! -d "$GTEST_ARM64_DIR/lib" ]; then
 fi
 
 # Create ARM64 build directory
-cd "$(dirname "${BASH_SOURCE[0]}")/.."  # repository root
+cd "$ROOT"
 echo "Creating ARM64 build directory..."
 rm -rf build/linux-arm64
 mkdir -p build/linux-arm64
@@ -166,7 +167,6 @@ if [ "$BUILD_EXAMPLES" = true ]; then
     fi
     
     echo ""
-    echo "Note: Examples 03-09 require API updates and are temporarily disabled."
     echo "Note: Examples require manual testing. See examples/README.md for usage."
 fi
 

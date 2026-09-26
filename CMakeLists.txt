@@ -57,7 +57,6 @@ option(SOCKETSHPP_BUILD_TESTS "Build SocketsHpp tests" OFF)
 include(CTest)
 
 include_directories(include)
-include_directories(external/simple-uri-parser)
 
 # Try to find nlohmann-json from vcpkg first
 find_package(nlohmann_json CONFIG QUIET)

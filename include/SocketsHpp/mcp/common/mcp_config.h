@@ -26,7 +26,7 @@ namespace mcp
     enum class TransportType
     {
         STDIO,            ///< JSON-RPC over stdin/stdout. Server: caller-driven via MCPServer::processMessage() (no port is bound). Not supported by MCPClient.
-        HTTP,             ///< HTTP POST + persistent SSE GET stream (MCP 2024-11-05).
+        HTTP,             ///< Protocol version 2024-11-05 over POST, notifications on a GET SSE stream opened after initialize (not the legacy SSE `endpoint`-event handshake).
         HTTP_STREAMABLE   ///< Streamable HTTP: POST returns JSON or SSE; GET stream optional (MCP 2025-03-26).
     };
 

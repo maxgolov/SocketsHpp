@@ -1281,6 +1281,26 @@ namespace net
 #endif
             }
 
+            /// @brief Number of sockets currently registered (listening sockets included).
+            /// @note Thread-safe.
+            size_t socketCount()
+            {
+                LOCKGUARD(m_sockets_mutex);
+                return m_sockets.size();
+            }
+
+            /// @brief Maximum number of sockets one reactor can watch: WSA_MAXIMUM_WAIT_EVENTS
+            ///        (64) on Windows, where WSAWaitForMultipleEvents() fails beyond that;
+            ///        unlimited (SIZE_MAX) with epoll and kqueue.
+            static constexpr size_t maxSockets()
+            {
+#ifdef _WIN32
+                return WSA_MAXIMUM_WAIT_EVENTS;
+#else
+                return static_cast<size_t>(-1);
+#endif
+            }
+
             /// @brief Register a socket or update its armed flags.
             /// @param socket Socket to watch (not owned).
             /// @param flags Bit mask of State values; 0 is equivalent to removeSocket().
