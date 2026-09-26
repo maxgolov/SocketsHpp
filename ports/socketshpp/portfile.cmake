@@ -1,22 +1,27 @@
-# Used as an overlay port from a SocketsHpp checkout (vcpkg --overlay-ports or
-# VCPKG_OVERLAY_PORTS=<repo>/ports), build the local source tree. When publishing
-# the port to a registry, pin REF to a release tag and fill in its SHA512.
-set(SOCKETSHPP_LOCAL_SOURCE "${CMAKE_CURRENT_LIST_DIR}/../..")
-if(EXISTS "${SOCKETSHPP_LOCAL_SOURCE}/include/sockets.hpp")
-    set(SOURCE_PATH "${SOCKETSHPP_LOCAL_SOURCE}")
-else()
-    vcpkg_from_github(
-        OUT_SOURCE_PATH SOURCE_PATH
-        REPO maxgolov/SocketsHpp
-        REF main
-        SHA512 0
-        HEAD_REF main
-    )
-endif()
+# Builds SocketsHpp from the public GitHub repository at a pinned commit, so the
+# port behaves the same from an overlay directory, a copy of it, or the git
+# registry in this repository (see ports/socketshpp/README.md).
+# To release: point REF at the new tag or commit and update SHA512 (vcpkg prints
+# the expected value when it does not match).
+vcpkg_from_github(
+    OUT_SOURCE_PATH SOURCE_PATH
+    REPO maxgolov/SocketsHpp
+    REF 614606f5290965e6372e33ce783562ea55e986de
+    SHA512 b12beb4dd8f79b9c356a5e0bdf312b818da6f9a3d5e7e928008e7bea7d9bef80d3bca46fb5b7c4f8e097df975f86404c6189143d94e4065814ae4c9ff42e9d21
+    HEAD_REF main
+)
+
+# The library finds jwt-cpp on its own; tie that to the "jwt" feature so the package
+# never picks up a jwt-cpp that happens to be installed without the feature.
+vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
+    INVERTED_FEATURES
+        jwt CMAKE_DISABLE_FIND_PACKAGE_jwt-cpp
+)
 
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
+        ${FEATURE_OPTIONS}
         -DBUILD_TESTING=OFF
         -DBUILD_EXAMPLES=OFF
         -DSOCKETSHPP_BUILD_TESTS=OFF

@@ -120,7 +120,7 @@ echo ""
 
 # Step 5: Run the example
 echo "[5/5] Running example..."
-echo "Starting HTTP server on http://localhost:9000"
+echo "Starting HTTP server on http://127.0.0.1:9000"
 echo "Press Ctrl+C to stop"
 echo ""
 

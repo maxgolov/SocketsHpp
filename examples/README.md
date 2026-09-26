@@ -34,8 +34,8 @@ consumes SocketsHpp as an installed vcpkg package (see its README).
 | [07-authentication](07-authentication/) | `authenticated-api` | Bearer token and API key checks done inside route handlers |
 | [08-compression](08-compression/) | `compression-server` | Serves a large HTML page; compression is **not** applied (the README shows how to add it) |
 | [09-full-featured](09-full-featured/) | `full-featured-server` | Proxy awareness plus Bearer/API-key authentication |
-| [10-typescript-interop](10-typescript-interop/) | `cpp_server`, `cpp_client` | JSON-RPC (MCP-style) interop between C++ and TypeScript clients/servers |
-| [11-vcpkg-consumption](11-vcpkg-consumption/) | `vcpkg-consumer` | A separate project using the vcpkg overlay port and `find_package(SocketsHpp)` |
+| [10-typescript-interop](10-typescript-interop/) | `cpp_server`, `cpp_client` | `MCPServer`/`MCPClient` interop in both directions with the official MCP TypeScript SDK (run in CI) |
+| [11-vcpkg-consumption](11-vcpkg-consumption/) | `vcpkg-consumer` | A separate project that gets SocketsHpp through the vcpkg port (overlay or git registry) and uses `find_package(SocketsHpp)` |
 
 The HTTP servers use `HttpServer(name, port)`, which listens on **all IPv4
 interfaces** (the name only appears in the `Server` response header, so
@@ -47,7 +47,7 @@ For a real MCP server and client, see `SocketsHpp::mcp::server::MCPServer` and
 
 ## Requirements
 
-- C++17 compiler and CMake 3.14+ (examples 06-09 declare 3.20, example 10 3.21)
+- C++17 compiler and CMake 3.14+ (example 11: 3.15)
 - The dependencies listed in the [main README](../README.md#dependencies): the bundled
   `external/BS_thread_pool.hpp`, and nlohmann/json (every example includes
   `sockets.hpp`)

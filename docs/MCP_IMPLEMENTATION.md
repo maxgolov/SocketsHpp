@@ -26,9 +26,16 @@ header-only and built on the library's own HTTP server and client.
 
 | `TransportType` | Protocol revision | Server | Client |
 |-----------------|-------------------|--------|--------|
-| `HTTP` | 2024-11-05 (HTTP + SSE) | POST for requests, GET for the notification stream | yes |
+| `HTTP` | 2024-11-05 protocol version, POST-based | POST for requests and responses; GET notification stream opened after `initialize` | yes |
 | `HTTP_STREAMABLE` | 2025-03-26 (Streamable HTTP) | POST returns JSON or SSE; optional GET stream | yes |
 | `STDIO` | any | no listener: feed messages to `processMessage()` from your own stdin/stdout loop | **not supported** (`connect()` returns false) |
+
+The `HTTP` transport speaks protocol version 2024-11-05 but is **not** the legacy
+2024-11-05 "HTTP with SSE" transport: there is no `endpoint` event handshake, the
+session is created by a POST `initialize`, and responses come back in the POST
+body. Standard legacy-SSE clients and servers are therefore not compatible with it;
+use `HTTP_STREAMABLE` for interoperability (it is what the official SDKs speak, see
+[example 10](../examples/10-typescript-interop/)).
 
 Both HTTP transports are plain HTTP. There is no TLS: the client rejects `https://`
 URLs, and the server should sit behind a TLS-terminating reverse proxy when it is
@@ -110,7 +117,7 @@ Key points:
 | `ping` | Returns `{}`. |
 | `notifications/initialized` | Accepted, no-op. |
 | `notifications/cancelled` | Sets the cancel token of the in-flight request whose id is `params.requestId`, in the same session. |
-| `logging/setLevel` | Sets the minimum level for `push_log()` (default `warning`); invalid levels get `-32602`. |
+| `logging/setLevel` | Sets the minimum level for `push_log()` for the calling session (default `warning`); invalid levels get `-32602`. |
 
 Registering one of these names replaces the built-in (for `initialize`, see below).
 
@@ -122,8 +129,7 @@ otherwise with `2025-03-26` (the client then decides whether to continue).
 
 If you registered an `initialize` handler, its result object is returned with
 `protocolVersion` overwritten by the negotiated version. Otherwise the server returns
-`{"protocolVersion": ..., "capabilities": {}, "serverInfo": server_info()}` (name,
-version and latest protocol version).
+`{"protocolVersion": <negotiated>, "capabilities": {}, "serverInfo": {"name": serverName, "version": serverVersion}}`.
 Register a handler to advertise capabilities such as `tools`.
 
 The client's `capabilities` are stored per session and can be read with
@@ -139,9 +145,13 @@ The client's `capabilities` are stored per session and can be read with
   produce no entry, and a batch of only notifications gets `202 Accepted` (HTTP) or an
   empty string (`processMessage()`).
 - Request ids may be strings, integers (the full `int64` range, kept without narrowing)
-  or `null`. Other ids, and unsigned values above `INT64_MAX`, are rejected with
-  `-32600 Invalid Request`, as are messages whose `jsonrpc` is not `"2.0"`, whose
-  `method` is missing, or whose `params` is not an object or array.
+  or `null` (accepted for JSON-RPC compatibility, although MCP forbids null ids).
+  Other ids, and unsigned values above `INT64_MAX`, are rejected with
+  `-32600 Invalid Request`, as are messages whose `jsonrpc` member is present but not
+  `"2.0"` (a missing `jsonrpc` is tolerated), whose `method` is missing, or whose
+  `params` is not an object or array.
+- JSON-RPC *responses* sent by a client are rejected with `-32600` (HTTP 400): the
+  server never sends requests to clients, so it does not expect responses.
 - Notifications (no `id`) never get a response; errors in notification handlers are
   logged and dropped.
 
@@ -155,6 +165,8 @@ The client's `capabilities` are stored per session and can be read with
 | `OPTIONS <endpoint>` | CORS preflight, 204. | Same. |
 | `GET /health` | `server_info()` as JSON. | Same. |
 | Notification-only POST | `202 Accepted`, empty body. | Same. |
+| Invalid JSON or JSON-RPC | 400 with a JSON-RPC error body (`-32700` / `-32600`). | Same. |
+| Any other method | 405 with `Allow: GET, POST, DELETE, OPTIONS`. | Same. |
 
 The default endpoint is `/mcp` (`config.endpoint`). Request bodies above
 `config.maxMessageSize` (4 MB) are rejected with 413.
@@ -180,7 +192,8 @@ returns its id in the `Mcp-Session-Id` response header (`session.headerName`).
 ### Server-initiated messages
 
 Messages from server to client travel on the session's notification stream (the GET
-endpoint):
+endpoint). Only notifications can be sent: server-to-client requests (sampling,
+`roots/list`, server `ping`) are not supported.
 
 ```cpp
 // From any thread, e.g. inside a tools/call handler:
@@ -196,12 +209,17 @@ server.push_event(sessionId, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"metho
 - With **Streamable HTTP** the queue is created at `initialize`, so events pushed before
   the client opens GET are kept and delivered when it does. With **legacy HTTP** the
   queue is created by the GET request, so `push_event()` returns false until then.
-- One stream per session: a new GET replaces the previous stream (which is closed; its
-  undelivered events move to the new stream).
+- One stream per session: a new GET replaces the previous stream, which is closed. Its
+  undelivered events move to the new stream, except on a resuming GET
+  (`Last-Event-ID`), which replays the history instead.
 - While idle the stream sends empty SSE comments a few times per second and a
   `: keepalive` comment every `sseWriteDeadlineSeconds` (30 s). The stream ends on `stop()`, on `DELETE`, when the
-  session expires, or when `cleanupStaleSessions(idleSeconds)` removes it; call that
-  periodically if clients may disappear without `DELETE`.
+  session expires (`session.sessionTimeoutSeconds` without activity), or when
+  `cleanupStaleSessions(idleSeconds)` closes idle notification queues. That call does
+  not end the MCP session itself; call it periodically if clients may disappear
+  without `DELETE`.
+- Session ids are `session-` followed by 32 hex digits (128 random bits), and the GET
+  stream response echoes `Mcp-Session-Id`.
 - To find the session inside a handler, have the client send it in the parameters
   (for example a progress token) or keep your own mapping; handlers receive only
   `params`.
@@ -216,8 +234,10 @@ With `resumability.enabled = true`:
 - a GET with `Last-Event-ID: <id>` replays the recorded events that follow `<id>` and
   then continues live. If `<id>` is not in the history, nothing is replayed.
 
-History lives as long as the session. `resumability.historyDurationMs` is stored but
-not currently enforced; the size limit is what bounds the history.
+History lives as long as the session and is bounded both by size
+(`resumability.maxHistorySize`) and by age: events older than
+`resumability.historyDurationMs` (default 5 minutes) are dropped and can no longer be
+replayed.
 
 ### Cancellation
 
@@ -236,7 +256,9 @@ server.registerCancellable("tools/call",
 
 A `notifications/cancelled` with `params.requestId` equal to the in-flight request's
 JSON-RPC id (and sent in the same session) sets the token. Handlers run on the HTTP
-server's worker pool, so the notification is processed while the request runs.
+server's worker pool, so the notification is processed while the request runs. The
+exception thrown above is still sent back as an error response (`-32603`); the server
+does not suppress responses to cancelled requests.
 
 ### Authentication
 
@@ -248,15 +270,20 @@ config.auth.validator = [](const std::string& token) { return token == "expected
 
 | `auth.type` | Header (`auth.headerName`) | Validation |
 |-------------|----------------------------|------------|
-| `BEARER` | `Authorization`; the `Bearer ` prefix is stripped | `validator`, else JWT (HS256, key `secretOrPublicKey`) when built with jwt-cpp |
+| `BEARER` | `Authorization`; the `Bearer ` prefix is stripped (a value without it is used as-is) | `validator`, else JWT (HS256, key `secretOrPublicKey`) when built with jwt-cpp |
 | `API_KEY` | set `headerName = "x-api-key"` (or any header) | `validator`, else constant-time comparison with `secretOrPublicKey` |
 | `CAPABILITY_TOKEN` | always `X-MCP-Capability-Token` | `validator`, else constant-time comparison with `secretOrPublicKey` |
+| `NONE` | `auth.headerName`, raw value | `validator` only |
 
-- Header names match case-insensitively. Missing or invalid credentials get 401.
+- Header names match case-insensitively. Missing or invalid credentials get 401 with a
+  `WWW-Authenticate` header.
 - If auth is enabled but nothing can validate (no `validator`, no usable secret, or
-  `BEARER` with a secret but no jwt-cpp), requests get **500**: the server fails closed.
-- JWT validation checks the HS256 signature; add your own `validator` (it takes
-  precedence) for issuer/audience/expiry rules or other algorithms.
+  `BEARER` with a secret but no jwt-cpp), requests that carry a credential get
+  **500**: the server fails closed.
+- JWT validation checks the HS256 signature (other algorithms, including `none`, are
+  rejected) and the time claims jwt-cpp verifies by default (`exp`, `nbf`, `iat`).
+  Issuer and audience are not checked; add your own `validator` (it takes precedence)
+  for those or for other algorithms.
 - Authentication applies to POST, GET and DELETE on the endpoint, not to `OPTIONS` or
   `/health`.
 
@@ -275,6 +302,11 @@ Every endpoint response (and `/health`) carries the headers from `config.cors`:
 `allowOrigin` (default `*`), `allowMethods`, `allowHeaders`, `exposeHeaders` (includes
 `Mcp-Session-Id`) and `maxAge`. `OPTIONS` answers 204. Narrow `allowOrigin` for
 browser-facing deployments.
+
+The server does not validate the `Origin` request header, which the 2025-03-26 spec
+requires of Streamable HTTP servers to prevent DNS-rebinding attacks. Keep the default
+loopback bind, or for browser-reachable deployments put a reverse proxy in front that
+rejects unexpected origins, and enable `auth`.
 
 ### STDIO transport
 
@@ -391,8 +423,11 @@ int main()
   `subscribeResource(uri)`, `unsubscribeResource(uri)`, `listResourceTemplates()`.
   The `list*` helpers return the array (`tools`, `prompts`, ...); the others return the
   `result` object. Request ids are sequential integers.
-- Responses may be `application/json` or `text/event-stream`; notifications that
-  arrive in an SSE response before the result are dispatched to the handlers.
+- Responses may be `application/json` or `text/event-stream`; notifications in an SSE
+  response are dispatched to the handlers. The whole SSE body is read, so a server
+  that keeps a POST stream open blocks the call until the read timeout.
+- `initialize()` sends empty client capabilities and does not check the
+  `protocolVersion` the server answers with.
 - `onNotification(method, handler)` registers a handler and opens the server's
   notification stream (GET with `Mcp-Session-Id` and the configured headers, using
   `SSEClient` with auto-reconnect and `Last-Event-ID`). The stream is also opened after
@@ -403,8 +438,10 @@ int main()
 - `disconnect()` (also run by the destructor) stops the notification stream and sends
   `DELETE` to end the session.
 - `sessionId()`, `isConnected()` and `getServerCapabilities()` expose state.
-- `ClientConfig::maxRetries`, `retryBackoffMs` and `readTimeoutSeconds` are not used
-  by the current client; use `http.timeoutSeconds` for the read timeout.
+- `ClientConfig::maxRetries`, `retryBackoffMs`, `readTimeoutSeconds` and
+  `HttpConfig::historyDurationMs` are not used by the current client; use
+  `http.timeoutSeconds` for the read timeout. If the server answers the notification
+  stream GET with 405, the `SSEClient` retries every 3 s and reports it via `onStatus`.
 
 ### Loading VS Code `mcp.json` entries
 
@@ -421,8 +458,10 @@ SocketsHpp::mcp::ClientConfig loadServer(const std::string& path, const std::str
 ```
 
 `fromJson()` maps `"type"`: `stdio` to `STDIO` (fills `stdio.command`, `args`, `env`,
-`envFile`, `cwd`), `http` and `sse` to `HTTP`, `streamable` and `http-streamable` to
-`HTTP_STREAMABLE` (fills `http.url`, `headers`, `timeout`), and throws
+`envFile`, `cwd`), `http` (what VS Code writes for Streamable HTTP servers),
+`streamable` and `http-streamable` to `HTTP_STREAMABLE`, and `sse` to `HTTP` (which
+does not implement the legacy SSE handshake, see [Transports](#transports)); HTTP
+entries fill `http.url`, `headers`, `timeout`. It throws
 `std::invalid_argument` for anything else. VS Code `${input:...}` variables are not
 expanded, and STDIO configurations can be parsed but not connected.
 

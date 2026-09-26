@@ -22,7 +22,7 @@ nlohmann/json is provided.
 | [add_subdirectory (git submodule)](#add_subdirectory-git-submodule) | Pinning the exact commit in your repository |
 | [FetchContent](#fetchcontent) | CMake-only projects without a package manager |
 | [Install + find_package](#install--find_package) | System-wide or prefix installs, other build systems via the installed headers |
-| [vcpkg overlay port](#vcpkg-overlay-port) | Projects that already use vcpkg |
+| [vcpkg](#vcpkg) (git registry or overlay port) | Projects that already use vcpkg |
 | [Manual include paths](#manual-include-paths-no-cmake) | Makefiles, IDE projects |
 
 ## add_subdirectory (git submodule)
@@ -96,13 +96,39 @@ configured with it, and attaches `nlohmann_json::nlohmann_json` to
 `SocketsHpp::SocketsHpp` whenever `find_package(nlohmann_json CONFIG)` succeeds.
 The version file uses `SameMajorVersion` compatibility.
 
-## vcpkg overlay port
+## vcpkg
 
-The repository contains a port at [`ports/socketshpp`](../ports/socketshpp/README.md).
-It is not part of the official vcpkg registry, so point vcpkg at the `ports`
-directory as an overlay.
+The repository contains a port at [`ports/socketshpp`](../ports/socketshpp/README.md)
+and is itself a vcpkg **git registry** (`ports/` + `versions/`). SocketsHpp is not in
+the official vcpkg registry, so use one of these.
 
-**Manifest mode.** Add the dependency to your `vcpkg.json`:
+**Git registry (no checkout needed).** Next to your `vcpkg.json`, add a
+`vcpkg-configuration.json`:
+
+```json
+{
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "<a microsoft/vcpkg commit SHA>"
+  },
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/maxgolov/SocketsHpp",
+      "baseline": "<a maxgolov/SocketsHpp commit SHA, e.g. the latest on main>",
+      "packages": [ "socketshpp" ]
+    }
+  ]
+}
+```
+
+**Overlay port (from a checkout).** Pass
+`-DVCPKG_OVERLAY_PORTS=/path/to/SocketsHpp/ports` when configuring, list the directory
+under `"overlay-ports"` in `vcpkg-configuration.json`, or in classic mode run
+`vcpkg install socketshpp --overlay-ports=/path/to/SocketsHpp/ports`.
+
+Then add the dependency to your `vcpkg.json`:
 
 ```json
 {
@@ -113,32 +139,15 @@ directory as an overlay.
 ```
 
 (write `{ "name": "socketshpp", "features": [ "jwt" ] }` instead to get JWT support),
-then configure with the overlay:
+configure with the vcpkg toolchain file
+(`-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake`), and use
+`find_package(SocketsHpp CONFIG REQUIRED)` with `SocketsHpp::SocketsHpp`.
 
-```bash
-cmake -S . -B build \
-  -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
-  -DVCPKG_OVERLAY_PORTS=/path/to/SocketsHpp/ports
-```
-
-Alternatively list the directory in a `vcpkg-configuration.json` next to `vcpkg.json`:
-
-```json
-{
-  "overlay-ports": [ "/path/to/SocketsHpp/ports" ]
-}
-```
-
-**Classic mode:**
-
-```bash
-vcpkg install socketshpp --overlay-ports=/path/to/SocketsHpp/ports
-```
-
-Either way, use `find_package(SocketsHpp CONFIG REQUIRED)` and link
-`SocketsHpp::SocketsHpp`. The port pulls in `nlohmann-json` and
-`bshoshany-thread-pool` (>= 5.0.0). A complete project is in
-[examples/11-vcpkg-consumption](../examples/11-vcpkg-consumption/).
+The port pulls in `nlohmann-json` and `bshoshany-thread-pool`, and builds SocketsHpp
+from GitHub at the commit pinned in its `portfile.cmake`, not from your checkout; to
+build a local working tree use `add_subdirectory` or `FetchContent` instead. A complete
+project is in [examples/11-vcpkg-consumption](../examples/11-vcpkg-consumption/); CI
+builds it through the port in both modes.
 
 ## Manual include paths (no CMake)
 
@@ -193,7 +202,7 @@ int main()
 | Errors around `BS::thread_pool<>` | An old (v3/v4) `BS_thread_pool.hpp` is found first. SocketsHpp needs v5. |
 | Undefined references to `WSAStartup`, `socket`, ... with MinGW | Link `ws2_32` (the CMake target does this). |
 | Undefined references to `pthread_*` | Link threads (`-pthread`, or `Threads::Threads`). |
-| `Could not find a package configuration file provided by "SocketsHpp"` | Set `CMAKE_PREFIX_PATH` to the install prefix, or use the vcpkg toolchain file with the overlay port. |
+| `Could not find a package configuration file provided by "SocketsHpp"` | Set `CMAKE_PREFIX_PATH` to the install prefix, or use the vcpkg toolchain file with the port (see [vcpkg](#vcpkg)). |
 | `SSRF guard: refusing to bind to non-loopback address` | `MCPServer` binds loopback only unless `ServerConfig::allowNonLoopback` is set. |
 
 ## Next steps

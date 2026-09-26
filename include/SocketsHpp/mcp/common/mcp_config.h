@@ -412,9 +412,11 @@ namespace mcp
         int readTimeoutSeconds = 30;
 
         /// @brief Load from a VS Code mcp.json server entry.
-        /// @param j Object with "type": "stdio", "http" / "sse" (TransportType::HTTP) or
-        ///          "streamable" / "http-streamable" (TransportType::HTTP_STREAMABLE), plus
-        ///          the fields read by StdioConfig::fromJson() or HttpConfig::fromJson().
+        /// @param j Object with "type": "stdio", "http" / "streamable" / "http-streamable"
+        ///          (TransportType::HTTP_STREAMABLE; "http" is what VS Code writes for
+        ///          Streamable HTTP servers) or "sse" (TransportType::HTTP, which does not
+        ///          implement the legacy SSE endpoint handshake), plus the fields read by
+        ///          StdioConfig::fromJson() or HttpConfig::fromJson().
         /// @return Parsed configuration.
         /// @throws std::invalid_argument for an unknown "type"; nlohmann::json::exception
         ///         for missing/mistyped fields.
@@ -428,13 +430,14 @@ namespace mcp
                 config.transport = TransportType::STDIO;
                 config.stdio = StdioConfig::fromJson(j);
             }
-            else if (type == "http" || type == "sse")
+            else if (type == "sse")
             {
                 config.transport = TransportType::HTTP;
                 config.http = HttpConfig::fromJson(j);
             }
-            else if (type == "streamable" || type == "http-streamable")
+            else if (type == "http" || type == "streamable" || type == "http-streamable")
             {
+                // VS Code's "http" is the Streamable HTTP transport (2025-03-26).
                 config.transport = TransportType::HTTP_STREAMABLE;
                 config.http = HttpConfig::fromJson(j);
             }

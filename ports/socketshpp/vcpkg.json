@@ -6,6 +6,8 @@
   "license": "Apache-2.0",
   "supports": "!uwp",
   "dependencies": [
+    "bshoshany-thread-pool",
+    "nlohmann-json",
     {
       "name": "vcpkg-cmake",
       "host": true
@@ -13,9 +15,7 @@
     {
       "name": "vcpkg-cmake-config",
       "host": true
-    },
-    "nlohmann-json",
-    "bshoshany-thread-pool"
+    }
   ],
   "features": {
     "jwt": {

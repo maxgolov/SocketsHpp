@@ -12,16 +12,9 @@ find_package(SocketsHpp CONFIG REQUIRED)
 # Create executable
 add_executable(vcpkg-consumer main.cpp)
 
-# Link SocketsHpp (header-only, brings in dependencies)
+# Header-only: the target brings the include paths, C++17, threads, ws2_32 on
+# Windows and nlohmann-json (also installed by vcpkg)
 target_link_libraries(vcpkg-consumer PRIVATE SocketsHpp::SocketsHpp)
-
-# Platform-specific settings
-if(WIN32)
-    target_compile_definitions(vcpkg-consumer PRIVATE _WIN32_WINNT=0x0601)
-    target_link_libraries(vcpkg-consumer PRIVATE ws2_32)
-else()
-    target_link_libraries(vcpkg-consumer PRIVATE pthread)
-endif()
 
 # Installation (optional)
 install(TARGETS vcpkg-consumer DESTINATION bin)

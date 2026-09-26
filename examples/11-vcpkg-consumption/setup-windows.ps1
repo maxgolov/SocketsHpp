@@ -131,7 +131,7 @@ Write-Host ""
 
 # Step 5: Run the example
 Write-Host "[5/5] Running example..." -ForegroundColor Yellow
-Write-Host "Starting HTTP server on http://localhost:9000" -ForegroundColor Gray
+Write-Host "Starting HTTP server on http://127.0.0.1:9000" -ForegroundColor Gray
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Gray
 Write-Host ""
 

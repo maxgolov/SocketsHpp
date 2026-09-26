@@ -25,8 +25,9 @@ HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protoc
 - **Server helpers**: authentication strategies (Bearer, API key, Basic),
   a pluggable compression registry (you bring the codec), and reverse-proxy
   helpers (`X-Forwarded-*`, RFC 7239 `Forwarded`) with trusted-proxy configuration.
-- **MCP**: JSON-RPC 2.0 layer, `MCPServer` (HTTP+SSE 2024-11-05, Streamable HTTP
-  2025-03-26, or JSON-RPC over your own STDIO loop) and `MCPClient` (HTTP transports).
+- **MCP**: JSON-RPC 2.0 layer, `MCPServer` (Streamable HTTP 2025-03-26, a POST-based
+  variant for 2024-11-05 clients, or JSON-RPC over your own STDIO loop) and `MCPClient`
+  (HTTP transports), tested against the official MCP TypeScript SDK in both directions.
 - **Tested**: 500+ GoogleTest cases in CI on Ubuntu (GCC, Clang, ASan/UBSan),
   macOS (Clang), Windows (MSVC) and MinGW-w64 (under Wine).
 
@@ -618,7 +619,7 @@ using json = nlohmann::json;
 int main()
 {
     ClientConfig config;
-    config.transport = TransportType::HTTP_STREAMABLE;  // or HTTP (2024-11-05); STDIO is not supported
+    config.transport = TransportType::HTTP_STREAMABLE;  // or HTTP (see docs); STDIO is not supported
     config.http.url = "http://127.0.0.1:8080/mcp";      // http:// only
     config.http.headers["Authorization"] = "Bearer my-token";
 
@@ -692,7 +693,7 @@ See [examples/README.md](examples/README.md). Build them with
 | [07-authentication](examples/07-authentication/) | Bearer token / API key checks in handlers |
 | [08-compression](examples/08-compression/) | Large HTML response (compression is not wired in) |
 | [09-full-featured](examples/09-full-featured/) | Proxy awareness + authentication |
-| [10-typescript-interop](examples/10-typescript-interop/) | JSON-RPC interop with TypeScript client/server |
+| [10-typescript-interop](examples/10-typescript-interop/) | MCP interop in both directions with the official TypeScript SDK over Streamable HTTP (run in CI) |
 | [11-vcpkg-consumption](examples/11-vcpkg-consumption/) | Consuming the vcpkg overlay port with `find_package` |
 
 ## Documentation

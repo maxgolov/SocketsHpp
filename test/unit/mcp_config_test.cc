@@ -78,7 +78,8 @@ TEST(MCPConfigTest, ClientConfigFromJsonHttp) {
 
     auto config = ClientConfig::fromJson(server_json);
     
-    EXPECT_EQ(config.transport, TransportType::HTTP);
+    // VS Code writes "type": "http" for Streamable HTTP servers.
+    EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
     EXPECT_EQ(config.http.url, "http://localhost:3000/mcp");
     EXPECT_EQ(config.http.headers["Authorization"], "Bearer xyz");
 }
@@ -212,6 +213,13 @@ TEST(MCPConfigTest, ClientConfigFromJsonHttpStreamableAlias) {
     json server_json = {{"type", "http-streamable"}, {"url", "http://localhost:3601/mcp"}};
     auto config = ClientConfig::fromJson(server_json);
     EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
+}
+
+TEST(MCPConfigTest, ClientConfigFromJsonSseUsesHttpTransport) {
+    json server_json = {{"type", "sse"}, {"url", "http://localhost:3000/sse"}};
+    auto config = ClientConfig::fromJson(server_json);
+    EXPECT_EQ(config.transport, TransportType::HTTP);
+    EXPECT_EQ(config.http.url, "http://localhost:3000/sse");
 }
 
 TEST(MCPConfigTest, ClientConfigDefaultTransportInitialized) {

@@ -235,3 +235,23 @@ jobs:
       # TypeScript SDK client -> C++ MCPServer, then C++ MCPClient -> TypeScript SDK server.
       - name: Run interop in both directions
         run: examples/10-typescript-interop/run-interop.sh build/examples/10-typescript-interop
+
+  vcpkg-port:
+    name: ubuntu-latest / vcpkg port (overlay and git registry)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # registry mode fetches the port tree from this repository's history
+
+      - name: Set up vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+
+      # Builds examples/11-vcpkg-consumption through ports/socketshpp (which downloads
+      # the pinned SocketsHpp commit from GitHub), once as an overlay port and once
+      # with this repository as a git registry, and checks versions/ is up to date.
+      - name: Test the vcpkg port
+        run: scripts/test-vcpkg-port.sh "$RUNNER_TEMP/vcpkg"

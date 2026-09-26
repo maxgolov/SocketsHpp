@@ -2,133 +2,102 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /// @file main.cpp
-/// @brief Example demonstrating SocketsHpp consumption via vcpkg
+/// @brief A small HTTP server built against SocketsHpp installed by vcpkg.
 ///
-/// This example shows:
-/// - Installing SocketsHpp as a vcpkg package
-/// - Using find_package() to locate the library
-/// - Creating a simple HTTP server with minimal code
+/// The build finds the library with find_package(SocketsHpp CONFIG REQUIRED) and
+/// links SocketsHpp::SocketsHpp; vcpkg also provides nlohmann-json, used here to
+/// build the JSON responses.
 
 #include <sockets.hpp>
-#include <SocketsHpp/http/server/http_server.h>
-#include <iostream>
-#include <string>
+
+#include <nlohmann/json.hpp>
+
+#include <atomic>
 #include <chrono>
+#include <csignal>
+#include <exception>
+#include <iostream>
+#include <map>
+#include <string>
 #include <thread>
 
-using namespace SOCKETSHPP_NS;
 using namespace SOCKETSHPP_NS::http::server;
+using json = nlohmann::json;
+
+namespace
+{
+    std::atomic<bool> g_running{true};
+    constexpr int kPort = 9000;
+}
 
 int main()
 {
-    std::cout << "========================================\n";
-    std::cout << " SocketsHpp vcpkg Consumption Example\n";
-    std::cout << "========================================\n\n";
-
-    std::cout << "This example demonstrates:\n";
-    std::cout << "  - Installing SocketsHpp via vcpkg\n";
-    std::cout << "  - Using CMake find_package()\n";
-    std::cout << "  - Creating a minimal HTTP server\n\n";
+    std::signal(SIGINT, [](int) { g_running = false; });
+    std::signal(SIGTERM, [](int) { g_running = false; });
 
     try
     {
-        // Create HTTP server on port 9000
-        HttpServer server("localhost", 9000);
+        HttpServer server("127.0.0.1", kPort);
 
-        // Route 1: Root endpoint
-        server.route("/", [](const HttpRequest& req, HttpResponse& res) -> int {
-            res.set_header("Content-Type", "text/html");
+        // "/" also catches unknown paths (routes match by longest prefix).
+        server.route("/", [](const HttpRequest&, HttpResponse& res) -> int {
             res.set_content(
-                "<html><body>"
-                "<h1>SocketsHpp via vcpkg</h1>"
-                "<p>This server was built using SocketsHpp installed through vcpkg!</p>"
-                "<h2>Available Endpoints:</h2>"
-                "<ul>"
-                "<li><a href='/info'>GET /info</a> - Server information</li>"
-                "<li><a href='/echo?msg=Hello'>GET /echo?msg=...</a> - Echo service</li>"
-                "<li><a href='/json'>GET /json</a> - JSON response</li>"
-                "</ul>"
-                "<h3>vcpkg Integration Benefits:</h3>"
-                "<ul>"
-                "<li>Automatic dependency management (nlohmann-json, thread-pool; jwt-cpp optional)</li>"
-                "<li>Cross-platform builds (Windows, Linux, macOS)</li>"
-                "<li>Header-only library - no linking required</li>"
-                "<li>Easy version management</li>"
-                "</ul>"
-                "</body></html>"
-            );
+                "<html><body><h1>SocketsHpp via vcpkg</h1><ul>"
+                "<li><a href='/info'>GET /info</a> - server information</li>"
+                "<li><a href='/echo?msg=Hello'>GET /echo?msg=...</a> - echo a query parameter</li>"
+                "<li><a href='/json'>GET /json</a> - a sample JSON document</li>"
+                "</ul></body></html>",
+                "text/html");
             return 200;
         });
 
-        // Route 2: Server info
-        server.route("/info", [](const HttpRequest& req, HttpResponse& res) -> int {
-            res.set_header("Content-Type", "application/json");
-            res.set_content(
-                "{"
-                "\"server\":\"SocketsHpp\","
-                "\"version\":\"1.0.0\","
-                "\"installation\":\"vcpkg\","
-                "\"dependencies\":[\"nlohmann-json\",\"bshoshany-thread-pool\"],"
-                "\"features\":[\"HTTP/1.1\",\"SSE\",\"MCP\",\"Authentication\",\"Compression\"]"
-                "}"
-            );
+        server.route("/info", [](const HttpRequest&, HttpResponse& res) -> int {
+            json info = {
+                {"server", "SocketsHpp"},
+                {"installedWith", "vcpkg"},
+                {"dependencies", {"nlohmann-json", "bshoshany-thread-pool"}},
+            };
+            res.set_content(info.dump(), "application/json");
             return 200;
         });
 
-        // Route 3: Echo service
         server.route("/echo", [](const HttpRequest& req, HttpResponse& res) -> int {
-            std::string message = "No message provided";
-            
-            // Parse query parameters
-            auto params = req.query_params;
-            auto it = params.find("msg");
-            if (it != params.end()) {
-                message = it->second;
+            std::map<std::string, std::string> params;
+            try
+            {
+                params = req.parse_query();
             }
-
-            res.set_header("Content-Type", "application/json");
-            res.set_content(
-                "{\"echo\":\"" + message + "\"}"
-            );
+            catch (const std::exception& e)
+            {
+                res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+                return 400;  // malformed query string, e.g. a bad %-escape
+            }
+            auto it = params.find("msg");
+            json body = {{"echo", it != params.end() ? it->second : "No message provided"}};
+            res.set_content(body.dump(), "application/json");  // dump() escapes the input
             return 200;
         });
 
-        // Route 4: JSON response
-        server.route("/json", [](const HttpRequest& req, HttpResponse& res) -> int {
-            res.set_header("Content-Type", "application/json");
-            res.set_content(
-                "{"
-                "\"vcpkg\":{"
-                "\"overlay_ports\":\"Use --overlay-ports=../../ports for development\","
-                "\"manifest_mode\":\"Automatic dependency installation\","
-                "\"toolchain\":\"CMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake\""
-                "},"
-                "\"installation\":{"
-                "\"windows\":\"vcpkg install socketshpp --overlay-ports=../../ports\","
-                "\"linux\":\"Same as Windows, works cross-platform\","
-                "\"automatic\":\"vcpkg.json in your project enables manifest mode\""
-                "}"
-                "}"
-            );
+        server.route("/json", [](const HttpRequest&, HttpResponse& res) -> int {
+            json doc = {
+                {"library", "SocketsHpp"},
+                {"headerOnly", true},
+                {"cmake", {{"find_package", "SocketsHpp CONFIG REQUIRED"}, {"target", "SocketsHpp::SocketsHpp"}}},
+            };
+            res.set_content(doc.dump(2), "application/json");
             return 200;
         });
 
-        std::cout << "Server starting on http://localhost:9000\n";
-        std::cout << "Press Ctrl+C to stop\n\n";
-        std::cout << "Try these commands:\n";
-        std::cout << "  curl http://localhost:9000/\n";
-        std::cout << "  curl http://localhost:9000/info\n";
-        std::cout << "  curl http://localhost:9000/echo?msg=HelloVcpkg\n";
-        std::cout << "  curl http://localhost:9000/json\n\n";
-
-        // Start server
         server.start();
+        std::cout << "Listening on http://127.0.0.1:" << kPort << " (Ctrl+C to stop)\n"
+                  << "  curl http://127.0.0.1:" << kPort << "/info\n"
+                  << "  curl \"http://127.0.0.1:" << kPort << "/echo?msg=HelloVcpkg\"\n";
 
-        // Keep server running
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        while (g_running)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-
+        server.stop();
         return 0;
     }
     catch (const std::exception& e)
