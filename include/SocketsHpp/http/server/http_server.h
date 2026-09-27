@@ -1798,6 +1798,15 @@ namespace http
 #endif
             }
 
+            /// @brief Whether @p socket is one of the (open) listening sockets; for
+            ///        debug assertions. Takes m_listenMutex.
+            bool isListeningSocket(const Socket& socket)
+            {
+                std::lock_guard<std::mutex> lock(m_listenMutex);
+                return std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) !=
+                    m_listeningSockets.end();
+            }
+
             /// @brief Stop accepting: unregister and close every listening socket and
             ///        remove the Unix socket files this server created. Thread-safe and
             ///        idempotent.
@@ -2203,8 +2212,7 @@ namespace http
             virtual void onSocketReadable(Socket socket) override
             {
                 LOG_TRACE("HttpServer: reading socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
-                assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
-                    m_listeningSockets.end());
+                assert(!isListeningSocket(socket));
 
                 std::lock_guard<std::mutex> lock(m_connectionsMutex);
                 auto connIt = m_connections.find(socket);
@@ -2239,8 +2247,7 @@ namespace http
             {
                 LOG_TRACE("HttpServer: writing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
 
-                assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
-                    m_listeningSockets.end());
+                assert(!isListeningSocket(socket));
 
                 std::lock_guard<std::mutex> lock(m_connectionsMutex);
                 auto connIt = m_connections.find(socket);
@@ -2275,8 +2282,7 @@ namespace http
             virtual void onSocketClosed(Socket socket) override
             {
                 LOG_TRACE("HttpServer: closing socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
-                assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
-                    m_listeningSockets.end());
+                assert(!isListeningSocket(socket));
 
                 std::lock_guard<std::mutex> lock(m_connectionsMutex);
                 auto connIt = m_connections.find(socket);
