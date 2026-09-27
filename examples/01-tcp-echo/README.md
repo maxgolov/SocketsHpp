@@ -1,7 +1,9 @@
-# TCP Client Example
+# TCP Echo Example
 
-Despite the directory name, this is a TCP **client**: it connects to
-`127.0.0.1:40000`, sends 1 MB of patterned data and closes the connection.
+A TCP echo server and client in one process. The program starts the library's
+`TcpServer` on an ephemeral port on `127.0.0.1`, connects a client `Socket` to it,
+sends 1 MiB of patterned data, reads the echo back and checks that it matches. It
+needs no other tools and exits with status 0 on success, 1 on failure.
 
 ## Building
 
@@ -14,36 +16,31 @@ cmake --build build --target tcp-echo
 
 ## Running
 
-Start something that listens on port 40000 first:
-
-```bash
-nc -l 40000 > received.bin        # netcat (BSD/macOS syntax; GNU netcat: nc -l -p 40000)
-ncat -l 40000 > received.bin      # Windows (nmap's ncat)
-```
-
-Then run the client:
-
 ```bash
 ./build/examples/01-tcp-echo/tcp-echo
 ```
 
 ## What it demonstrates
 
-- Creating a TCP socket from `SocketParams{AF_INET, SOCK_STREAM, 0}`
-- Connecting with `Socket::connect(SocketAddr{"127.0.0.1:40000"})`
-- Sending with `Socket::send()` (a single call; it reports how many bytes the kernel
-  accepted)
-- Closing with `Socket::close()`
+- `net::tcp::TcpServer(0, "127.0.0.1")` (from `<SocketsHpp/net/tcp/tcp.h>`, which
+  `sockets.hpp` does not include): port 0 picks a free port, `address()` reports it,
+  and without an `onMessage()` handler the server echoes every chunk it receives.
+  `Start()` runs the reactor thread; `Stop()` closes everything.
+- A client `Socket` from `SocketParams{AF_INET, SOCK_STREAM, 0}`, with the result of
+  `connect()` checked
+- `Socket::writeall()` (loops over `send()` until everything is sent or an error
+  occurs) on a second thread while the main thread reads the echo with a `recv()` loop.
+  Sending everything before reading could deadlock once both sides' socket buffers are
+  full.
+- TCP is a byte stream: the echo arrives in chunks of arbitrary size, so the client
+  reads until it has as many bytes as it sent.
 
 ## Expected output
 
 ```
-Connecting to 127.0.0.1:40000...
-Connected!
-Sending 1048576 bytes...
-Successfully sent 1048576 bytes
-Connection closed
+Echo server listening on 127.0.0.1:41933
+Sent 1048576 bytes, received 1048576 bytes
+OK: echo matches
 ```
 
-The byte count on the "Successfully sent" line can be lower than 1048576 if the
-kernel accepts only part of the buffer in one `send()`.
+The port differs from run to run.

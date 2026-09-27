@@ -1,63 +1,108 @@
 // Copyright Max Golovanov.
 // SPDX-License-Identifier: Apache-2.0
 
-#include <thread>
-#include <chrono>
-#include <sockets.hpp>
-#include <SocketsHpp/http/server/http_server.h>
-#include <iostream>
+/// @file main.cpp
+/// @brief HTTP response compression with CompressionMiddleware.
+///
+/// This example demonstrates:
+/// - Registering codecs in CompressionRegistry (here the toy "rle" codec from
+///   compression_simple.h; register zlib/brotli/zstd-based codecs for real clients)
+/// - CompressionMiddleware::compressResponse(): Accept-Encoding negotiation, minimum
+///   size and content-type checks
+/// - Setting Content-Encoding and Vary on the response
+///
+/// Usage: compression-server [port]   (default 8080)
 
-using namespace SOCKETSHPP_NS;
+#include <sockets.hpp>
+#include <SocketsHpp/http/server/compression.h>
+#include <SocketsHpp/http/server/compression_simple.h>
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+
 using namespace SOCKETSHPP_NS::http::server;
 
-int main()
+namespace
 {
+    std::atomic<bool> g_running{true};
+    void onSignal(int) { g_running = false; }
+
+    // Compress body if the client accepts a registered encoding, then send it.
+    int sendCompressed(CompressionMiddleware& compression, const HttpRequest& req, HttpResponse& res,
+                       std::string body, const std::string& contentType)
+    {
+        std::string encoding;
+        if (compression.compressResponse(req.get_header_value("Accept-Encoding"), contentType, body, encoding))
+        {
+            res.set_header("Content-Encoding", encoding);
+        }
+        res.set_header("Vary", "Accept-Encoding");  // caches must key on Accept-Encoding
+        res.set_content(body, contentType);
+        return 200;
+    }
+}  // namespace
+
+int main(int argc, char* argv[])
+{
+    std::signal(SIGINT, onSignal);
+    std::signal(SIGTERM, onSignal);
+
     try
     {
-        std::cout << "HTTP Server with Compression Example (Simplified)\n";
-        std::cout << "==================================================\n";
-        std::cout << "NOTE: Compression middleware integration with HttpServer\n";
-        std::cout << "is planned for future releases. This example shows basic HTTP.\n\n";
-        std::cout << "Listening on http://localhost:8080\n\n";
-        
-        HttpServer server("localhost", 8080);
-        
-        server.route("/", [](const HttpRequest& req, HttpResponse& res) -> int
-        {
-            std::ostringstream html;
-            html << "<!DOCTYPE html>\n<html>\n<head><title>Compression Demo</title></head>\n<body>\n";
-            html << "<h1>HTTP Compression Demonstration</h1>\n";
-            html << "<p>Compression middleware integration coming soon!</p>\n";
-            html << "<h2>Large Response Test</h2>\n";
-            
-            for (int i = 0; i < 50; i++)
-            {
-                html << "<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. " << i << "</p>\n";
-            }
-            
-            html << "</body>\n</html>\n";
-            
-            res.set_header("Content-Type", "text/html");
-            res.set_content(html.str());
-            return 0;
-        });
-        
-        std::cout << "Test with:\n";
-        std::cout << "  curl http://localhost:8080/\n\n";
-        
-        server.start();  // non-blocking: the reactor runs on its own thread
+        const int port = argc > 1 ? std::stoi(argv[1]) : 8080;
 
-        // Keep the process alive while the server runs (Ctrl+C to stop)
-        while (true)
+        // Register codecs before start(): the registry is not synchronized.
+        // "rle" is a toy run-length codec for experiments; browsers cannot decode it.
+        compression::registerSimpleCompression();
+        // A real codec: CompressionRegistry::instance().registerStrategy(
+        //     std::make_shared<CompressionStrategy>("gzip", myCompress, myDecompress));
+
+        CompressionMiddleware compression;  // compresses text/JSON bodies of 1 KB or more
+        compression.setMinSize(256);
+
+        HttpServer server("0.0.0.0", port);
+
+        // A large, repetitive text body (run-length encoding only helps with runs)
+        server.route("/", [&compression](const HttpRequest& req, HttpResponse& res) -> int {
+            if (req.uri.substr(0, req.uri.find('?')) != "/")
+            {
+                res.set_content("Not found\n", "text/plain");
+                return 404;
+            }
+            std::ostringstream text;
+            text << "Compression demo: a bar chart\n";
+            for (int i = 1; i <= 40; ++i)
+            {
+                text << std::string(i * 2, '#') << std::string(80 - i * 2, ' ') << "|\n";
+            }
+            return sendCompressed(compression, req, res, text.str(), "text/plain");
+        });
+
+        // Below the minimum size: always sent as is
+        server.route("/small", [&compression](const HttpRequest& req, HttpResponse& res) -> int {
+            return sendCompressed(compression, req, res, "Too small to be worth compressing.\n", "text/plain");
+        });
+
+        server.start();
+        std::cout << "Compression server on http://localhost:" << port << " - try:" << std::endl
+                  << "  curl -si -H \"Accept-Encoding: rle\" http://localhost:" << port << "/" << std::endl;
+
+        while (g_running)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        std::cout << "Shutting down..." << std::endl;
+        server.stop();
+        return 0;
     }
     catch (const std::exception& e)
     {
-        std::cerr << "Error: " << e.what() << "\n";
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
-    
-    return 0;
 }

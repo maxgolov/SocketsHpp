@@ -1,9 +1,12 @@
-# Compression Example (not wired in yet)
+# Compression Example
 
-This example currently serves a large HTML page (about 3.5 KB of repeated paragraphs)
-**without compressing it**: `main.cpp` only uses `HttpServer` and prints a note that
-compression integration is not done. The rest of this README explains how to add
-compression with the library's `compression.h`.
+Compresses HTTP responses with the library's `CompressionMiddleware`
+(`<SocketsHpp/http/server/compression.h>`). The server serves a large, repetitive text
+page at `/`; a client that sends `Accept-Encoding: rle` gets it run-length encoded
+(`Content-Encoding: rle`), any other client gets it uncompressed.
+
+`HttpServer` does not compress anything by itself: handlers call
+`CompressionMiddleware::compressResponse()` and set `Content-Encoding` and `Vary`.
 
 ## Building
 
@@ -17,75 +20,73 @@ cmake --build build --target compression-server
 ## Running
 
 ```bash
-./build/examples/08-compression/compression-server
-curl -i http://localhost:8080/
+./build/examples/08-compression/compression-server          # port 8080
+./build/examples/08-compression/compression-server 9000     # another port
 ```
 
-The server listens on port 8080 on all IPv4 interfaces and answers every path with the
-same page, uncompressed.
+The server listens on all IPv4 interfaces. Press Ctrl+C to stop it.
 
-## Adding compression
+## Testing
 
-`SocketsHpp/http/server/compression.h` provides:
+```bash
+curl -si -H "Accept-Encoding: rle" http://localhost:8080/ -o /dev/null -D -
+# HTTP/1.1 200 OK
+# Content-Encoding: rle
+# Content-Length: 376
+# Content-Type: text/plain
+# Vary: Accept-Encoding
 
-- `CompressionRegistry`: a process-wide map from content-coding name to
-  `CompressionStrategy` (compress and decompress callbacks);
-- `CompressionMiddleware`: parses `Accept-Encoding` (with q-values), skips small bodies
-  (< 1 KB by default) and non-text content types, and compresses with the best
-  registered codec, keeping the result only if it is smaller.
+curl -si http://localhost:8080/ -o /dev/null -D -      # no Content-Encoding, Content-Length: 3310
+curl -si -H "Accept-Encoding: gzip" http://localhost:8080/ -o /dev/null -D -   # gzip is not registered: uncompressed
+curl -si -H "Accept-Encoding: rle" http://localhost:8080/small   # below the minimum size: uncompressed
+```
 
-The library contains **no gzip/deflate/brotli codec**. For real clients register one
-built on zlib, brotli or zstd. For experiments, `compression_simple.h` registers a
-toy `rle` codec (and `identity`); on Windows, `compression_windows.h` registers
-`mszip`, `xpress` and `lzms` through the Windows Compression API (link `cabinet`;
-these are not standard HTTP content-codings, so browsers cannot decode them).
+## Codecs
 
-A route that compresses its response:
+`CompressionRegistry` maps content-coding names to `CompressionStrategy` objects
+(compress / decompress callbacks). The library contains **no gzip, deflate or brotli
+codec**; for real clients register one built on zlib, brotli or zstd:
 
 ```cpp
-#include <SocketsHpp/http/server/compression.h>
-#include <SocketsHpp/http/server/compression_simple.h>
-#include <SocketsHpp/http/server/http_server.h>
-#include <chrono>
-#include <thread>
+CompressionRegistry::instance().registerStrategy(
+    std::make_shared<CompressionStrategy>("gzip", myCompress, myDecompress));
+```
 
-using namespace SocketsHpp::http::server;
+For experiments, `compression_simple.h` registers a toy `rle` codec (and `identity`)
+with `compression::registerSimpleCompression()`; this example uses it, which is why
+the page consists of long runs of the same character. On Windows,
+`compression_windows.h` registers `mszip`, `xpress` and `lzms` through the Windows
+Compression API (link `cabinet`); these are not standard HTTP content-codings, so
+browsers cannot decode them either.
 
-int main()
+Register codecs before `start()`: the registry is not synchronized.
+
+## How it works
+
+```cpp
+CompressionMiddleware compression;   // text, JSON, XML and JavaScript bodies >= 1 KB
+compression.setMinSize(256);
+
+int sendCompressed(CompressionMiddleware& compression, const HttpRequest& req, HttpResponse& res,
+                   std::string body, const std::string& contentType)
 {
-    compression::registerSimpleCompression();  // "rle" + "identity"; register real codecs here
-
-    // Registering your own codec:
-    // CompressionRegistry::instance().registerStrategy(
-    //     std::make_shared<CompressionStrategy>("gzip", myCompress, myDecompress));
-
-    CompressionMiddleware compression;
-    compression.setMinSize(256);
-
-    HttpServer server("compression-demo", 8080);
-    server.route("/", [&compression](const HttpRequest& req, HttpResponse& res) -> int {
-        std::string body(4096, 'a');
-        std::string encoding;
-        if (compression.compressResponse(req.get_header_value("Accept-Encoding"),
-                                         "text/plain", body, encoding))
-        {
-            res.set_header("Content-Encoding", encoding);
-        }
-        res.set_header("Vary", "Accept-Encoding");
-        res.set_content(body, "text/plain");
-        return 200;
-    });
-
-    server.start();
-    std::this_thread::sleep_for(std::chrono::minutes(5));
+    std::string encoding;
+    if (compression.compressResponse(req.get_header_value("Accept-Encoding"), contentType, body, encoding))
+    {
+        res.set_header("Content-Encoding", encoding);
+    }
+    res.set_header("Vary", "Accept-Encoding");
+    res.set_content(body, contentType);
+    return 200;
 }
 ```
 
-```bash
-curl -i -H "Accept-Encoding: rle" http://localhost:8080/   # Content-Encoding: rle
-curl -i http://localhost:8080/                             # uncompressed
-```
+`compressResponse()` compresses only if the body is at least the minimum size, the
+content type is compressible (not an image, video, archive, ...) and the client's
+`Accept-Encoding` (q-values honoured) names a registered codec. It keeps the result
+only if it is smaller, and returns the chosen encoding in its last argument.
+`Vary: Accept-Encoding` tells caches that the response depends on that header.
 
-Register codecs before `start()`: the registry is not synchronized.
 `CompressionMiddleware::decompressRequest(contentEncoding, body)` does the reverse for
-compressed request bodies, bounded by `setMaxDecompressedSize()` (2 MB by default).
+compressed request bodies, bounded by `setMaxDecompressedSize()` (the server's maximum
+body size by default).

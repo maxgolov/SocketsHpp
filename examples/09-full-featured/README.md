@@ -1,13 +1,17 @@
 # Full-Featured HTTP Server
 
-Combines two of the server helpers in one program:
+A small notes API that combines the server features shown one at a time in examples
+03-08:
 
-1. **Proxy awareness**: `TrustProxyConfig` + `ProxyAwareHelpers` recover the real
-   client IP, scheme and host behind a trusted reverse proxy.
-2. **Authentication**: Bearer tokens and API keys, checked in the handlers by a
-   `checkAuth()` helper (as in [example 07](../07-authentication/)).
-
-It does not use compression or Basic authentication.
+| Feature | How |
+|---------|-----|
+| Worker thread pool | `server.enableThreadPool(4)`; the shared notes list is guarded by a mutex |
+| CORS | `enableCors()`, `setCorsOrigin("http://localhost:3000")`, `setCorsHeaders(...)`; preflight `OPTIONS` requests get 204 from the server |
+| Authentication | `AuthenticationMiddleware` with `BearerTokenAuth` and `ApiKeyAuth` (see [example 07](../07-authentication/)) |
+| Proxy awareness | `TrustProxyConfig` + `ProxyAwareHelpers` (trusted proxy: `127.0.0.1`, see [example 06](../06-proxy-aware/)) |
+| Compression | `CompressionMiddleware` with the toy `rle` codec (see [example 08](../08-compression/)) |
+| JSON | request and response bodies with nlohmann::json |
+| Graceful shutdown | Ctrl+C / SIGTERM stop the server |
 
 ## Building
 
@@ -21,59 +25,86 @@ cmake --build build --target full-featured-server
 ## Running
 
 ```bash
-./build/examples/09-full-featured/full-featured-server
+./build/examples/09-full-featured/full-featured-server          # port 8080
+./build/examples/09-full-featured/full-featured-server 9000     # another port
 ```
 
-The server listens on port 8080 on all IPv4 interfaces.
+The server listens on all IPv4 interfaces.
 
 ## Routes
 
 | Route | Auth | Response |
 |-------|------|----------|
-| `/` (and any unknown path) | none | HTML page with the proxy-aware client IP, scheme, host and URI |
-| `/api/protected` | Bearer token or API key | JSON with the user, the proxy-aware client IP and `"authenticated": true`; 401 with `WWW-Authenticate: Bearer` otherwise |
-| `/api/service` | Bearer token or API key | JSON with the identity; 401 otherwise |
+| `GET /` | none | HTML page showing your (proxy-aware) address and scheme |
+| `GET /api/notes` | Bearer token or API key | `{"notes":[...]}` |
+| `POST /api/notes` | Bearer token or API key | Body `{"text": "..."}`; 201 with the stored note (id, text, author, proxy-aware client IP); 400 for another body |
+| `OPTIONS` any path | none | 204 CORS preflight answer |
+| other methods on `/api/notes` | | 405 with `Allow: GET, POST, OPTIONS` |
+| any other path | none | 404 |
+
+Every handler returns 0 for `OPTIONS` without touching the response, which declines the
+request and lets the server answer the preflight. Preflights carry no credentials, so
+this has to happen before authentication.
 
 ## Testing
 
 ```bash
 curl http://localhost:8080/
 
-curl -H "Authorization: Bearer secret_token_123" http://localhost:8080/api/protected
+# 401 with WWW-Authenticate: Bearer realm="API", API-Key header="X-API-Key"
+curl -i http://localhost:8080/api/notes
 
-curl -H "X-API-Key: api_key_abc" http://localhost:8080/api/service
+# Add a note. The X-Forwarded-For header is honoured because the request comes from
+# 127.0.0.1, a trusted proxy in this example.
+curl -H "Authorization: Bearer secret_token_123" \
+     -H "Content-Type: application/json" \
+     -H "X-Forwarded-For: 203.0.113.42" \
+     -d '{"text": "Hello from curl"}' \
+     http://localhost:8080/api/notes
+# {"author":"user1","clientIP":"203.0.113.42","id":1,"text":"Hello from curl"}
 
-# Proxy headers + auth. Honoured because the request comes from 127.0.0.1,
-# which is a trusted proxy in this example.
-curl -H "X-Forwarded-For: 203.0.113.42" \
-     -H "X-Forwarded-Proto: https" \
-     -H "Authorization: Bearer secret_token_123" \
-     http://localhost:8080/api/protected
-# {"user": "user1","endpoint": "/api/protected","clientIP": "203.0.113.42","authenticated": true}
+curl -H "X-API-Key: api_key_abc" http://localhost:8080/api/notes
+# {"notes":[{"author":"user1","clientIP":"203.0.113.42","id":1,"text":"Hello from curl"}]}
 
-curl -i http://localhost:8080/api/protected   # 401
+# CORS preflight: 204 with Access-Control-Allow-Origin: http://localhost:3000
+curl -i -X OPTIONS http://localhost:8080/api/notes \
+     -H "Origin: http://localhost:3000" \
+     -H "Access-Control-Request-Method: POST"
+
+# Compression: "rle" only pays off for repetitive bodies of 256 bytes or more
+curl -H "X-API-Key: api_key_abc" -H "Content-Type: application/json" \
+     -d "{\"text\": \"$(printf '=%.0s' $(seq 300))\"}" \
+     http://localhost:8080/api/notes > /dev/null
+curl -si -H "X-API-Key: api_key_abc" -H "Accept-Encoding: rle" http://localhost:8080/api/notes -o /dev/null -D -
+# ... Content-Encoding: rle ...
 ```
+
+Every response carries the CORS headers (`Access-Control-Allow-Origin:
+http://localhost:3000`, allowed headers `Content-Type, Authorization, X-API-Key`,
+exposed header `Content-Encoding`).
 
 ## Request flow
 
 ```
 [Client] -> [nginx / HAProxy] -> [This server]
-                 |
-          X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host
-                 |
-          ProxyAwareHelpers (only if the peer is a trusted proxy)
-                 |
-          checkAuth() in the /api/* handlers
-                 |
-          JSON / HTML response
+                                      |
+                        route handler on a worker thread
+                          - OPTIONS: declined, the server answers the preflight (204)
+                          - AuthenticationMiddleware (401)
+                          - ProxyAwareHelpers (only for trusted peers)
+                          - nlohmann::json body parsing (400)
+                          - CompressionMiddleware (Content-Encoding)
+                                      |
+                        server adds CORS headers and sends the response
 ```
 
-## Configuration
+## Credentials
 
-- Trusted proxies: `127.0.0.1`, `10.0.0.1`, `172.16.0.1` (`TrustMode::TrustSpecific`).
-  Forwarded headers from any other peer are ignored.
-- Credentials: Bearer `secret_token_123` (user1) and `admin_token_456` (admin);
-  API key `api_key_abc` (service1).
+| Kind | Value | Identity |
+|------|-------|----------|
+| Bearer token | `secret_token_123` | `user1` |
+| Bearer token | `admin_token_456` | `admin` |
+| API key | `api_key_abc` | `service1` |
 
-To add compression, see [example 08](../08-compression/); for the library's
-authentication strategies, see the [main README](../../README.md#authentication).
+Notes are kept in memory (at most 100; more gives 507) and are lost when the server
+stops.

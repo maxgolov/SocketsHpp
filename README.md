@@ -749,15 +749,15 @@ See [examples/README.md](examples/README.md). Build them with
 
 | Example | Shows |
 |---------|-------|
-| [01-tcp-echo](examples/01-tcp-echo/) | TCP client sending 1 MB |
-| [02-udp-echo](examples/02-udp-echo/) | UDP client sending a datagram |
-| [03-http-server](examples/03-http-server/) | Routes, query parameters, JSON/HTML responses |
+| [01-tcp-echo](examples/01-tcp-echo/) | TCP echo server (`TcpServer`) and client in one process, verifying a 1 MiB round trip |
+| [02-udp-echo](examples/02-udp-echo/) | UDP echo server (`SocketServer`) and client in one process |
+| [03-http-server](examples/03-http-server/) | Routes and prefix matching, query parameters, JSON/HTML responses, 400/404/405 |
 | [04-http-sse](examples/04-http-sse/) | SSE streaming with `send_chunk_stream` and the thread pool |
-| [05-mcp-server](examples/05-mcp-server/) | Hand-rolled MCP-style SSE transport on `HttpServer` (not `MCPServer`) |
+| [05-mcp-server](examples/05-mcp-server/) | `MCPServer` over Streamable HTTP with two tools and cancellation, driven with curl |
 | [06-proxy-aware](examples/06-proxy-aware/) | `TrustProxyConfig` and `ProxyAwareHelpers` |
-| [07-authentication](examples/07-authentication/) | Bearer token / API key checks in handlers |
-| [08-compression](examples/08-compression/) | Large HTML response (compression is not wired in) |
-| [09-full-featured](examples/09-full-featured/) | Proxy awareness + authentication |
+| [07-authentication](examples/07-authentication/) | `AuthenticationMiddleware` with Bearer, Basic and API-key strategies |
+| [08-compression](examples/08-compression/) | `CompressionMiddleware` with the toy `rle` codec |
+| [09-full-featured](examples/09-full-featured/) | Thread pool, CORS, auth, proxy awareness and compression in one JSON API |
 | [10-typescript-interop](examples/10-typescript-interop/) | MCP interop in both directions with the official TypeScript SDK over Streamable HTTP (run in CI) |
 | [11-vcpkg-consumption](examples/11-vcpkg-consumption/) | Consuming SocketsHpp through the vcpkg port (overlay or git registry) with `find_package` |
 

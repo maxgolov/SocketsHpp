@@ -1,13 +1,17 @@
-# MCP-Style SSE Transport Example
+# MCP Server Example
 
-A hand-written, **simplified** imitation of an MCP HTTP+SSE transport, built directly
-on `HttpServer` routes. It does not use the library's MCP implementation and does not
-process JSON-RPC requests: the SSE stream plays back canned messages.
+A small but complete [Model Context Protocol](https://modelcontextprotocol.io) server
+built with `SocketsHpp::mcp::server::MCPServer`, using the Streamable HTTP transport
+(MCP 2025-03-26) at `http://127.0.0.1:8080/mcp`. It offers two tools:
 
-For a working MCP server (JSON-RPC dispatch, sessions, Streamable HTTP, auth, ...) use
-`SocketsHpp::mcp::server::MCPServer`; see
-[docs/MCP_IMPLEMENTATION.md](../../docs/MCP_IMPLEMENTATION.md) and the MCP example in
-the [main README](../../README.md#mcp-server).
+| Tool | Arguments | Result |
+|------|-----------|--------|
+| `echo` | `{"text": string}` | The text |
+| `wait` | `{"seconds": 1-60}` | `Waited N s` after N seconds; can be cancelled with `notifications/cancelled` |
+
+For the full API (sessions, notification streams, progress, auth, rate limiting, the
+client) see [docs/MCP_IMPLEMENTATION.md](../../docs/MCP_IMPLEMENTATION.md); example 10
+talks to the official MCP TypeScript SDK.
 
 ## Building
 
@@ -21,58 +25,119 @@ cmake --build build --target mcp-server
 ## Running
 
 ```bash
-./build/examples/05-mcp-server/mcp-server
+./build/examples/05-mcp-server/mcp-server          # port 8080
+./build/examples/05-mcp-server/mcp-server 9000     # another port
 ```
 
-The server listens on port 8080 on all IPv4 interfaces.
+`MCPServer` binds only the configured host (`127.0.0.1` here) and refuses a
+non-loopback host unless `ServerConfig::allowNonLoopback` is set. Press Ctrl+C to stop.
 
-## Routes
+## Talking to it with curl
 
-| Route | Behaviour |
-|-------|-----------|
-| `GET /sse` | SSE stream: an `initialized`-style message (id 1), a `tools/list`-style message (id 2), then five `ping` events two seconds apart, then the stream ends. Each connection gets a session id `session-<unix time>` in a global map. |
-| `OPTIONS /sse` | CORS preflight answered by the handler itself (204 with `Access-Control-Allow-*` headers) |
-| `DELETE /session` | Removes the fixed id `demo-session` from the map and returns 204 (the session id is not read from the request); `OPTIONS` also gets 204, other methods 405 |
-| `GET /info` | Static JSON metadata |
-| `POST /base64` | Returns the request body and its Base64 encoding as JSON |
-| `/` (any other path) | 404 |
+Every POST needs `Content-Type: application/json` and an `Accept` header listing both
+`application/json` and `text/event-stream`. Because `Accept` includes
+`text/event-stream`, each response arrives as one SSE event (`data: {...}`); with
+`Accept: application/json` alone the server answers with plain JSON instead.
+
+**1. Initialize** and keep the session id from the `Mcp-Session-Id` response header:
 
 ```bash
-curl -N http://localhost:8080/sse
-curl -X DELETE http://localhost:8080/session
-curl http://localhost:8080/info
-curl -X POST http://localhost:8080/base64 -d "Hello, MCP!"
-# {"original":"Hello, MCP!","encoded":"SGVsbG8sIE1DUCE="}
+curl -s -D headers.txt http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+# data: {"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2025-03-26","serverInfo":{"name":"example-mcp-server","version":"1.0.0"}}}
+
+SESSION=$(grep -i '^mcp-session-id:' headers.txt | cut -d' ' -f2 | tr -d '\r')
+echo "$SESSION"
+# session-1648acffc8e3571c8c54f4056a849e57
 ```
+
+Every later request must carry `Mcp-Session-Id: $SESSION` (without it: 400; with an
+unknown or deleted id: 404).
+
+**2. Confirm initialization** (a notification, so the answer is `202 Accepted` with no body):
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+# 202
+```
+
+**3. List the tools:**
+
+```bash
+curl -s http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+# data: {"id":2,"jsonrpc":"2.0","result":{"tools":[{"description":"Return the given text",...,"name":"echo"},{...,"name":"wait"}]}}
+```
+
+**4. Call a tool:**
+
+```bash
+curl -s http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"Hello, MCP!"}}}'
+# data: {"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"Hello, MCP!","type":"text"}]}}
+```
+
+An unknown tool or bad arguments give a JSON-RPC error, for example
+`{"error":{"code":-32602,"message":"Unknown tool: nope"},...}`.
+
+**5. Cancel a running call.** Start a 30-second `wait` in the background, then send
+`notifications/cancelled` with its request id; the call ends at once with an error:
+
+```bash
+curl -s http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"wait","arguments":{"seconds":30}}}' &
+sleep 1
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION" \
+  -d '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}}'
+wait
+# 202
+# data: {"error":{"code":-32603,"message":"cancelled"},"id":4,"jsonrpc":"2.0"}
+```
+
+**6. End the session:**
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE http://127.0.0.1:8080/mcp -H "Mcp-Session-Id: $SESSION"
+# 204
+```
+
+`GET /health` returns the server name and protocol version as JSON.
 
 ## What it demonstrates
 
-- SSE streaming with `send_chunk_stream()` and `SSEEvent` (multi-line `data` is split
-  into several `data:` lines)
-- `enableThreadPool(4)`, so the pauses between pings do not block other requests
-- Setting CORS headers by hand in handlers (the server also has built-in CORS support:
-  `enableCors()`, `setCorsOrigin()`, `setCorsHeaders()`)
-- Branching on `req.method` inside one route
-- `SocketsHpp::utils::base64::encode()`
+- `ServerConfig` with `TransportType::HTTP_STREAMABLE`, host, port and endpoint;
+  `MCPServer::listen()` (non-blocking), `port()` and `stop()`
+- `registerMethod("initialize", ...)` to advertise the `tools` capability (the
+  protocol version and the session are handled by `MCPServer`)
+- `registerMethod("tools/list", ...)` returning the tool descriptions with JSON
+  schemas
+- `registerCancellable("tools/call", ...)`: the handler polls its `cancelled` token,
+  which a `notifications/cancelled` from the same session sets. Handlers run on
+  `MCPServer`'s worker threads, so the notification is processed while the call runs.
+- `JsonRpcError::invalidParams()` for bad input; any other exception becomes a
+  `-32603` internal error
 
-## Expected output (curl -N /sse)
+## Expected output
 
 ```
-id: 1
-event: message
-data: {
-data:                 "jsonrpc": "2.0",
-data:                 "method": "initialized",
-...
-
-id: 2
-event: message
-data: {
-data:                 "jsonrpc": "2.0",
-data:                 "method": "tools/list",
-...
-
-event: ping
-data: 1790323647
-...
+MCP server listening at http://127.0.0.1:8080/mcp
+^CShutting down...
 ```

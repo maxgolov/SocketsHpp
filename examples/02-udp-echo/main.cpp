@@ -2,53 +2,89 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /// @file main.cpp
-/// @brief Simple UDP client example - sends a datagram to a UDP server
+/// @brief UDP echo round trip in one process.
 ///
-/// This example demonstrates:
-/// - Creating a UDP socket
-/// - Sending a datagram
-///
-/// To test, run a UDP server first:
-///   netcat: nc -u -l -p 40000
+/// Starts a SocketServer bound to a UDP socket on an ephemeral 127.0.0.1 port whose
+/// onRequest handler sends every datagram back, then sends a few datagrams from a
+/// client Socket and checks each reply.
 
-#include <sockets.hpp>
+#include <SocketsHpp/net/common/socket_server.h>
+
 #include <iostream>
 #include <string>
 
-using namespace SOCKETSHPP_NS::net::common;
+using SOCKETSHPP_NS::net::common::Socket;
+using SOCKETSHPP_NS::net::common::SocketAddr;
+using SOCKETSHPP_NS::net::common::SocketParams;
+using SOCKETSHPP_NS::net::common::SocketServer;
+
+// UDP gives no delivery guarantee: never wait for a reply forever.
+static void setRecvTimeout(Socket& sock, int ms)
+{
+#ifdef _WIN32
+    DWORD tv = static_cast<DWORD>(ms);
+#else
+    timeval tv{ms / 1000, (ms % 1000) * 1000};
+#endif
+    ::setsockopt(sock.m_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+}
 
 int main()
 {
     try
     {
-        // Create UDP socket
-        SocketParams params{AF_INET, SOCK_DGRAM, 0};
-        Socket client(params);
+        const SocketParams udp{AF_INET, SOCK_DGRAM, 0};
 
-        // Set destination address
-        SocketAddr destination("127.0.0.1:40000");
-        std::cout << "Sending to " << destination.toString() << std::endl;
-
-        // Connect sets the default destination for send()
-        client.connect(destination);
-
-        // Send message
-        std::string message = "Hello from SocketsHpp UDP client!";
-        auto bytes_sent = client.send(message.c_str(), message.length());
-
-        if (bytes_sent > 0)
+        // Port 0 picks a free port; address() reports the one actually bound.
+        SocketServer server(SocketAddr("127.0.0.1:0"), udp);
+        if (!server.is_bound)
         {
-            std::cout << "Sent " << bytes_sent << " bytes: " << message << std::endl;
+            std::cerr << "bind failed" << std::endl;
+            return 1;
         }
-        else
+        // Called on the reactor thread for each datagram: reply with the same bytes.
+        server.onRequest = [](SocketServer::Connection& conn) {
+            conn.response_buffer = conn.request_buffer;
+            conn.state.insert(SocketServer::Connection::Responding);
+        };
+        server.Start();
+        std::cout << "Echo server listening on udp://" << server.address().toString() << std::endl;
+
+        Socket client(udp);
+        setRecvTimeout(client, 2000);
+        // On a UDP socket connect() only sets the default peer for send()/recv().
+        if (!client.connect(server.address()))
         {
-            std::cerr << "Failed to send datagram" << std::endl;
+            std::cerr << "connect() failed, error " << client.error() << std::endl;
+            client.close();
             return 1;
         }
 
-        // Clean up
+        int failures = 0;
+        for (const std::string message : {"Hello", "from the", "SocketsHpp UDP client!"})
+        {
+            char reply[1500];
+            int n = -1;
+            if (client.send(message.data(), message.size()) == static_cast<int>(message.size()))
+            {
+                n = client.recv(reply, sizeof(reply));
+            }
+            if (n >= 0 && std::string(reply, static_cast<size_t>(n)) == message)
+            {
+                std::cout << "echoed: " << message << std::endl;
+            }
+            else
+            {
+                std::cerr << "no matching reply for \"" << message << "\" (error " << client.error() << ")"
+                          << std::endl;
+                ++failures;
+            }
+        }
+
         client.close();
-        return 0;
+        server.Stop();
+        std::cout << (failures == 0 ? "OK: all datagrams echoed" : "FAILED") << std::endl;
+        return failures == 0 ? 0 : 1;
     }
     catch (const std::exception& e)
     {
