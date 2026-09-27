@@ -33,8 +33,9 @@ HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protoc
   helpers (`X-Forwarded-*`, RFC 7239 `Forwarded`) with trusted-proxy configuration.
 - **MCP**: JSON-RPC 2.0 layer, `MCPServer` (Streamable HTTP for protocol versions
   2025-11-25, 2025-06-18 and 2025-03-26, a POST-based variant for 2024-11-05 clients,
-  or JSON-RPC over your own STDIO loop; `registerTool()` helpers) and `MCPClient`
-  (HTTP transports), tested against the official MCP TypeScript SDK in both directions.
+  or stdio with `StdioServerTransport`; `registerTool()` helpers) and `MCPClient`
+  (HTTP transports, or stdio: it launches the server process), tested against the
+  official MCP TypeScript SDK in both directions.
 - **Tested**: 500+ GoogleTest cases in CI on Ubuntu (GCC, Clang, ASan/UBSan),
   macOS (Clang), Windows (MSVC) and MinGW-w64 (under Wine), plus MCP interop with the
   TypeScript SDK and the vcpkg port.
@@ -665,8 +666,10 @@ are built in. `registerTool()` / `registerCancellableTool()`, `registerPrompt()`
 tool becomes an `isError` result); `registerMethod()` handles any other method and
 overrides a helper. `registerCancellable()` gives a handler a cancel token,
 `push_event()` / `push_log()` / `push_progress()` send server-initiated messages on a
-session's SSE stream, `processMessage()` handles one JSON-RPC message (or batch) for
-a STDIO transport you drive yourself, and `GET /health` returns the server info. See
+session's SSE stream, `StdioServerTransport` (`SocketsHpp/mcp/server/stdio_server.h`)
+serves the same `MCPServer` over stdin/stdout (`runStdio()`; see
+[example 12](examples/12-mcp-stdio/)), `processMessage()` handles one JSON-RPC message
+(or batch) for a loop you drive yourself, and `GET /health` returns the server info. See
 [docs/MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md) for transports, sessions,
 resumability, authentication (including JWT via jwt-cpp), rate limiting, CORS and
 `Origin` validation (browser origins other than loopback need `config.allowedOrigins`).
@@ -683,9 +686,10 @@ using json = nlohmann::json;
 int main()
 {
     ClientConfig config;
-    config.transport = TransportType::HTTP_STREAMABLE;  // or HTTP (see docs); STDIO is not supported
+    config.transport = TransportType::HTTP_STREAMABLE;  // or HTTP, or STDIO (below)
     config.http.url = "http://127.0.0.1:8080/mcp";      // http:// only
     config.http.headers["Authorization"] = "Bearer my-token";
+    config.maxRetries = 3;                              // connect failures only
 
     client::MCPClient client;
     client.onNotification("notifications/message", [](const json& params) {
@@ -712,6 +716,13 @@ int main()
     client.disconnect();  // sends DELETE to end the session
 }
 ```
+
+For a stdio server set `config.transport = TransportType::STDIO` and
+`config.stdio.command` / `args` / `env` / `cwd` (or load a VS Code `mcp.json` entry with
+`ClientConfig::fromJson()`): `connect()` starts the process, and `disconnect()` closes
+its stdin, terminates it if needed and reaps it. `initialize()` checks the protocol
+version the server picks, requests can be cancelled with a `CancelToken`, and
+`config.readTimeoutSeconds` bounds each STDIO request.
 
 ## Design
 
@@ -794,6 +805,7 @@ See [examples/README.md](examples/README.md). Build them with
 | [09-full-featured](examples/09-full-featured/) | Thread pool, CORS, auth, proxy awareness and compression in one JSON API |
 | [10-typescript-interop](examples/10-typescript-interop/) | MCP interop in both directions with the official TypeScript SDK over Streamable HTTP (run in CI) |
 | [11-vcpkg-consumption](examples/11-vcpkg-consumption/) | Consuming SocketsHpp through the vcpkg port (overlay or git registry) with `find_package` |
+| [12-mcp-stdio](examples/12-mcp-stdio/) | MCP over stdio: a `StdioServerTransport` server and an `MCPClient` that launches it, calls tools, receives progress/log notifications and cancels a call |
 
 ## Documentation
 

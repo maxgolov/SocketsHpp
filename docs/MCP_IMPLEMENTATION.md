@@ -8,7 +8,9 @@ header-only and built on the library's own HTTP server and client.
 | `SocketsHpp/http/common/json_rpc.h` | `SocketsHpp::http::common` | `JsonRpcRequest`, `JsonRpcNotification`, `JsonRpcResponse`, `JsonRpcError`, `JsonRpcId` |
 | `SocketsHpp/mcp/common/mcp_config.h` | `SocketsHpp::mcp` | `TransportType`, `ServerConfig`, `ClientConfig`, `HttpConfig`, `StdioConfig` |
 | `SocketsHpp/mcp/server/mcp_server.h` | `SocketsHpp::mcp::server` | `MCPServer` |
+| `SocketsHpp/mcp/server/stdio_server.h` | `SocketsHpp::mcp::server` | `StdioServerTransport` (runs an `MCPServer` on stdin/stdout) |
 | `SocketsHpp/mcp/client/mcp_client.h` | `SocketsHpp::mcp::client` | `MCPClient` |
+| `SocketsHpp/utils/process.h` | `SocketsHpp::utils` | `ChildProcess`, `PipeReader`, `writeAll()` (used by the STDIO transport) |
 
 `SocketsHpp::mcp` also defines `using json = nlohmann::json;`.
 
@@ -27,8 +29,8 @@ header-only and built on the library's own HTTP server and client.
 | `TransportType` | Protocol revision | Server | Client |
 |-----------------|-------------------|--------|--------|
 | `HTTP` | 2024-11-05 protocol version, POST-based | POST for requests and responses; GET notification stream opened after `initialize` | yes |
-| `HTTP_STREAMABLE` | Streamable HTTP (2025-03-26, 2025-06-18, 2025-11-25) | POST returns JSON or SSE; optional GET stream | yes (offers 2025-03-26) |
-| `STDIO` | any | no listener: feed messages to `processMessage()` from your own stdin/stdout loop | **not supported** (`connect()` returns false) |
+| `HTTP_STREAMABLE` | Streamable HTTP (2025-03-26, 2025-06-18, 2025-11-25) | POST returns JSON or SSE; optional GET stream | yes |
+| `STDIO` | any (newline-delimited JSON-RPC) | `StdioServerTransport` on stdin/stdout (or `processMessage()` in your own loop); no listener | launches the server process and talks over its stdin/stdout |
 
 The `HTTP` transport speaks protocol version 2024-11-05 but is **not** the legacy
 2024-11-05 "HTTP with SSE" transport: there is no `endpoint` event handshake, the
@@ -419,32 +421,69 @@ config.allowedOrigins = { "https://app.example.com" };  // browser app on anothe
 
 ### STDIO transport
 
-`MCPServer` does not read stdin itself. Drive it with `processMessage()`, which takes
-one JSON-RPC message or batch and returns the response text (empty for notifications):
+With the stdio transport the host (VS Code, an SDK client, `MCPClient`) launches the
+server as a child process and exchanges newline-delimited JSON-RPC messages over its
+stdin and stdout: one UTF-8 message per line, no embedded newlines, and **nothing but
+protocol messages on stdout** (logs go to stderr). `StdioServerTransport`
+(`SocketsHpp/mcp/server/stdio_server.h`, also included by `sockets.hpp`) runs an
+`MCPServer` that way:
 
 ```cpp
-#include <SocketsHpp/mcp/server/mcp_server.h>
-#include <iostream>
-#include <string>
+#include <SocketsHpp/mcp/server/stdio_server.h>
+
+using namespace SocketsHpp::mcp;
+using json = nlohmann::json;
 
 int main()
 {
-    SocketsHpp::mcp::ServerConfig config;  // transport defaults to STDIO
-    SocketsHpp::mcp::server::MCPServer server(config);
-    // ... registerMethod(...) ...
+    ServerConfig config;                      // transport defaults to STDIO
+    server::MCPServer server(config);
+    server::StdioServerTransport stdio(server);
 
-    std::string line;
-    while (std::getline(std::cin, line))  // newline-delimited JSON-RPC
-    {
-        std::string reply = server.processMessage(line);
-        if (!reply.empty())
-            std::cout << reply << '\n' << std::flush;
-    }
+    server.registerCancellable("tools/call",
+        [&stdio](const json& params, std::shared_ptr<std::atomic<bool>> cancelled) -> json {
+            stdio.log("info", "demo", "tool " + params.value("name", ""));  // notifications/message
+            // ... poll cancelled->load() in long work ...
+            return {{"content", json::array()}};
+        });
+
+    stdio.runStdio();   // blocks until stdin is closed (or stop() is called)
 }
 ```
 
-Sessions, authentication, rate limiting and the notification stream do not apply to
-STDIO.
+- **Concurrency:** requests run on a worker pool (`Options::maxConcurrentRequests`,
+  default 4; at most `maxQueuedRequests`, default 256, wait for a worker before the
+  reader pauses). Notifications and client responses are handled in order on the
+  reading thread, so a `notifications/cancelled` reaches a running cancellable handler
+  even while every worker is busy; a cancellation for a request still in the queue
+  removes it. As on HTTP, a cancelled request gets no response.
+- **Output:** each reply or notification is written as one line; writes are
+  serialized. `MCPServer::push_log()` / `push_progress()` target HTTP sessions, so use
+  the transport's `notify(method, params)`, `log(level, logger, data)` (honours
+  `logging/setLevel`, default `warning`) and `progress(token, progress, total,
+  message)` instead; capture the transport in your handlers.
+- **Shutdown:** at end of input the requests already received are completed and
+  answered, then `runStdio()` returns. `stop()` (thread-safe, also from a handler) ends
+  the read loop immediately, drops queued requests and cancels running ones.
+  If stdout is closed (the client went away), writes fail with `EPIPE` instead of
+  raising `SIGPIPE`, and the loop stops.
+- **Windows:** `runStdio()` switches stdin/stdout to binary mode (`_setmode`) and uses
+  the raw handles.
+- **Testing / embedding:** `run(std::istream&, std::ostream&)` serves C++ streams (a
+  blocked `getline()` cannot be interrupted by `stop()`), and
+  `run(NativeHandle in, NativeHandle out)` serves pipe handles or descriptors.
+- Lines longer than `Options::maxMessageSize` (4 MiB) are discarded and answered with
+  `-32600` (id `null`).
+- Do not print to `std::cout` / `stdout` in a stdio server, and do not build it with
+  `HAVE_CONSOLE_LOG` (that logging backend writes to stdout).
+
+Sessions, authentication, rate limiting and the HTTP notification stream do not apply
+to STDIO; all messages share the session `""` (e.g. `get_client_capabilities("")`).
+`MCPServer::processMessage()` remains available for your own loop; it runs handlers on
+the calling thread, so cancellation needs concurrent calls.
+
+[Example 12](../examples/12-mcp-stdio/) has a complete stdio server and a client that
+launches it.
 
 ### Configuration reference (`ServerConfig`)
 
@@ -502,7 +541,7 @@ int main()
         std::cout << "progress " << params.value("progress", 0.0) << '\n';
     });
 
-    if (!client.connect(config))  // false for STDIO; HTTP connects lazily
+    if (!client.connect(config))  // HTTP connects lazily; STDIO starts the server here
         return 1;
 
     try
@@ -527,20 +566,43 @@ int main()
 }
 ```
 
-- `connect(config)` accepts `HTTP` and `HTTP_STREAMABLE`. Nothing is sent until
-  `initialize(clientInfo)`, which sends `initialize` (protocol version `2025-03-26` for
-  `HTTP_STREAMABLE`, `2024-11-05` for `HTTP`), stores the `Mcp-Session-Id`, sends
+- `connect(config)` accepts `HTTP`, `HTTP_STREAMABLE` and `STDIO` (see
+  [STDIO client](#stdio-client)). For HTTP nothing is sent until `initialize()`.
+- `initialize(clientInfo)` (or `initialize()` with `setClientInfo()`) sends
+  `initialize` with the capabilities from `setClientCapabilities()` (default `{}`) and
+  offers `config.protocolVersion`, by default `2024-11-05` for `HTTP` and the newest
+  supported version (`2025-06-18`) otherwise. The server's answer must be one of
+  `MCPClient::supportedProtocolVersions()` (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`);
+  anything else disconnects and throws `std::runtime_error`. The negotiated version is
+  available from `protocolVersion()`. It then stores the `Mcp-Session-Id`, sends
   `notifications/initialized` and returns the server's result.
-- Request helpers: `ping()`, `listTools()`, `callTool(name, args)`, `listPrompts()`,
-  `getPrompt(name, args)`, `listResources()`, `readResource(uri)`,
-  `subscribeResource(uri)`, `unsubscribeResource(uri)`, `listResourceTemplates()`.
+- When the negotiated version is `2025-06-18` or newer, every later HTTP request
+  (POST, the notification-stream GET and the final DELETE) carries
+  `MCP-Protocol-Version: <version>`.
+- Request helpers: `ping()`, `listTools()`, `callTool(name, args[, cancel])`,
+  `listPrompts()`, `getPrompt(name, args)`, `listResources()`, `readResource(uri)`,
+  `subscribeResource(uri)`, `unsubscribeResource(uri)`, `listResourceTemplates()`, and
+  the generic `request(method, params[, cancel])` / `notify(method, params)`.
   The `list*` helpers return the array (`tools`, `prompts`, ...); the others return the
-  `result` object. Request ids are sequential integers.
+  `result` object. Request ids are sequential integers. Requests may be issued from
+  several threads at once.
+- **Cancellation:** pass a `MCPClient::CancelToken`
+  (`std::shared_ptr<std::atomic<bool>>`) and set it from another thread: the call stops
+  waiting (over HTTP the connection is aborted), `notifications/cancelled` is sent for
+  the request, and `std::runtime_error` is thrown.
 - Responses may be `application/json` or `text/event-stream`; notifications in an SSE
-  response are dispatched to the handlers. The whole SSE body is read, so a server
-  that keeps a POST stream open blocks the call until the read timeout.
-- `initialize()` sends empty client capabilities and does not check the
-  `protocolVersion` the server answers with.
+  response are dispatched to the handlers. Reading an SSE response stops as soon as the
+  response for the request id has arrived, so a server that keeps the POST stream open
+  does not block the call.
+- **Timeouts:** the HTTP socket read timeout is `http.timeoutSeconds` (default 30), or
+  `config.readTimeoutSeconds` when `http.timeoutSeconds <= 0`. For STDIO,
+  `readTimeoutSeconds` (default 30; `<= 0` waits forever) bounds the wait for each
+  response; on timeout the request is cancelled as above.
+- **Retries (HTTP):** when the connection cannot be established (DNS or connect
+  failure, so nothing was sent) a request or notification is retried up to
+  `config.maxRetries` times (default 3), `config.retryBackoffMs` (default 1000) apart.
+  Failures after the request was sent, HTTP errors and JSON-RPC errors are never
+  retried, so non-idempotent calls are never duplicated.
 - `onNotification(method, handler)` registers a handler and opens the server's
   notification stream (GET with `Mcp-Session-Id` and the configured headers, using
   `SSEClient` with auto-reconnect and `Last-Event-ID`). The stream is also opened after
@@ -549,12 +611,56 @@ int main()
   (a plain struct with `code`, `message`, `data`, not derived from `std::exception`);
   HTTP failures or non-200 status codes throw `std::runtime_error`.
 - `disconnect()` (also run by the destructor) stops the notification stream and sends
-  `DELETE` to end the session.
-- `sessionId()`, `isConnected()` and `getServerCapabilities()` expose state.
-- `ClientConfig::maxRetries`, `retryBackoffMs`, `readTimeoutSeconds` and
-  `HttpConfig::historyDurationMs` are not used by the current client; use
-  `http.timeoutSeconds` for the read timeout. If the server answers the notification
-  stream GET with 405, the `SSEClient` retries every 3 s and reports it via `onStatus`.
+  `DELETE` to end the session (STDIO: see below).
+- `sessionId()`, `protocolVersion()`, `isConnected()` and `getServerCapabilities()`
+  expose state.
+- `HttpConfig::historyDurationMs` is reserved and not used by the client. If the server
+  answers the notification stream GET with 405, the `SSEClient` retries every 3 s and
+  reports it via `onStatus`.
+
+### STDIO client
+
+```cpp
+ClientConfig config;
+config.transport = TransportType::STDIO;
+config.stdio.command = "npx";                       // searched in PATH
+config.stdio.args = {"-y", "@modelcontextprotocol/server-everything"};
+config.stdio.env["API_KEY"] = "...";                // added to the inherited environment
+config.readTimeoutSeconds = 60;                     // per request
+
+client::MCPClient client;
+client.onStderr([](const std::string& line) { std::cerr << "[server] " << line << '\n'; });
+if (!client.connect(config))                        // starts the process
+    return 1;
+client.initialize({{"name", "my-host"}, {"version", "1.0"}});
+json result = client.callTool("echo", {{"message", "hi"}});
+client.disconnect();                                // stdin closed; process reaped
+```
+
+- `connect()` launches `stdio.command` with `stdio.args`, the parent's environment
+  plus `stdio.envFile` entries plus `stdio.env` (see
+  `StdioConfig::resolvedEnvironment()`), and `stdio.cwd`. The process gets piped
+  stdin/stdout; its stderr is inherited, or piped and delivered line by line to the
+  `onStderr()` callback when one is set before `connect()`. It returns false (and
+  reports through `onStatus`) when the command is empty or not found, the envFile
+  cannot be read, or the process cannot be started.
+- POSIX uses `fork()` + `execve()` (the executable is resolved in PATH beforehand);
+  Windows uses `CreateProcessW()` with anonymous pipes, tries the `PATHEXT` extensions
+  and runs `.cmd` / `.bat` files (such as `npx.cmd`) through `cmd.exe /d /s /c`.
+  All pipe descriptors are close-on-exec; writing to an exited server fails instead
+  of raising `SIGPIPE`.
+- A reader thread splits stdout into lines, matches responses to waiting requests by
+  id and runs notification handlers (on that thread). A server-to-client `ping` is
+  answered; other server requests get `-32601`. Non-JSON lines are ignored.
+- If the server exits (or closes stdout), waiting and later requests throw
+  `std::runtime_error`, `isConnected()` turns false and `onStatus` gets
+  `(false, ...)`; call `disconnect()` to reap it.
+- `disconnect()` follows the MCP shutdown sequence: close the server's stdin, wait up
+  to `stdio.shutdownTimeoutMs` (2000 ms), send `SIGTERM`, wait again, then `SIGKILL`
+  (Windows: `TerminateProcess()`), and always reaps the process, so no zombie is left.
+  `serverProcessId()` returns the pid while it runs.
+- `utils::ChildProcess` (`SocketsHpp/utils/process.h`) can be used on its own to run
+  a process with piped standard streams.
 
 ### Loading VS Code `mcp.json` entries
 
@@ -576,7 +682,7 @@ SocketsHpp::mcp::ClientConfig loadServer(const std::string& path, const std::str
 does not implement the legacy SSE handshake, see [Transports](#transports)); HTTP
 entries fill `http.url`, `headers`, `timeout`. It throws
 `std::invalid_argument` for anything else. VS Code `${input:...}` variables are not
-expanded, and STDIO configurations can be parsed but not connected.
+expanded.
 
 ## JSON-RPC layer
 
@@ -637,6 +743,7 @@ With `-DSOCKETSHPP_BUILD_TESTS=ON` (and nlohmann/json available):
 | `build/test/json_rpc_test`, `json_rpc_minimal_test` | JSON-RPC types and ids |
 | `build/test/mcp_config_test` | `ServerConfig` / `ClientConfig` parsing |
 | `build/test/mcp_streamable_test` (POSIX only) | Server over both HTTP transports, protocol versions and `MCP-Protocol-Version`, sessions, batching, typed helpers, auth, rate limiting, cancellation, resumability, client |
+| `build/test/mcp_stdio_test` | `StdioServerTransport` (streams and pipes, concurrency, cancellation, notifications, stop), `MCPClient` over STDIO against a real child process (initialize, tools, notifications, cancellation, timeouts, server exit, stderr/env/cwd, shutdown and reaping), `ChildProcess`, protocol version check, HTTP retries, `MCP-Protocol-Version`, early end of SSE responses |
 
 ```bash
 ctest --test-dir build -R "JsonRpc|MCPConfig|Mcp|StreamableHttp" --output-on-failure

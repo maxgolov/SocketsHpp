@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <optional>
@@ -25,21 +26,102 @@ namespace mcp
     /// @brief MCP transport type
     enum class TransportType
     {
-        STDIO,            ///< JSON-RPC over stdin/stdout. Server: caller-driven via MCPServer::processMessage() (no port is bound). Not supported by MCPClient.
+        STDIO,            ///< Newline-delimited JSON-RPC over stdin/stdout. Server: mcp::server::StdioServerTransport (or MCPServer::processMessage() in your own loop; no port is bound). Client: MCPClient launches the server process (StdioConfig).
         HTTP,             ///< Protocol version 2024-11-05 over POST, notifications on a GET SSE stream opened after initialize (not the legacy SSE `endpoint`-event handshake).
         HTTP_STREAMABLE   ///< Streamable HTTP: POST returns JSON or SSE; GET stream optional (MCP 2025-03-26).
     };
 
-    /// @brief Configuration for a stdio MCP server process (VS Code mcp.json "stdio" entry).
-    /// @note Parsed and stored only: MCPClient does not implement the STDIO transport,
-    ///       so no process is launched.
+    /// @brief Configuration for a stdio MCP server process (VS Code mcp.json "stdio" entry),
+    ///        launched by MCPClient::connect() for TransportType::STDIO.
     struct StdioConfig
     {
-        std::string command;                               ///< Executable to run, e.g. "npx", "node", "python".
+        /// @brief Executable to run, e.g. "npx", "node", "python". A name without a
+        ///        directory part is searched in PATH (on Windows also with the PATHEXT
+        ///        extensions; `.cmd` / `.bat` files run through cmd.exe).
+        std::string command;
         std::vector<std::string> args;                     ///< Command-line arguments (default: none).
-        std::map<std::string, std::string> env;            ///< Extra environment variables (default: none).
-        std::optional<std::string> envFile;                ///< Path to a .env file (default: unset).
+        /// @brief Extra environment variables (default: none). The server inherits this
+        ///        process's environment plus these (they override #envFile entries).
+        std::map<std::string, std::string> env;
+        /// @brief Path to a .env file whose variables are added to the environment
+        ///        (default: unset). Relative paths are resolved against the client
+        ///        process's working directory. See resolvedEnvironment().
+        std::optional<std::string> envFile;
         std::optional<std::string> cwd;                    ///< Working directory (default: unset = inherit).
+        /// @brief Grace period in milliseconds for each shutdown step of
+        ///        MCPClient::disconnect() (default 2000): after closing stdin, and again
+        ///        after SIGTERM, before the process is killed. Not read from JSON.
+        int shutdownTimeoutMs = 2000;
+
+        /// @brief Environment variables to add for the server process: #envFile entries
+        ///        overridden by #env.
+        ///
+        /// .env format: one NAME=value per line; blank lines and lines starting with '#'
+        /// are ignored; an optional leading "export " is dropped; surrounding whitespace
+        /// is trimmed; a value in matching single or double quotes is unquoted (double
+        /// quotes also expand the escapes backslash-n, -r, -t, -quote and -backslash).
+        /// No variable interpolation.
+        /// @return The merged variables.
+        /// @throws std::runtime_error if #envFile is set but cannot be opened.
+        std::map<std::string, std::string> resolvedEnvironment() const
+        {
+            std::map<std::string, std::string> result;
+            if (envFile.has_value())
+            {
+                std::ifstream in(*envFile, std::ios::binary);
+                if (!in)
+                {
+                    throw std::runtime_error("cannot read envFile: " + *envFile);
+                }
+                auto trim = [](std::string s) {
+                    const char* ws = " \t\r\n";
+                    s.erase(0, s.find_first_not_of(ws));
+                    const size_t last = s.find_last_not_of(ws);
+                    s.erase(last == std::string::npos ? 0 : last + 1);
+                    return s;
+                };
+                std::string line;
+                while (std::getline(in, line))
+                {
+                    line = trim(line);
+                    if (line.empty() || line[0] == '#')
+                        continue;
+                    if (line.compare(0, 7, "export ") == 0)
+                        line = trim(line.substr(7));
+                    const size_t eq = line.find('=');
+                    if (eq == std::string::npos)
+                        continue;
+                    const std::string name = trim(line.substr(0, eq));
+                    std::string value = trim(line.substr(eq + 1));
+                    if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'')
+                    {
+                        value = value.substr(1, value.size() - 2);
+                    }
+                    else if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+                    {
+                        std::string unescaped;
+                        for (size_t i = 1; i + 1 < value.size(); ++i)
+                        {
+                            char c = value[i];
+                            if (c == '\\' && i + 2 < value.size())
+                            {
+                                const char next = value[++i];
+                                c = next == 'n' ? '\n' : next == 'r' ? '\r' : next == 't' ? '\t' : next;
+                            }
+                            unescaped.push_back(c);
+                        }
+                        value = unescaped;
+                    }
+                    if (!name.empty())
+                        result[name] = value;
+                }
+            }
+            for (const auto& kv : env)
+            {
+                result[kv.first] = kv.second;
+            }
+            return result;
+        }
 
         /// @brief Load from JSON (VS Code mcp.json format).
         /// @param j Object with required "command" and optional "args", "env", "envFile", "cwd".
@@ -83,14 +165,17 @@ namespace mcp
         /// @brief Headers sent with every request, including the notification stream and
         ///        DELETE (e.g. {"Authorization", "Bearer ..."}). Default: none.
         std::map<std::string, std::string> headers;
-        /// @brief HTTP read timeout in seconds (default 30; <= 0 keeps the HttpClient default).
+        /// @brief HTTP socket read timeout in seconds (default 30). <= 0 uses
+        ///        ClientConfig::readTimeoutSeconds instead (and when that is <= 0 too,
+        ///        the HttpClient default of 30 s).
         int timeoutSeconds = 30;
         /// @brief Open the server-to-client notification stream after initialize() even
         ///        without a registered notification handler (default false). The stream
         ///        auto-reconnects and resends Last-Event-ID.
         bool enableResumability = false;
         /// @brief Event history duration in milliseconds (default 300000).
-        /// @note Currently not used by MCPClient.
+        /// @note Reserved: not used by MCPClient (the server-side setting is
+        ///       ServerConfig::ResumabilityConfig::historyDurationMs).
         int historyDurationMs = 300000;
 
         /// @brief Load from JSON (VS Code mcp.json format).
@@ -436,23 +521,31 @@ namespace mcp
     /// @brief Client-side MCP configuration (see mcp::client::MCPClient).
     struct ClientConfig
     {
-        /// @brief Transport (default STDIO, which MCPClient does not support: set HTTP or
-        ///        HTTP_STREAMABLE).
+        /// @brief Transport (default STDIO: MCPClient launches the #stdio server process).
         TransportType transport = TransportType::STDIO;
-        StdioConfig stdio;   ///< Used if transport == STDIO (parsed only; not supported by MCPClient).
+        StdioConfig stdio;   ///< Used if transport == STDIO.
         HttpConfig http;     ///< Used if transport == HTTP or HTTP_STREAMABLE.
 
-        /// @brief Maximum request retries (default 3).
-        /// @note Currently not used by MCPClient (requests are not retried).
+        /// @brief Protocol version MCPClient::initialize() offers (default "": "2024-11-05"
+        ///        for TransportType::HTTP, otherwise the newest version the client supports).
+        std::string protocolVersion;
+
+        /// @brief HTTP transports: how often a request is retried when the connection
+        ///        cannot be established (DNS or connect failure; nothing was sent), so
+        ///        up to maxRetries + 1 attempts (default 3; <= 0 disables retries).
+        ///        Requests that reached the server, HTTP errors and JSON-RPC errors are
+        ///        never retried. Not used by STDIO.
         int maxRetries = 3;
-        /// @brief Delay between retries in milliseconds (default 1000).
-        /// @note Currently not used by MCPClient.
+        /// @brief Delay between those retries in milliseconds (default 1000).
         int retryBackoffMs = 1000;
 
         /// @brief TCP connect timeout in seconds (default 10; <= 0 keeps the HttpClient default).
         int connectTimeoutSeconds = 10;
-        /// @brief Read timeout in seconds (default 30).
-        /// @note Currently not used; the read timeout comes from HttpConfig::timeoutSeconds.
+        /// @brief Response timeout in seconds (default 30; <= 0 = none).
+        ///
+        /// STDIO: the longest MCPClient waits for a response; on timeout it sends
+        /// `notifications/cancelled` and throws. HTTP: the socket read timeout when
+        /// HttpConfig::timeoutSeconds is <= 0 (otherwise HttpConfig::timeoutSeconds wins).
         int readTimeoutSeconds = 30;
 
         /// @brief Load from a VS Code mcp.json server entry.

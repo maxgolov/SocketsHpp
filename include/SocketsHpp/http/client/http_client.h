@@ -538,6 +538,10 @@ namespace http
             /// and on any single chunk of a chunked response (default 1 GiB).
             size_t m_maxResponseBodySize = static_cast<size_t>(1) << 30;  // 1 GiB
 
+            /// @brief Set by sendOnce() when request bytes are about to be written
+            /// (see lastRequestSent()).
+            bool m_requestSent = false;
+
             /// @brief Maximum size of the status line + header section.
             static constexpr size_t kMaxHeaderBytes = 1024 * 1024;
             /// @brief Maximum length of a chunk-size line (including extensions) or trailer line.
@@ -584,6 +588,14 @@ namespace http
             ///       established; it does not interrupt DNS resolution or connect(), and has
             ///       no effect on later requests.
             void cancel() { shutdownActiveSocket(false); }
+
+            /// @brief Whether the most recent send() wrote any part of a request to a server.
+            ///
+            /// When send() returned false and this is false, the request never left the
+            /// client (invalid URL, DNS or connect failure, or cancel() before sending),
+            /// so it is safe to retry even a non-idempotent request.
+            /// @return true if request bytes were written during the last send().
+            bool lastRequestSent() const { return m_requestSent; }
 
             /// @brief Send a GET request (see send()).
             /// @param url Target URL (http:// only).
@@ -636,6 +648,7 @@ namespace http
             bool send(HttpClientRequest& request, HttpClientResponse& response)
             {
                 HttpClientRequest current = request;  // never modify the caller's request
+                m_requestSent = false;
                 if (!m_followRedirects || m_maxRedirects <= 0)
                 {
                     return sendOnce(current, response);
@@ -808,6 +821,7 @@ namespace http
                 requestStream << "\r\n";
 
                 const std::string requestStr = requestStream.str();
+                m_requestSent = true;
                 if (!sendAll(socket, requestStr.data(), requestStr.size()))
                 {
                     LOG_ERROR("HttpClient: Failed to send request headers");

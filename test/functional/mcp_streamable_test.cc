@@ -1352,8 +1352,14 @@ static void run_client_e2e(TransportType transport)
     ASSERT_TRUE(client.connect(cc));
     auto init = client.initialize({{"name", "e2e"}, {"version", "1"}});
     EXPECT_EQ(init["serverInfo"]["name"], "client-e2e");
-    EXPECT_EQ(init["protocolVersion"],
-              transport == TransportType::HTTP_STREAMABLE ? "2025-03-26" : "2024-11-05");
+    // Streamable HTTP clients offer the newest version they support; the server answers
+    // with it or with its own newest one.
+    if (transport == TransportType::HTTP_STREAMABLE)
+        EXPECT_TRUE(init["protocolVersion"] == "2025-11-25")
+            << init["protocolVersion"];
+    else
+        EXPECT_EQ(init["protocolVersion"], "2024-11-05");
+    EXPECT_EQ(client.protocolVersion(), init["protocolVersion"].get<std::string>());
     EXPECT_EQ(initialized.load(), 1) << "client must send notifications/initialized";
     const std::string session = client.sessionId();
     EXPECT_FALSE(session.empty());
@@ -1426,9 +1432,10 @@ TEST(McpClientTest, NotificationStreamAuthenticatesAndReceivesPushes)
     client.disconnect();
 }
 
-TEST(McpClientTest, StdioTransportNotSupported)
+// STDIO needs a command to launch (the transport itself is covered by mcp_stdio_test).
+TEST(McpClientTest, StdioTransportNeedsCommand)
 {
-    ClientConfig cc;  // default-initialized transport (STDIO)
+    ClientConfig cc;  // default-initialized transport (STDIO), no command
     EXPECT_EQ(cc.transport, TransportType::STDIO);
     MCPClient client;
     EXPECT_FALSE(client.connect(cc));

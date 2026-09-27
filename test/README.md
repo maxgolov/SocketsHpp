@@ -87,6 +87,7 @@ The lists come from `test/CMakeLists.txt`.
 | `http_client_test` (POSIX only) | `HttpClient` (redirects, schemes, IPv6, bodies) and `SSEClient` |
 | `http_server_robustness_test` (POSIX only) | Request smuggling, pipelining, backpressure, error responses, thread pool, lifetime |
 | `mcp_streamable_test` (POSIX only, needs nlohmann/json) | `MCPServer` on both HTTP transports and STDIO, sessions, auth (JWT with jwt-cpp), rate limiting, cancellation, resumability, `MCPClient` |
+| `mcp_stdio_test` (needs nlohmann/json) | `StdioServerTransport`, `MCPClient` over STDIO against a real child process (the test binary re-launches itself as the server), `ChildProcess`, protocol version check, HTTP retries, `MCP-Protocol-Version`, early end of SSE responses |
 
 The POSIX-only tests drive the code over raw POSIX sockets and are not built on Windows.
 

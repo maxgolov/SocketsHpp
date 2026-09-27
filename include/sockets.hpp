@@ -4,7 +4,8 @@
 
 /// @file sockets.hpp
 /// @brief Umbrella header: includes the socket primitives, generic socket server,
-///        HTTP server / file server / client, MCP server and client, and base64 utilities.
+///        HTTP server / file server / client, MCP server (HTTP and stdio transports) and
+///        client, child processes with pipes, and base64 utilities.
 /// @note Not included here: net/tcp/tcp.h and net/server/thread_pool_server.h. JWT
 ///       support in the MCP server additionally requires SOCKETSHPP_HAS_JWT_CPP.
 
@@ -22,7 +23,9 @@
 // MCP (Model Context Protocol) server and client
 #include "SocketsHpp/mcp/common/mcp_config.h"
 #include "SocketsHpp/mcp/server/mcp_server.h"
+#include "SocketsHpp/mcp/server/stdio_server.h"
 #include "SocketsHpp/mcp/client/mcp_client.h"
 
 // Utilities
 #include "SocketsHpp/utils/base64.h"
+#include "SocketsHpp/utils/process.h"

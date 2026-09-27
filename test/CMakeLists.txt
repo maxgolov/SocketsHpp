@@ -99,6 +99,29 @@ if(NOT WIN32 AND TARGET nlohmann_json::nlohmann_json)
   gtest_discover_tests(mcp_streamable_test TEST_PREFIX functional. DISCOVERY_TIMEOUT ${SOCKETSHPP_TEST_DISCOVERY_TIMEOUT})
 endif()
 
+# MCP stdio transport tests (StdioServerTransport, MCPClient over STDIO, ChildProcess)
+# plus MCPClient retries / protocol-version handling. Portable (POSIX and Windows);
+# the client tests launch this executable itself as the MCP server process.
+if(TARGET nlohmann_json::nlohmann_json)
+  add_executable(mcp_stdio_test "functional/mcp_stdio_test.cc")
+  target_link_libraries(mcp_stdio_test
+    ${GTEST_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+    nlohmann_json::nlohmann_json)
+  target_include_directories(mcp_stdio_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  # POSIX: path of this executable for self-spawning (Windows uses GetModuleFileName).
+  target_compile_definitions(mcp_stdio_test PRIVATE MCP_STDIO_TEST_SELF="$<TARGET_FILE:mcp_stdio_test>")
+  # The translation unit exceeds the default COFF section limit on Windows.
+  if(MSVC)
+    target_compile_options(mcp_stdio_test PRIVATE /bigobj)
+  elseif(MINGW)
+    target_compile_options(mcp_stdio_test PRIVATE -Wa,-mbig-obj)
+  endif()
+  gtest_discover_tests(mcp_stdio_test TEST_PREFIX functional. DISCOVERY_TIMEOUT ${SOCKETSHPP_TEST_DISCOVERY_TIMEOUT})
+endif()
+
 # HttpClient / SSEClient functional tests. They drive the client against a scripted
 # raw POSIX-socket server (arpa/inet.h, sys/socket.h, unistd.h), so they are
 # POSIX-only and excluded from the Windows build.

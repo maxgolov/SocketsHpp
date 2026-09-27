@@ -219,6 +219,7 @@ if(SOCKETSHPP_BUILD_EXAMPLES)
     add_subdirectory(examples/08-compression)
     add_subdirectory(examples/09-full-featured)
     add_subdirectory(examples/10-typescript-interop)
+    add_subdirectory(examples/12-mcp-stdio)
     
     # Example 11 is special - it demonstrates vcpkg consumption using find_package()
     # It's designed to be built standalone with: ./setup-windows.ps1 or ./setup-linux.sh

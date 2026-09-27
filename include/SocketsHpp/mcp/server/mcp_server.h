@@ -7,8 +7,8 @@
 // HTTP) and a POST-based transport for protocol version 2024-11-05 (not the legacy
 // SSE `endpoint`-event handshake) over the SocketsHpp HTTP server. The STDIO transport is
 // supported only through MCPServer::processMessage(), driven by the caller: the
-// server never reads stdin itself and never binds a port in STDIO mode.
-// (MCPClient does not support STDIO.)
+// server never reads stdin itself and never binds a port in STDIO mode;
+// StdioServerTransport (stdio_server.h) runs that loop over stdin/stdout.
 //
 // ── NGINX INTEGRATION GUIDE ──────────────────────────────────────────────────
 //

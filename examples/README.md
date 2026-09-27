@@ -1,7 +1,7 @@
 # SocketsHpp Examples
 
 Small programs showing how to use the library. Each directory has a `main.cpp` (or
-two sources for example 10), a `CMakeLists.txt` and a README.
+two sources for examples 10 and 12), a `CMakeLists.txt` and a README.
 
 ## Building
 
@@ -36,6 +36,7 @@ consumes SocketsHpp as an installed vcpkg package (see its README).
 | [09-full-featured](09-full-featured/) | `full-featured-server` | Notes API combining the thread pool, CORS, auth middleware, proxy awareness, compression and JSON GET/POST routes |
 | [10-typescript-interop](10-typescript-interop/) | `cpp_server`, `cpp_client` | `MCPServer`/`MCPClient` interop in both directions with the official MCP TypeScript SDK (run in CI) |
 | [11-vcpkg-consumption](11-vcpkg-consumption/) | `vcpkg-consumer` | A separate project that gets SocketsHpp through the vcpkg port (overlay or git registry) and uses `find_package(SocketsHpp)` |
+| [12-mcp-stdio](12-mcp-stdio/) | `mcp-stdio-server`, `mcp-stdio-client` | MCP over stdio: `StdioServerTransport` server with `add` and a cancellable, progress-reporting `count` tool; `MCPClient` launches it as a child process, calls the tools and cancels a call |
 
 Examples 03, 04 and 06-09 use `HttpServer(name, port)`, which listens on **all IPv4
 interfaces** (the name only appears in the `Server` response header, so

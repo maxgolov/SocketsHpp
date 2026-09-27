@@ -111,7 +111,9 @@ Server helpers (opt-in headers, applied from your handlers):
   ids as string, 64-bit integer or null.
 - `mcp::server::MCPServer`: MCP protocol versions 2025-11-25, 2025-06-18 and
   2025-03-26 (Streamable HTTP) and a POST-based transport for 2024-11-05 (not the
-  legacy SSE `endpoint` handshake), plus `processMessage()` for STDIO; version
+  legacy SSE `endpoint` handshake), plus the stdio transport (`StdioServerTransport`:
+  newline-delimited JSON-RPC on stdin/stdout, concurrent requests with cancellation,
+  `notify` / `log` / `progress`) and `processMessage()` for custom loops; version
   negotiation stored per session, `MCP-Protocol-Version` header validation, JSON-RPC
   batches only for 2025-03-26 and older, sessions,
   server push (`push_event`, `push_log`, `push_progress`), resumability with
@@ -123,8 +125,15 @@ Server helpers (opt-in headers, applied from your handlers):
   `isError` results, object results `structuredContent`), `registerPrompt()`
   (`prompts/list`, `prompts/get`) and `registerResource()` (`resources/list`,
   `resources/read`), with the matching capabilities advertised in `initialize`.
-- `mcp::client::MCPClient`: HTTP and Streamable HTTP transports, tools / prompts /
-  resources helpers, notification handlers over SSE. No STDIO client.
+- `mcp::client::MCPClient`: HTTP, Streamable HTTP and stdio transports (stdio launches
+  the server process with piped stdin/stdout, env / envFile / cwd, stderr capture, and
+  shuts it down with stdin close, SIGTERM, SIGKILL and reaping); tools / prompts /
+  resources helpers, generic `request()` / `notify()`, notification handlers,
+  cancellation tokens, protocol version check (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05) and
+  `MCP-Protocol-Version` header, retries on HTTP connect failures, SSE responses read
+  only up to the matching response.
+- `utils::ChildProcess`: child processes with piped stdin/stdout/stderr
+  (`fork`/`execve` on POSIX, `CreateProcessW` on Windows).
 
 ## Utilities
 
