@@ -20,6 +20,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <map>
 #include <mutex>
@@ -1184,6 +1185,8 @@ namespace http
             SessionManager m_sessionManager;  ///< Sessions used by createSession() and the built-in DELETE handling.
             CorsConfig m_corsConfig;          ///< CORS settings.
             std::atomic<bool> m_stopped{false};  ///< Set by stop(); cleared by start().
+            /// @brief Set by shutdown(): no keep-alive, streams end, idle connections close.
+            std::atomic<bool> m_draining{false};
 
             /// @brief Idle timeout (setIdleTimeout()); 0 = disabled.
             std::chrono::milliseconds m_idleTimeout{ config::HTTP_IDLE_TIMEOUT_MS };
@@ -1925,6 +1928,90 @@ namespace http
                 closeListeningSockets();
             }
 
+            /// @brief Graceful shutdown: stop accepting, let in-flight requests finish,
+            ///        then stop() - waiting at most @p drainTimeout.
+            ///
+            /// 1. The listening sockets are closed at once (new connections are refused;
+            ///    Unix socket files are removed).
+            /// 2. Idle keep-alive connections are closed immediately (and any that
+            ///    become idle meanwhile).
+            /// 3. Requests already being received or handled complete normally; their
+            ///    responses carry "Connection: close" (a response whose headers were
+            ///    already sent with keep-alive is followed by closing the connection),
+            ///    and the connection is closed once the response has been sent.
+            /// 4. Open streams (send_chunk_stream(), SSE) are ended gracefully before
+            ///    their next chunk: the terminating chunk is sent and the stream's onEnd
+            ///    callback runs. A stream callback that is blocked (e.g. waiting for the
+            ///    next event on a thread-pool worker) is only noticed when it returns.
+            /// 5. When no connection is left - or at the deadline - the reactor is
+            ///    stopped (stop()) and any remaining connection is closed abruptly: a
+            ///    handler or stream callback still running is not interrupted, its result
+            ///    is discarded, and onEnd is not called for a stream cut this way.
+            ///
+            /// @param drainTimeout Maximum time to wait for connections to finish; 0
+            ///        closes everything right away (like stop() followed by closing the
+            ///        client connections).
+            /// @return true if every connection finished before the deadline, false if
+            ///         some were cut.
+            /// @note Blocks the caller (polling every 10 ms). Call from one thread, not
+            ///       from a handler; later stop() / shutdown() calls are no-ops. Also
+            ///       works if start() was never called.
+            bool shutdown(std::chrono::milliseconds drainTimeout)
+            {
+                if (m_stopped.load())
+                {
+                    return true;
+                }
+                using namespace std::chrono;
+                const auto deadline = steady_clock::now() + (std::max)(drainTimeout, milliseconds(0));
+                m_draining = true;
+                LOG_INFO("HttpServer: draining connections (timeout %lld ms)",
+                    static_cast<long long>(drainTimeout.count()));
+                closeListeningSockets();
+
+                bool drained = false;
+                for (;;)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                        closeFinishedConnectionsLocked();
+                        if (m_connections.empty())
+                        {
+                            drained = true;
+                            break;
+                        }
+                    }
+                    const auto now = steady_clock::now();
+                    if (now >= deadline)
+                    {
+                        break;
+                    }
+                    std::this_thread::sleep_for((std::min)(duration_cast<nanoseconds>(milliseconds(10)),
+                        duration_cast<nanoseconds>(deadline - now)));
+                }
+
+                stop();
+                if (!drained)
+                {
+                    std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                    LOG_WARN("HttpServer: drain timeout - closing %zu connection(s)", m_connections.size());
+                    for (auto& entry : m_connections)
+                    {
+                        Socket sock = entry.second.socket;
+                        if (!sock.invalid())
+                        {
+                            sock.close();
+                        }
+                    }
+                    m_connections.clear();
+                }
+                LOG_INFO("HttpServer: shut down (%s)", drained ? "drained" : "deadline reached");
+                return drained;
+            }
+
+            /// @brief Whether shutdown() has begun.
+            bool isDraining() const { return m_draining.load(); }
+
         protected:
             /// @brief Reactor callback: accept a client on listening socket @p socket
             ///        and register the new connection. Runs on the reactor thread.
@@ -2218,6 +2305,41 @@ namespace http
             }
 
         protected:
+            /// @brief During shutdown(): close every connection that has no request in
+            ///        flight - waiting between requests (Connection::Idle) or done after its
+            ///        last response (Connection::Closing, whose peer has not closed yet).
+            ///        Pending input is read and discarded first, so the close is a FIN,
+            ///        not a reset that could destroy response data still in flight.
+            ///        Called with m_connectionsMutex held.
+            void closeFinishedConnectionsLocked()
+            {
+                std::vector<Socket> finished;
+                for (auto const& entry : m_connections)
+                {
+                    const Connection& conn = entry.second;
+                    if ((conn.state == Connection::Idle && conn.receiveBuffer.empty()) ||
+                        (conn.state == Connection::Closing && conn.sendBuffer.empty()))
+                    {
+                        finished.push_back(entry.first);
+                    }
+                }
+                for (Socket sock : finished)
+                {
+                    auto it = m_connections.find(sock);
+                    if (it == m_connections.end())
+                    {
+                        continue;
+                    }
+                    char discard[4096];
+                    for (int i = 0; i < 16 && sock.recv(discard, sizeof(discard)) > 0; ++i)
+                    {
+                    }
+                    LOG_TRACE("HttpServer: [%s] closing finished connection (draining)", it->second.request.client.c_str());
+                    it->second.closeRequested = true;
+                    handleConnectionClosed(it->second);  // erases the entry
+                }
+            }
+
             /// @brief Close the connection and erase it from m_connections.
             /// @warning conn is a dangling reference once this returns.
             void handleConnectionClosed(Connection& conn)
@@ -2762,7 +2884,7 @@ namespace http
                             return;
                         }
 
-                        conn.keepalive &= allowKeepalive;
+                        conn.keepalive = conn.keepalive && allowKeepalive && !m_draining.load();
                         conn.lastActivity = std::chrono::steady_clock::now();  // idle timeout restarts
 
                         if (conn.keepalive)
@@ -2787,6 +2909,19 @@ namespace http
 
                     if (conn.state == Connection::StreamingChunked)
                     {
+                        if (m_draining.load())
+                        {
+                            // shutdown(): end the stream gracefully instead of producing
+                            // the next chunk.
+                            LOG_INFO("HttpServer: [%s] ending stream (server shutting down)", conn.request.client.c_str());
+                            conn.sendBuffer = streamTerminator(conn);
+                            conn.streamingActive = false;
+                            conn.keepalive = false;
+                            conn.state = Connection::SendingBody;
+                            invokeStreamEnd(conn.response.onStreamEnd);
+                            continue;
+                        }
+
                         // Get next chunk from callback
                         if (conn.response.streamCallback)
                         {
@@ -2834,8 +2969,8 @@ namespace http
                                         // so the normal send/keepalive path handles the rest.
                                         ac.sendBuffer = streamTerminator(ac);
                                         ac.streamingActive = false;
-                                        ac.keepalive &= kaAllowed;
-                                        if (onEndCb) onEndCb();
+                                        ac.keepalive = ac.keepalive && kaAllowed && !m_draining.load();
+                                        invokeStreamEnd(onEndCb);
                                         ac.state = Connection::SendingBody;
                                         LOG_TRACE("HttpServer: stream ended (thread pool path)");
                                     }
@@ -2876,10 +3011,7 @@ namespace http
                                     conn.request.client.c_str(), conn.chunksSent);
                                 conn.streamingActive = false;
                                 conn.state = Connection::SendingBody;
-                                if (conn.response.onStreamEnd)
-                                {
-                                    conn.response.onStreamEnd();
-                                }
+                                invokeStreamEnd(conn.response.onStreamEnd);
                                 continue;
                             }
 
@@ -3249,6 +3381,25 @@ namespace http
                 return std::string();
             }
 
+            /// @brief Run a stream's onEnd callback (if any); an exception is logged and
+            ///        swallowed so it never escapes onto the reactor or a pool thread.
+            /// @param onEnd Callback set with HttpResponse::send_chunk_stream().
+            static void invokeStreamEnd(const std::function<void()>& onEnd)
+            {
+                if (!onEnd)
+                {
+                    return;
+                }
+                try
+                {
+                    onEnd();
+                }
+                catch (...)
+                {
+                    LOG_ERROR("HttpServer: stream onEnd callback threw");
+                }
+            }
+
             /// @brief Wire format of one streamed chunk: chunked framing, or raw data for
             ///        HTTP/1.0 (see Connection::chunkedStream).
             /// @param conn Connection being streamed to
@@ -3518,7 +3669,7 @@ namespace http
                 {
                     conn.keepalive = false;
                 }
-                conn.keepalive &= allowKeepalive;
+                conn.keepalive = conn.keepalive && allowKeepalive && !m_draining.load();
 
                 conn.response.headers.erase(constants::HOST);
                 conn.response.headers["Server"] = m_serverHost;

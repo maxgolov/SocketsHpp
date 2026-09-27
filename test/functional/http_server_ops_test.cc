@@ -814,3 +814,198 @@ TEST(HttpServerAdoptTest, SocketActivationIsLinuxOnly)
     EXPECT_FALSE(SocketsHpp::net::utils::sdNotify("READY=1"));
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Graceful drain (shutdown())
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    template <typename Pred>
+    bool waitFor(Pred pred, int timeoutMs = 5000)
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (!pred())
+        {
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return true;
+    }
+
+    /// true once connecting to 127.0.0.1:port fails (listening socket closed).
+    bool connectionsRefused(int port, int timeoutMs = 3000)
+    {
+        return waitFor([port]() { return !RawConn(port).connected(); }, timeoutMs);
+    }
+}  // namespace
+
+TEST(HttpServerDrainTest, InFlightRequestCompletesIdleClosedNewRefused)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    server.enableThreadPool(2);
+    std::atomic<bool> started{ false };
+    std::atomic<bool> release{ false };
+    server.route("/slow", [&](const HttpRequest&, HttpResponse& res) {
+        started = true;
+        waitFor([&]() { return release.load(); }, 10000);
+        res.set_content("done");
+        return 200;
+    });
+    server.route("/", [](const HttpRequest&, HttpResponse& res) {
+        res.set_content("ok");
+        return 200;
+    });
+    server.start();
+
+    RawConn idle(port);
+    ASSERT_TRUE(idle.connected());
+    RawResponse first = idle.request(get("/"));
+    ASSERT_EQ(first.code, 200);
+    EXPECT_EQ(toLower(first.header("connection")), "keep-alive");
+
+    RawConn slow(port);
+    ASSERT_TRUE(slow.connected());
+    ASSERT_TRUE(slow.send(get("/slow")));
+    ASSERT_TRUE(waitFor([&]() { return started.load(); }));
+
+    std::atomic<int> result{ -1 };
+    std::thread drainer([&]() { result = server.shutdown(std::chrono::seconds(10)) ? 1 : 0; });
+
+    EXPECT_TRUE(idle.waitForClose(3000));  // idle keep-alive connection closed at once
+    EXPECT_TRUE(connectionsRefused(port));  // no longer accepting
+    EXPECT_TRUE(server.isDraining());
+    EXPECT_EQ(result.load(), -1);           // still waiting for /slow
+
+    release = true;
+    RawResponse r = slow.readResponse(5000);
+    ASSERT_TRUE(r.complete);
+    EXPECT_EQ(r.code, 200);
+    EXPECT_EQ(r.body, "done");
+    EXPECT_EQ(toLower(r.header("connection")), "close");
+    EXPECT_TRUE(slow.waitForClose(3000));
+    drainer.join();
+    EXPECT_EQ(result.load(), 1);  // drained before the deadline
+}
+
+TEST(HttpServerDrainTest, RequestStillBeingReceivedCompletes)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    server.route("/", [](const HttpRequest& req, HttpResponse& res) {
+        res.set_content(req.content);
+        return 200;
+    });
+    server.start();
+
+    RawConn c(port);
+    ASSERT_TRUE(c.connected());
+    ASSERT_TRUE(c.send("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\n\r\nabc"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // head received, body partial
+
+    std::atomic<int> result{ -1 };
+    std::thread drainer([&]() { result = server.shutdown(std::chrono::seconds(10)) ? 1 : 0; });
+    EXPECT_TRUE(connectionsRefused(port));
+    ASSERT_TRUE(c.send("def"));
+    RawResponse r = c.readResponse(5000);
+    ASSERT_TRUE(r.complete);
+    EXPECT_EQ(r.body, "abcdef");
+    EXPECT_EQ(toLower(r.header("connection")), "close");
+    drainer.join();
+    EXPECT_EQ(result.load(), 1);
+}
+
+TEST(HttpServerDrainTest, StreamsAreEndedGracefully)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    std::atomic<int> chunks{ 0 };
+    std::atomic<bool> ended{ false };
+    server.route("/events", [&](const HttpRequest&, HttpResponse& res) {
+        res.set_header("Content-Type", "text/event-stream");
+        res.send_chunk_stream(
+            [&]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                return "data: " + std::to_string(++chunks) + "\n\n";
+            },
+            [&]() { ended = true; });
+        return 200;
+    });
+    server.start();
+
+    RawConn c(port);
+    ASSERT_TRUE(c.connected());
+    ASSERT_TRUE(c.send(get("/events")));
+    ASSERT_TRUE(waitFor([&]() { return chunks.load() >= 3; }));
+
+    std::atomic<int> result{ -1 };
+    std::thread drainer([&]() { result = server.shutdown(std::chrono::seconds(10)) ? 1 : 0; });
+    RawResponse r = c.readResponse(8000);
+    EXPECT_TRUE(r.complete);  // terminating chunk received
+    EXPECT_NE(r.body.find("data: 1\n\n"), std::string::npos);
+    drainer.join();
+    EXPECT_EQ(result.load(), 1);
+    EXPECT_TRUE(ended.load());
+}
+
+TEST(HttpServerDrainTest, DeadlineCutsBlockedStream)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    server.enableThreadPool(2);
+    std::atomic<bool> release{ false };
+    std::atomic<int> calls{ 0 };
+    std::atomic<bool> ended{ false };
+    server.route("/events", [&](const HttpRequest&, HttpResponse& res) {
+        res.set_header("Content-Type", "text/event-stream");
+        res.send_chunk_stream(
+            [&]() {
+                if (++calls > 1)
+                {
+                    waitFor([&]() { return release.load(); }, 10000);  // blocks past the deadline
+                }
+                return std::string("data: x\n\n");
+            },
+            [&]() { ended = true; });
+        return 200;
+    });
+    server.start();
+
+    RawConn c(port);
+    ASSERT_TRUE(c.connected());
+    ASSERT_TRUE(c.send(get("/events")));
+    ASSERT_TRUE(waitFor([&]() { return calls.load() >= 2; }));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(server.shutdown(std::chrono::milliseconds(300)));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(250));
+    EXPECT_LT(elapsed, std::chrono::seconds(3));
+
+    RawResponse r = c.readResponse(3000);
+    EXPECT_FALSE(r.complete);  // cut: no terminating chunk
+    EXPECT_TRUE(c.waitForClose(3000));
+    release = true;  // let the pool worker finish (the destructor waits for it)
+    EXPECT_FALSE(ended.load());
+}
+
+TEST(HttpServerDrainTest, ShutdownWithoutStartOrConnections)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    EXPECT_TRUE(server.shutdown(std::chrono::milliseconds(100)));
+    EXPECT_FALSE(RawConn(port).connected());
+    EXPECT_TRUE(server.shutdown(std::chrono::milliseconds(100)));  // idempotent
+
+    HttpServer started;
+    int port2 = started.addListeningPort("127.0.0.1", 0);
+    started.start();
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(started.shutdown(std::chrono::seconds(5)));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+    EXPECT_FALSE(RawConn(port2).connected());
+}
