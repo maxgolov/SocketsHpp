@@ -50,12 +50,34 @@ Application features:
 - `HttpRequest` helpers: case-insensitive `get_header_value()` / `has_header()`,
   URL-decoding `parse_query()`, `Accept` parsing with q-values (`accepts()`,
   `get_accepted_types()`).
-- CORS headers and preflight (`enableCors()`, `setCorsOrigin()`, `setCorsHeaders()`).
+- CORS headers and preflight (`enableCors()`, `setCorsOrigin()`, `setCorsMethods()`,
+  `setCorsHeaders()`).
+- Response header names are Title-Cased, keeping `WWW-Authenticate`, `ETag`, `TE` and
+  `DNT` spelled conventionally.
+- `multipart.h`: `multipart::parse()` splits `multipart/form-data` bodies into parts
+  (field name, filename incl. RFC 5987 `filename*`, content type, headers, binary-safe
+  `string_view` data) with limits on parts and part headers; malformed input returns an
+  error instead of throwing. Raw uploads use `HttpRequest::content` directly.
 - Session manager with timeouts and optional event history (used by the MCP server).
 - Server-Sent Events: `SSEEvent` formatting (CR/LF-safe fields, multi-line data),
   automatic `Cache-Control: no-cache` and `X-Accel-Buffering: no`.
 - Optional worker pool (`enableThreadPool()`) so handlers and stream callbacks do not
   block the reactor.
+Deployment and operations:
+
+- Listening on Unix domain sockets (`addListeningUnixSocket()`: stale-file cleanup,
+  optional permissions, file removed on stop; peers reported as `"unix"`), and
+  `HttpClient::setUnixSocketPath()` on the client side.
+- systemd socket activation (`addInheritedListeningSockets()`, Linux) and adoption of
+  any listening socket (`adoptListeningSocket()`); `net::utils::sdNotify()` speaks the
+  `sd_notify` protocol without libsystemd.
+- Graceful drain: `shutdown(drainTimeout)` stops accepting, closes idle connections,
+  finishes in-flight requests with `Connection: close`, ends streams (running `onEnd`)
+  and cuts whatever is left at the deadline.
+- `metrics()` counters (connections accepted / refused / active, requests, responses by
+  status class, timeouts, bytes) and a Prometheus text endpoint
+  (`enableMetricsEndpoint()`); `setMaxConnections()`.
+
 - `HttpFileServer`: static files from a document root with percent-decoding,
   path-traversal and symlink containment checks, `index.html` for extension-less paths
   and MIME types by extension. Files are read fully into memory.
@@ -139,7 +161,10 @@ Server helpers (opt-in headers, applied from your handlers):
 
 - `utils::Base64` (RFC 4648, strict decoding) - see
   [include/SocketsHpp/utils/README.md](../include/SocketsHpp/utils/README.md).
-- Logging hooks: `LOG_*` macros compiled out by default, `HAVE_CONSOLE_LOG` for stdout.
+- Logging: the `LOG_*` macros route to a runtime handler (`SocketsHpp::setLogHandler()`,
+  `setLogLevel()`; `utils/log.h`) that costs one atomic load while unset;
+  `HAVE_CONSOLE_LOG` prints to stdout, your own `LOG_*` macros take precedence, and
+  `SOCKETSHPP_NO_RUNTIME_LOG` compiles logging out.
 
 ## Not implemented
 
@@ -151,7 +176,7 @@ Server helpers (opt-in headers, applied from your handlers):
 | Built-in compression codecs | Framework only; bring zlib/brotli/zstd or compress in the proxy. |
 | Caching / conditional requests | No `ETag`, `If-None-Match`, `If-Modified-Since` handling. |
 | Range requests | No `206 Partial Content`. |
-| Multipart / form parsing | Bodies are delivered raw in `HttpRequest::content`. |
+| Streaming uploads | Bodies (including `multipart/form-data`) are buffered completely before the handler runs. `application/x-www-form-urlencoded` bodies are not parsed (use `parse_query()`-style decoding yourself). |
 | Global middleware chain | Auth, compression and proxy helpers are called from handlers. |
 | Send timeout on the server | A client that stops reading a response or stream is not timed out; use a reverse proxy. |
 | Host header validation | Duplicate `Host` is rejected, but the value is not checked. |
@@ -163,7 +188,9 @@ Server helpers (opt-in headers, applied from your handlers):
 - One reactor thread per server. Without `enableThreadPool()`, a slow handler or a
   blocking stream callback stalls all connections of that server.
 - On Windows a reactor watches at most 64 sockets (listening sockets included);
-  further connections are accepted and closed immediately.
+  further connections are accepted and closed immediately (and counted as refused).
+- Unix domain listening sockets and socket activation suit services behind a local
+  proxy; see the README for an nginx `upstream ... unix:` example and systemd units.
 - Request bodies are buffered in memory (bounded by `setRequestLimits()`), as are
   static files served by `HttpFileServer`.
 - For internet-facing services, run behind nginx, Caddy or HAProxy for TLS, timeouts,

@@ -68,7 +68,8 @@ The lists come from `test/CMakeLists.txt`.
 | `compression_test` | Registry, `Accept-Encoding` negotiation, middleware (plus the Windows codecs on Windows) |
 | `sse_parser_test` | `SSEParser` (WHATWG parsing rules) |
 | `thread_pool_server_test` | `net::server::ThreadPoolServer` |
-| `http_server_hardening_test` | Query parsing limits, SSE formatting, session ids, file-server path containment, auth/compression/proxy hardening |
+| `http_server_hardening_test` | Query parsing limits, SSE formatting, session ids, file-server path containment, auth/compression/proxy hardening, header name casing |
+| `multipart_test` | `multipart::parse()`: boundaries, fields and files, binary data, malformed input, limits, randomized fuzzing |
 | `json_rpc_test`, `json_rpc_minimal_test` | JSON-RPC 2.0 types and ids (need nlohmann/json) |
 | `mcp_config_test` | `ServerConfig` / `ClientConfig` parsing (needs nlohmann/json) |
 
@@ -84,6 +85,8 @@ The lists come from `test/CMakeLists.txt`.
 | `http_streaming_test` | Chunked streaming and SSE responses |
 | `http_methods_test` | Methods, HEAD, OPTIONS/CORS, DELETE |
 | `http_file_server_test` | `HttpFileServer` |
+| `http_server_ops_test` | Header casing, CORS methods, runtime log handler, Unix domain listening sockets and `HttpClient` over them, adopted / systemd-activated sockets and `sdNotify()` (Linux), graceful `shutdown()`, metrics and `/metrics`, multipart upload |
+| `mcp_unix_socket_test` (needs nlohmann/json) | `MCPServer` with `ServerConfig::unixSocketPath` |
 | `http_client_test` (POSIX only) | `HttpClient` (redirects, schemes, IPv6, bodies) and `SSEClient` |
 | `http_server_robustness_test` (POSIX only) | Request smuggling, pipelining, backpressure, error responses, thread pool, lifetime |
 | `mcp_streamable_test` (POSIX only, needs nlohmann/json) | `MCPServer` on both HTTP transports and STDIO, sessions, auth (JWT with jwt-cpp), rate limiting, cancellation, resumability, `MCPClient` |

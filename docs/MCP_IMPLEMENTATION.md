@@ -98,6 +98,14 @@ Key points:
 - **Loopback guard:** `listen()` refuses to bind anything other than `127.0.0.1`,
   `localhost`, `::1` or `[::1]` unless `config.allowNonLoopback = true`. `0.0.0.0`
   therefore throws by default.
+- **Unix domain socket:** with `config.unixSocketPath` set, `listen()` binds only that
+  socket (via `HttpServer::addListeningUnixSocket()`: a stale socket file is replaced,
+  `config.unixSocketPermissions` such as `0660` is applied with `chmod()`, and the file
+  is removed by `stop()`). `host` and `port` are then ignored, the loopback guard does
+  not apply (filesystem permissions control access) and `port()` returns -1. Clients
+  are reported as `"unix"`, so per-client rate limiting sees a single client unless
+  `trustProxyHeaders` is set. Not available on Windows without `<afunix.h>`
+  (`listen()` throws).
 
 ### Built-in methods
 
@@ -493,6 +501,7 @@ launches it.
 | `serverName`, `serverVersion` | `"mcp-server"`, `"1.0.0"` | Default `serverInfo` and `/health` |
 | `host`, `port`, `endpoint` | `"127.0.0.1"`, `8080`, `"/mcp"` | |
 | `allowNonLoopback` | `false` | Loopback guard for `listen()` |
+| `unixSocketPath`, `unixSocketPermissions` | empty, `-1` | Listen on a Unix domain socket instead of `host:port`; see above |
 | `allowedOrigins` | empty | Browser origins allowed besides loopback ones; see [Origin validation](#origin-validation) |
 | `responseMode` | `BATCH` | `STREAM` only affects legacy `initialize` (see above) |
 | `maxMessageSize` | 4 MB | HTTP request body limit |
@@ -734,6 +743,21 @@ location /mcp {
 }
 ```
 
+Or skip the TCP port and let nginx connect over a Unix domain socket
+(`config.unixSocketPath = "/run/mcp/mcp.sock"; config.unixSocketPermissions = 0660;`):
+
+```nginx
+location /mcp {
+    proxy_pass         http://unix:/run/mcp/mcp.sock:;
+    proxy_http_version 1.1;
+    proxy_set_header   Connection "";
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Forwarded-For $remote_addr;
+    proxy_buffering    off;
+    proxy_read_timeout 3600s;
+}
+```
+
 ## Tests
 
 With `-DSOCKETSHPP_BUILD_TESTS=ON` (and nlohmann/json available):
@@ -744,6 +768,7 @@ With `-DSOCKETSHPP_BUILD_TESTS=ON` (and nlohmann/json available):
 | `build/test/mcp_config_test` | `ServerConfig` / `ClientConfig` parsing |
 | `build/test/mcp_streamable_test` (POSIX only) | Server over both HTTP transports, protocol versions and `MCP-Protocol-Version`, sessions, batching, typed helpers, auth, rate limiting, cancellation, resumability, client |
 | `build/test/mcp_stdio_test` | `StdioServerTransport` (streams and pipes, concurrency, cancellation, notifications, stop), `MCPClient` over STDIO against a real child process (initialize, tools, notifications, cancellation, timeouts, server exit, stderr/env/cwd, shutdown and reaping), `ChildProcess`, protocol version check, HTTP retries, `MCP-Protocol-Version`, early end of SSE responses |
+| `build/test/mcp_unix_socket_test` | `ServerConfig::unixSocketPath` (skipped where AF_UNIX is unavailable) |
 
 ```bash
 ctest --test-dir build -R "JsonRpc|MCPConfig|Mcp|StreamableHttp" --output-on-failure

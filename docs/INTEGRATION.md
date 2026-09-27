@@ -208,7 +208,10 @@ int main()
 | Undefined references to `WSAStartup`, `socket`, ... with MinGW | Link `ws2_32` (the CMake target does this). |
 | Undefined references to `pthread_*` | Link threads (`-pthread`, or `Threads::Threads`). |
 | `Could not find a package configuration file provided by "SocketsHpp"` | Set `CMAKE_PREFIX_PATH` to the install prefix, or use the vcpkg toolchain file with the port (see [vcpkg](#vcpkg)). |
-| `SSRF guard: refusing to bind to non-loopback address` | `MCPServer` binds loopback only unless `ServerConfig::allowNonLoopback` is set. |
+| `SSRF guard: refusing to bind to non-loopback address` | `MCPServer` binds loopback only unless `ServerConfig::allowNonLoopback` is set (or listen on `ServerConfig::unixSocketPath` behind a local proxy). |
+| No log output from the library | Nothing is logged until you install a handler with `SocketsHpp::setLogHandler()` (`<SocketsHpp/utils/log.h>`), define `HAVE_CONSOLE_LOG`, or define your own `LOG_*` macros before including SocketsHpp. |
+| Errors mentioning `LOG_DEBUG` / `LOG_INFO` arguments after upgrading | The default `LOG_*` macros now compile their arguments (they reach the runtime log hook); define `SOCKETSHPP_NO_RUNTIME_LOG` for the old no-op macros. |
+| `Refusing to replace ...: exists and is not a socket` / `... is in use by another server` | `HttpServer::addListeningUnixSocket()` only replaces stale socket files; remove the file or stop the other server. |
 
 ## Next steps
 

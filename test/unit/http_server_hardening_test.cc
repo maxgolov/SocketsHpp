@@ -168,6 +168,19 @@ TEST(ProxyAwareHardeningTest, XffWalksRightToLeft)
     EXPECT_EQ(ProxyAwareHelpers::getClientIP(headers, "10.0.0.1:5000", config), "203.0.113.7");
 }
 
+TEST(ProxyAwareHardeningTest, UnixSocketPeerCanBeTrusted)
+{
+    // HttpServer reports Unix domain socket peers as "unix".
+    TrustProxyConfig config;
+    config.addTrustedProxy("unix");
+    std::map<std::string, std::string> headers;
+    headers["X-Forwarded-For"] = "203.0.113.9";
+    EXPECT_TRUE(config.isTrusted("unix"));
+    EXPECT_EQ(ProxyAwareHelpers::getClientIP(headers, "unix", config), "203.0.113.9");
+    TrustProxyConfig none;
+    EXPECT_EQ(ProxyAwareHelpers::getClientIP(headers, "unix", none), "unix");
+}
+
 TEST(ProxyAwareHardeningTest, XffIgnoredFromUntrustedPeer)
 {
     TrustProxyConfig config(std::vector<std::string>{"10.0.0.1"});

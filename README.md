@@ -9,7 +9,7 @@ HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protoc
 - **Header-only**: nothing to compile or link beyond the system socket library and
   threads; `#include <sockets.hpp>` (or individual headers under `SocketsHpp/`).
   `sockets.hpp` covers sockets, `SocketServer`, `HttpServer`/`HttpFileServer`,
-  `HttpClient`/`SSEClient`, MCP and Base64; include `net/tcp/tcp.h`,
+  `HttpClient`/`SSEClient`, MCP, Base64, the multipart parser and the log hook; include `net/tcp/tcp.h`,
   `net/server/thread_pool_server.h`, `http/server/authentication.h`,
   `http/server/compression*.h` and `http/server/proxy_aware.h` explicitly.
 - **Sockets**: thin RAII-friendly wrappers over BSD sockets / WinSock (TCP, UDP,
@@ -23,6 +23,10 @@ HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protoc
   chunked request bodies, `Expect: 100-continue`, HEAD, CORS, request size limits,
   idle and request timeouts (slowloris protection), strict request parsing (ambiguous `Content-Length` / `Transfer-Encoding` framing is
   rejected), optional worker thread pool, chunked streaming responses and SSE.
+- **Deployment**: listen on Unix domain sockets (for nginx `proxy_pass http://unix:...`),
+  systemd socket activation and `sd_notify` without libsystemd, graceful drain on
+  shutdown, a runtime log hook, counters with a Prometheus `/metrics` endpoint, and a
+  `multipart/form-data` parser.
 - **Static files** (`HttpFileServer`): serves a document root with path-traversal
   protection and MIME types.
 - **HTTP client** (`HttpClient`): plain `http://` only (no TLS), redirects,
@@ -342,7 +346,7 @@ several ports (`getListeningPorts()`).
   Returning `0` without touching the response declines, and the next candidate runs.
   Returning `-1` closes the connection without a response.
 - If no handler takes the request: `OPTIONS` gets 204 when CORS is enabled
-  (`enableCors()`, `setCorsOrigin()`, `setCorsHeaders()`) and 405 otherwise; `DELETE`
+  (`enableCors()`, `setCorsOrigin()`, `setCorsMethods()`, `setCorsHeaders()`) and 405 otherwise; `DELETE`
   with an `Mcp-Session-Id` header terminates that session of the server's built-in
   session manager (200, or 404 if the id is unknown); everything else gets 404.
 - `HEAD` is dispatched as `GET` and the body is dropped.
@@ -374,9 +378,14 @@ first byte - a slowloris client trickling header bytes, or a stalled body - gets
 reactor or the thread pool), sending responses and streaming (`send_chunk_stream()`,
 SSE) is never limited, so long-lived SSE streams stay open. `0` disables either
 timeout. The reactor checks them about every timeout/4 (10-500 ms), so a connection
-may live slightly longer than the limit. `stop()` stops the reactor; a
-stopped server cannot be restarted (create a new one), and open client connections are
-closed when the server object is destroyed.
+may live slightly longer than the limit. `stop()` stops the reactor and closes the
+listening sockets; a stopped server cannot be restarted (create a new one), and open
+client connections are closed when the server object is destroyed. For a graceful
+stop use `shutdown(drainTimeout)` ([Graceful shutdown](#graceful-shutdown)).
+
+Response header names are stored Title-Case (`set_header("x-request-id", ...)` sends
+`X-Request-Id`), except for the conventional spellings `WWW-Authenticate`, `ETag`,
+`TE` and `DNT`. Header names are case-insensitive in HTTP either way.
 
 **Static files.** `HttpFileServer` serves a directory:
 
@@ -439,6 +448,188 @@ Size the pool for the number of concurrent streams: a stream callback that block
 the `sleep_for` above) holds a worker for that time, so more open streams than
 workers delay every other request. `MCPServer::listen()` uses a fixed pool of 4
 workers, so MCP handlers run concurrently and must be thread-safe.
+
+### Unix domain sockets (behind nginx)
+
+A service that is only reached through a reverse proxy on the same host does not need
+a TCP port at all:
+
+```cpp
+HttpServer server;
+server.addListeningUnixSocket("/run/myapp/http.sock", 0660);  // chmod after bind
+server.route("/", handler);
+server.start();
+```
+
+`addListeningUnixSocket(path, permissions = -1)` removes a stale socket file left by a
+previous run (it refuses a path that is not a socket, or a socket another server is
+still accepting on), applies `permissions` with `chmod()` when given (POSIX), and
+removes the file again when the server stops. Requests arriving on it have
+`req.client == "unix"`; for the end-user address use the proxy's headers with
+`TrustProxyConfig::addTrustedProxy("unix")` (see
+[Behind a reverse proxy](#behind-a-reverse-proxy)). TCP and Unix
+listeners can be combined; `getListeningPort()` reports only TCP ports and
+`getListeningUnixSockets()` the paths. Unix sockets need `<afunix.h>` on Windows;
+elsewhere the call throws `std::runtime_error`.
+
+```nginx
+upstream myapp {
+    server unix:/run/myapp/http.sock;
+    keepalive 16;
+}
+server {
+    listen 443 ssl;
+    location / {
+        proxy_pass http://myapp;           # or directly: proxy_pass http://unix:/run/myapp/http.sock:;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;               # for SSE / streaming routes
+    }
+}
+```
+
+nginx must be able to open the socket: create it with a group nginx belongs to
+(e.g. `0660` and a shared group) or in a directory only the two services can reach.
+`HttpClient::setUnixSocketPath(path)` sends requests over a Unix socket (like
+`curl --unix-socket`); the URL still provides the target and `Host`:
+`client.get("http://localhost/health", res)`. `MCPServer` has
+`ServerConfig::unixSocketPath` (see [docs/MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md)).
+
+### systemd socket activation
+
+With socket activation systemd owns the listening socket (privileged ports, zero-downtime
+restarts, on-demand start) and passes it to the service as fd 3:
+
+```cpp
+#include <SocketsHpp/http/server/http_server.h>
+
+HttpServer server;
+if (server.addInheritedListeningSockets() == 0)  // LISTEN_PID / LISTEN_FDS
+    server.addListeningPort("127.0.0.1", 8080);   // started by hand: bind ourselves
+server.route("/", handler);
+server.start();
+SocketsHpp::net::utils::sdNotify("READY=1");     // Type=notify; no-op without NOTIFY_SOCKET
+```
+
+```ini
+# myapp.socket
+[Socket]
+ListenStream=/run/myapp/http.sock    # or ListenStream=127.0.0.1:8080
+SocketMode=0660
+SocketGroup=www-data
+
+[Install]
+WantedBy=sockets.target
+
+# myapp.service
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/myapp
+```
+
+`addInheritedListeningSockets()` adopts every inherited descriptor that is a listening
+stream socket (TCP or Unix; others are skipped with a warning) when `LISTEN_PID` is this
+process, unsets `LISTEN_PID`/`LISTEN_FDS`/`LISTEN_FDNAMES` by default and returns the
+number adopted. It is Linux-only and returns 0 elsewhere; `sdNotify()` likewise returns
+`false` off Linux. `adoptListeningSocket(handle)` adopts any listening socket you
+already have, on every platform. Adopted sockets are closed on stop, but a Unix socket
+file created by systemd is left alone.
+
+### Graceful shutdown
+
+`shutdown(drainTimeout)` stops a server without cutting requests off:
+
+```cpp
+// e.g. on SIGTERM, from the main thread:
+bool clean = server.shutdown(std::chrono::seconds(10));
+```
+
+It closes the listening sockets at once (new connections are refused, Unix socket files
+removed), closes idle keep-alive connections, lets requests that are being received or
+handled finish - their responses carry `Connection: close` and the connection is closed
+afterwards - and ends open streams (`send_chunk_stream()`, SSE) before their next chunk
+by sending the terminating chunk and running the stream's `onEnd` callback. It returns
+`true` when all connections finished in time. At the deadline the reactor is stopped and
+the remaining connections are closed abruptly: a handler or stream callback that is
+still running (e.g. blocked on a pool worker waiting for the next event) is not
+interrupted, its result is discarded, and `onEnd` is not called for such a stream.
+`shutdown()` blocks the calling thread; `isDraining()` tells handlers a shutdown is in
+progress. `stop()` remains the immediate variant.
+
+### Logging
+
+Unless you define your own `LOG_*` macros (or `HAVE_CONSOLE_LOG`), library messages go
+to an optional runtime handler:
+
+```cpp
+#include <SocketsHpp/utils/log.h>
+
+SocketsHpp::setLogHandler([](SocketsHpp::LogLevel level, const char* message) {
+    std::fprintf(stderr, "[%s] %s\n", SocketsHpp::logLevelName(level), message);
+});
+SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Warn);  // default Info; Trace is very verbose
+```
+
+Without a handler a log statement costs one relaxed atomic load and its arguments are
+not evaluated; define `SOCKETSHPP_NO_RUNTIME_LOG` to compile the statements out
+completely. The handler is process-wide, may be called concurrently from the reactor,
+pool workers and API callers - sometimes while server locks are held - so it must be
+thread-safe and quick and must not call back into the server. `setLogHandler(nullptr)`
+removes it.
+
+### Metrics
+
+```cpp
+server.enableMetricsEndpoint("/metrics");   // Prometheus text format, GET only
+HttpServerMetrics m = server.metrics();     // lock-free snapshot
+```
+
+Counters: connections accepted / refused / active, requests, responses by status class
+(`1xx`..`5xx`, including errors the server generates such as 400, 408, 413), timeouts
+(idle and request) and bytes received / sent. The endpoint serves
+`text/plain; version=0.0.4` with metrics named `socketshpp_http_*`;
+`HttpServer::formatPrometheus(metrics())` renders the same text for your own endpoint
+(e.g. with extra application metrics). The endpoint is public to whoever can reach the
+server. `setMaxConnections(n)` limits open client connections; connections beyond it
+are accepted and closed at once and counted as refused.
+
+### Request bodies: raw uploads and multipart/form-data
+
+`req.content` is the complete, binary-safe request body (a `std::string` that may
+contain NUL bytes; a chunked body is already decoded). For raw uploads such as
+`curl --data-binary @file -H 'Content-Type: application/octet-stream'` use it directly.
+HTML forms with file inputs send `multipart/form-data`; parse those with
+`http/server/multipart.h`:
+
+```cpp
+#include <SocketsHpp/http/server/multipart.h>
+
+server.route("/upload", [](const HttpRequest& req, HttpResponse& res) -> int {
+    auto form = multipart::parse(req);  // boundary from Content-Type
+    if (!form)
+    {
+        res.set_content(multipart::errorMessage(form.error));
+        return 400;
+    }
+    for (const multipart::Part& part : form.parts)
+    {
+        // part.name, part.filename / isFile(), part.contentType, part.headers,
+        // part.data (std::string_view into req.content - no copy, binary-safe)
+    }
+    return 204;
+});
+```
+
+The parser never throws on malformed input (it returns an `Error`), limits the number
+of parts (100), the header block size per part (8 KB) and the fields per part (32)
+through `multipart::Limits`, and ignores the preamble and epilogue. `Part::data` views
+the request body, so copy what you keep beyond the handler. `filename` is what the
+client sent - never use it as a path without sanitizing it. The whole body is buffered
+first, so uploads are bounded by `setRequestLimits()` / `setMaxRequestContentSize()`
+(2 MB by default).
 
 ### HTTP client
 
@@ -756,7 +947,8 @@ coroutines, multiple reactors, io_uring/IOCP, senders/receivers).
 
 - On Windows a reactor waits on at most 64 event handles (`WSA_MAXIMUM_WAIT_EVENTS`),
   so one server handles at most 64 sockets at a time, listening sockets included.
-  Further connections are accepted and closed immediately (logged with `LOG_WARN`).
+  Further connections are accepted and closed immediately (logged with `LOG_WARN` and
+  counted in `HttpServerMetrics::connectionsRefused`).
   Keep Windows servers behind a proxy, or well below 64 concurrent connections.
   WinSock is initialized automatically.
 - Other POSIX systems (FreeBSD, ...) have no reactor backend and are not supported.
@@ -771,10 +963,19 @@ coroutines, multiple reactors, io_uring/IOCP, senders/receivers).
   stream (there is no send timeout); keep a reverse proxy in front of servers
   exposed to untrusted networks.
 - Unix domain sockets are available on POSIX systems and on Windows when the SDK
-  provides `<afunix.h>` (Windows 10 SDK 17063 or later).
-- Logging is compiled out by default. Define `HAVE_CONSOLE_LOG` to print to stdout,
-  or define `LOG_DEBUG` / `LOG_TRACE` / `LOG_INFO` / `LOG_WARN` / `LOG_ERROR` yourself
-  before including the headers.
+  provides `<afunix.h>` (Windows 10 SDK 17063 or later). Abstract (Linux) socket names
+  can be adopted (`adoptListeningSocket()`) but not created by
+  `addListeningUnixSocket()`. systemd socket activation and `sdNotify()` are Linux-only.
+- Logging goes to `SocketsHpp::setLogHandler()` (nothing is logged until a handler is
+  set). Define `HAVE_CONSOLE_LOG` to print to stdout instead, define `LOG_DEBUG` /
+  `LOG_TRACE` / `LOG_INFO` / `LOG_WARN` / `LOG_ERROR` yourself before including the
+  headers, or define `SOCKETSHPP_NO_RUNTIME_LOG` to compile logging out. Formatted
+  messages are truncated at 2 KB.
+- Request bodies are buffered in memory (default limit 2 MB); there is no streaming
+  upload API, and `multipart::parse()` works on the buffered body (defaults: 100 parts,
+  8 KB of headers and 32 fields per part).
+- `shutdown()` cannot interrupt a handler or stream callback that is blocked; at the
+  drain deadline such connections are closed and the callback's result is discarded.
 
 ## Header-only guarantee
 
