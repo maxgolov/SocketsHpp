@@ -55,7 +55,7 @@ curl -u alice:wonderland http://localhost:8080/api/user
 # No or wrong credentials: 401
 curl -i http://localhost:8080/api/user
 # HTTP/1.1 401 Unauthorized
-# Www-Authenticate: Bearer realm="API", Basic realm="Restricted"
+# WWW-Authenticate: Bearer realm="API", Basic realm="Restricted"
 # {"error": "Unauthorized"}
 
 # Role check
@@ -70,11 +70,8 @@ curl -H "X-API-Key: api_key_abc" http://localhost:8080/api/service
 # {"service":"service1"}
 curl -i http://localhost:8080/api/service
 # HTTP/1.1 401 Unauthorized
-# Www-Authenticate: API-Key header="X-API-Key"
+# WWW-Authenticate: API-Key header="X-API-Key"
 ```
-
-(Header names are case-insensitive; the server prints `WWW-Authenticate` as
-`Www-Authenticate`.)
 
 ## Valid credentials
 

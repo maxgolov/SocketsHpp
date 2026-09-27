@@ -542,6 +542,11 @@ namespace http
 
             /// @brief Normalize a header name to Title-Case (each '-'-separated word
             ///        capitalized, the rest lower-cased), e.g. "x-api-KEY" -> "X-Api-Key".
+            ///
+            /// A few registered names whose conventional spelling is not Title-Case keep
+            /// it: "WWW-Authenticate", "ETag", "TE" and "DNT" (so "www-authenticate"
+            /// becomes "WWW-Authenticate", not "Www-Authenticate"). Header names are
+            /// case-insensitive in HTTP; this only affects how they are stored and sent.
             /// @param name Header name in any case
             /// @return Normalized header name
             static std::string normalize_header_name(const std::string& name)
@@ -562,6 +567,20 @@ namespace http
                     else
                     {
                         ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
+                    }
+                }
+                // Well-known exceptions to Title-Case (compared after normalization).
+                static const char* const kExceptions[][2] = {
+                    { "Www-Authenticate", "WWW-Authenticate" },
+                    { "Etag", "ETag" },
+                    { "Te", "TE" },
+                    { "Dnt", "DNT" },
+                };
+                for (auto const& exception : kExceptions)
+                {
+                    if (result == exception[0])
+                    {
+                        return exception[1];
                     }
                 }
                 return result;
@@ -1311,6 +1330,11 @@ namespace http
 
             /// @brief Set Access-Control-Allow-Origin (default "*"). Call before start().
             void setCorsOrigin(const std::string& origin) { m_corsConfig.allowOrigin = origin; }
+
+            /// @brief Set Access-Control-Allow-Methods (default
+            ///        constants::CORS_DEFAULT_METHODS). Call before start().
+            /// @param methods Comma-separated method list, e.g. "GET, POST, OPTIONS".
+            void setCorsMethods(const std::string& methods) { m_corsConfig.allowMethods = methods; }
 
             /// @brief Set Access-Control-Allow-Headers and, if non-empty,
             ///        Access-Control-Expose-Headers. Call before start().

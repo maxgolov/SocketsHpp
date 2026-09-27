@@ -240,7 +240,7 @@ TEST(AuthHardeningTest, AllChallengesAreReported)
     HttpRequest req;
     HttpResponse res;
     EXPECT_FALSE(middleware.authenticate(req, res));
-    EXPECT_EQ(res.headers["Www-Authenticate"], "Bearer realm=\"api\", Basic realm=\"site\"");
+    EXPECT_EQ(res.headers["WWW-Authenticate"], "Bearer realm=\"api\", Basic realm=\"site\"");
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +455,30 @@ TEST(SessionManagerHistoryTest, SessionLimitIsEnforced)
     sm.createSession();
     sm.createSession();
     EXPECT_THROW(sm.createSession(), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// Header name normalization
+// ---------------------------------------------------------------------------
+
+TEST(HeaderNameTest, TitleCaseWithWellKnownExceptions)
+{
+    EXPECT_EQ(HttpRequest::normalize_header_name("content-type"), "Content-Type");
+    EXPECT_EQ(HttpRequest::normalize_header_name("X-API-KEY"), "X-Api-Key");
+    EXPECT_EQ(HttpRequest::normalize_header_name("www-authenticate"), "WWW-Authenticate");
+    EXPECT_EQ(HttpRequest::normalize_header_name("WWW-AUTHENTICATE"), "WWW-Authenticate");
+    EXPECT_EQ(HttpRequest::normalize_header_name("etag"), "ETag");
+    EXPECT_EQ(HttpRequest::normalize_header_name("te"), "TE");
+    EXPECT_EQ(HttpRequest::normalize_header_name("dnt"), "DNT");
+    EXPECT_EQ(HttpRequest::normalize_header_name("proxy-authenticate"), "Proxy-Authenticate");
+
+    HttpResponse res;
+    res.set_header("www-authenticate", "Bearer");
+    EXPECT_EQ(res.headers.count("WWW-Authenticate"), 1u);
+    HttpRequest req;
+    req.headers[HttpRequest::normalize_header_name("ETAG")] = "\"x\"";
+    EXPECT_TRUE(req.has_header("etag"));
+    EXPECT_EQ(req.get_header_value("ETag"), "\"x\"");
 }
 
 int main(int argc, char** argv)
