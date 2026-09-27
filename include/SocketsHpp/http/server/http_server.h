@@ -2238,6 +2238,20 @@ namespace http
                 bump(m_metrics.bytesReceived, static_cast<uint64_t>(received));
                 conn.lastActivity = std::chrono::steady_clock::now();
 
+                // Unparsed input is normally bounded by the request limits, but while a
+                // response is in progress (a handler on the thread pool, a long stream)
+                // nothing consumes it. A client that keeps sending then would grow the
+                // buffer without limit; no legitimate pipelined request needs more than
+                // one maximal request (plus slack for chunked framing).
+                const size_t maxBuffered = m_maxRequestHeadersSize + m_maxRequestContentSize + 64 * 1024;
+                if (conn.receiveBuffer.size() > maxBuffered)
+                {
+                    LOG_WARN("HttpServer: [%s] closing: %u bytes of unconsumed input",
+                        conn.request.client.c_str(), static_cast<unsigned>(conn.receiveBuffer.size()));
+                    handleConnectionClosed(conn);
+                    return;
+                }
+
                 handleConnection(conn);  // May close and erase conn - must be the last use
             }
 

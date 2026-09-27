@@ -1282,6 +1282,48 @@ TEST(HttpServerStreamingTest, ReactorDoesNotSpinWhileStreamWorkerWaits)
     server.stop();
 }
 
+// A client that keeps sending while its response is still running (here: a stream
+// whose callback waits on the pool) must not grow the server's input buffer forever.
+TEST(HttpServerStreamingTest, UnconsumedInputDuringStreamIsBounded)
+{
+    HttpServer server("127.0.0.1", 0);
+    server.enableThreadPool(2);
+    server.setRequestLimits(1024, 4096);  // at most ~69 KB of unconsumed input
+    std::atomic<bool> release{false};
+    server.route("/stream", [&](const HttpRequest&, HttpResponse& res) {
+        res.set_header("Content-Type", "text/event-stream");
+        auto first = std::make_shared<bool>(true);
+        res.send_chunk_stream([&, first]() -> std::string {
+            if (*first)
+            {
+                *first = false;
+                return "data: hello\n\n";
+            }
+            for (int i = 0; i < 500 && !release.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return "";
+        });
+        return 200;
+    });
+    server.start();
+
+    RawClient client(server.getListeningPort());
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n"));
+    while (client.buffered().find("data: hello") == std::string::npos)
+        ASSERT_TRUE(client.fill()) << "stream did not start";
+
+    const std::string junk(16 * 1024, 'j');
+    bool closed = false;
+    for (int i = 0; i < 64 && !closed; ++i)  // up to 1 MB, far above the bound
+        closed = !client.send(junk);
+    if (!closed)
+        closed = client.waitForClose(5000);
+    release = true;
+    EXPECT_TRUE(closed) << "the server kept buffering input while the stream ran";
+    server.stop();
+}
+
 int main(int argc, char** argv)
 {
     testing::InitGoogleTest(&argc, argv);
