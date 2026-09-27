@@ -39,6 +39,7 @@ set(UNIT_TESTS
   sse_parser_test
   thread_pool_server_test
   http_server_hardening_test
+  multipart_test
 )
 
 # MCP unit tests (require nlohmann-json)

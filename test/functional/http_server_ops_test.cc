@@ -10,6 +10,7 @@
 
 #include <SocketsHpp/http/client/http_client.h>
 #include <SocketsHpp/http/server/http_server.h>
+#include <SocketsHpp/http/server/multipart.h>
 
 #include <atomic>
 #include <cctype>
@@ -1121,4 +1122,52 @@ TEST(HttpServerMetricsTest, FormatPrometheusIsStatic)
     EXPECT_NE(text.find("socketshpp_http_connections_accepted_total 7\n"), std::string::npos);
     EXPECT_NE(text.find("socketshpp_http_responses_total{code=\"3xx\"} 3\n"), std::string::npos);
     EXPECT_NE(text.find("# HELP socketshpp_http_timeouts_total "), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// multipart/form-data upload end to end
+// ---------------------------------------------------------------------------
+
+TEST(HttpServerMultipartTest, BinaryUploadRoundTrip)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    server.route("/upload", [](const HttpRequest& req, HttpResponse& res) {
+        auto form = SocketsHpp::http::server::multipart::parse(req);
+        if (!form)
+        {
+            res.set_content(SocketsHpp::http::server::multipart::errorMessage(form.error));
+            return 400;
+        }
+        const auto* file = form.find("file");
+        if (file == nullptr)
+        {
+            return 422;
+        }
+        res.set_content(file->filename + ":" + std::to_string(file->data.size()) + ":" + file->body(),
+            "application/octet-stream");
+        return 200;
+    });
+    server.start();
+
+    std::string payload;
+    for (int i = 0; i < 3000; ++i)
+    {
+        payload.push_back(static_cast<char>(i * 7));
+    }
+    const std::string boundary = "xYzBoundary";
+    const std::string body = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"b.bin\"\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n" + payload + "\r\n--" + boundary + "--\r\n";
+    RawConn c(port);
+    ASSERT_TRUE(c.connected());
+    RawResponse r = c.request("POST /upload HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary=" +
+        boundary + "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body);
+    ASSERT_TRUE(r.complete);
+    EXPECT_EQ(r.code, 200);
+    EXPECT_EQ(r.body, "b.bin:3000:" + payload);
+
+    RawResponse bad = c.request("POST /upload HTTP/1.1\r\nHost: t\r\nContent-Type: text/plain\r\nContent-Length: 1\r\n\r\nx");
+    EXPECT_EQ(bad.code, 400);
+    EXPECT_EQ(bad.body, "Content-Type is not multipart");
+    server.stop();
 }
