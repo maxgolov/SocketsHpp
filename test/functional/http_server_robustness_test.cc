@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -111,6 +112,9 @@ namespace
             }
             return true;
         }
+
+        /// Bytes received so far and not consumed by readResponse().
+        const std::string& buffered() const { return m_buffer; }
 
         /// Read more bytes into the internal buffer. Returns false on EOF/error/timeout.
         bool fill(int timeoutMs = 5000)
@@ -1215,6 +1219,67 @@ TEST_F(HttpServerThreadPoolTest, SlowlorisGets408WhileHandlersRun)
     auto done = busy.readResponse(false, 5000);
     EXPECT_EQ(done.code, 200);
     EXPECT_EQ(done.body, "done");
+}
+
+// Regression: a stream callback dispatched to the thread pool while Writable was still
+// armed (left over from a send that would block) made the level-triggered reactor
+// (epoll, kqueue) report the always-writable socket on every poll and spin at 100% CPU
+// for as long as the worker waited. Functional tests could not see it: responses were
+// correct, only CPU time was wasted, so this test measures the process's CPU time.
+TEST(HttpServerStreamingTest, ReactorDoesNotSpinWhileStreamWorkerWaits)
+{
+    auto cpuSeconds = [] {
+        rusage ru{};
+        ::getrusage(RUSAGE_SELF, &ru);
+        return static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
+               static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+    };
+
+    HttpServer server("127.0.0.1", 0);
+    server.enableThreadPool(2);
+    const std::string big(8 * 1024 * 1024, 'x');  // far more than the socket buffers hold
+    const auto wait = std::chrono::milliseconds(1500);
+    std::atomic<int> calls{0};
+    server.route("/stream", [&](const HttpRequest&, HttpResponse& res) {
+        res.set_header("Content-Type", "text/event-stream");
+        res.send_chunk_stream([&]() -> std::string {
+            int n = calls++;
+            if (n == 0)
+                return big;  // the send blocks: the reactor arms Writable to finish it
+            if (n == 1)
+            {
+                std::this_thread::sleep_for(wait);  // worker waits, e.g. for an SSE event
+                return "data: done\n\n";
+            }
+            return "";
+        });
+        return 200;
+    });
+    server.start();
+
+    RawClient client(server.getListeningPort(), 64 * 1024);
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n"));
+    // Let the server hit EAGAIN on the big chunk before reading anything.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    while (client.buffered().size() < big.size())
+        ASSERT_TRUE(client.fill()) << "stream ended early";
+
+    // The big chunk is delivered and callback #2 is sleeping on a worker.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const double cpuBefore = cpuSeconds();
+    const auto t0 = std::chrono::steady_clock::now();
+    while (client.buffered().find("data: done") == std::string::npos)
+        ASSERT_TRUE(client.fill(5000)) << "second chunk never arrived";
+    const double cpuUsed = cpuSeconds() - cpuBefore;
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    // A spinning reactor burns one core for the whole wait (~1.4 s here); an idle one
+    // uses almost nothing. Allow generous slack for slow CI machines.
+    EXPECT_LT(cpuUsed, 0.35 * elapsed) << "reactor busy-looped while the worker waited: "
+                                       << cpuUsed << " s CPU in " << elapsed << " s";
+    server.stop();
 }
 
 int main(int argc, char** argv)
