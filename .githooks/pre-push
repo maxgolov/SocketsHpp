@@ -1,0 +1,25 @@
+#!/bin/sh
+# Refuse to push new commits that carry an AI assistant identity or
+# attribution trailer (catches commits made with --no-verify or elsewhere).
+. "$(dirname "$0")/identity.sh"
+remote="$1"
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue            # branch deletion
+    case "$local_ref" in refs/tags/*) continue ;; esac
+    for c in $(git rev-list "$local_sha" --not --remotes="$remote"); do
+        bad=""
+        if git log -1 --format='%an <%ae>%n%cn <%ce>' "$c" | grep -q -i -E "$FORBIDDEN_IDENT"; then
+            bad="assistant author/committer"
+        elif git log -1 --format='%B' "$c" | grep -q -i -E "$FORBIDDEN_MSG_LINE"; then
+            bad="assistant attribution in message"
+        fi
+        if [ -n "$bad" ]; then
+            echo "pre-push: $(git log -1 --format='%h %s' "$c"): $bad" >&2
+            status=1
+        fi
+    done
+done
+[ $status -eq 0 ] || echo "pre-push: fix the commits above (e.g. git commit --amend --reset-author) and push again." >&2
+exit $status

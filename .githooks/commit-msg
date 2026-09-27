@@ -1,0 +1,13 @@
+#!/bin/sh
+# Remove AI assistant attribution trailers from the commit message.
+. "$(dirname "$0")/identity.sh"
+msg="$1"
+tmp="$msg.tmp.$$"
+grep -v -i -E "$FORBIDDEN_MSG_LINE" "$msg" > "$tmp" || true
+# Drop trailing blank lines (and a lone "---" left behind by a removed footer).
+awk '{ lines[NR] = $0 } END {
+       n = NR
+       while (n > 0 && (lines[n] ~ /^[[:space:]]*$/ || lines[n] == "---")) n--
+       for (i = 1; i <= n; i++) print lines[i]
+     }' "$tmp" > "$msg"
+rm -f "$tmp"

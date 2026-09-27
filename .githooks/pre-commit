@@ -1,0 +1,11 @@
+#!/bin/sh
+# Refuse to record a commit under an AI assistant identity.
+. "$(dirname "$0")/identity.sh"
+for var in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+    ident=$(git var "$var") || exit 1
+    if printf '%s\n' "$ident" | grep -q -i -E "$FORBIDDEN_IDENT"; then
+        echo "pre-commit: refusing to commit as '$ident'." >&2
+        echo "Set the maintainer identity: git config user.name / user.email" >&2
+        exit 1
+    fi
+done

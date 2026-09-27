@@ -1,0 +1,4 @@
+# Canonical identities for git log / shortlog / blame.
+# Commits made with an AI assistant are attributed to the maintainer who made them.
+Max Golovanov <max.golovanov+github@gmail.com> Claude <noreply@anthropic.com>
+Max Golovanov <max.golovanov+github@gmail.com> <noreply@anthropic.com>
