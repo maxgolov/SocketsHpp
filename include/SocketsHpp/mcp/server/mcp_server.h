@@ -177,6 +177,8 @@ namespace mcp
 
                 // Set HTTP server limits
                 m_httpServer.setMaxRequestContentSize(config.maxMessageSize);
+                m_httpServer.setIdleTimeout(std::chrono::milliseconds(config.idleTimeoutMs));
+                m_httpServer.setRequestTimeout(std::chrono::milliseconds(config.requestTimeoutMs));
 
                 // ── Auto-register built-in MCP protocol methods ───────────────────────────
                 // ping — required by spec; clients poll for liveness

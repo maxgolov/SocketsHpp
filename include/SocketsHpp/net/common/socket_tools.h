@@ -1156,8 +1156,9 @@ namespace net
         ///
         /// Stream mode (TCP / Unix domain) uses epoll on Linux, kqueue on Apple and
         /// WSAEventSelect + WSAWaitForMultipleEvents on Windows, each waiting at most
-        /// config::REACTOR_POLL_TIMEOUT_MS per iteration. Datagram mode is selected
-        /// when the first socket is added with flags == Readable only: the loop then
+        /// pollTimeout() (default config::REACTOR_POLL_TIMEOUT_MS) per iteration and
+        /// calling SocketCallback::onReactorTick() before each wait. Datagram mode is
+        /// selected when the first socket is added with flags == Readable only: the loop then
         /// polls that single socket and calls onSocketReadable() for each datagram.
         ///
         /// @note Callbacks run on the reactor thread, without m_sockets_mutex held;
@@ -1179,6 +1180,11 @@ namespace net
                 /// @brief The peer hung up or an error occurred on @p sock (also called
                 ///        once when the datagram loop ends).
                 virtual void onSocketClosed(Socket sock) = 0;
+                /// @brief Called once per iteration of the stream event loop, before each
+                ///        wait: at least every pollTimeout() milliseconds and after each
+                ///        batch of events. Use it for periodic work such as timeouts; it
+                ///        must be cheap. Not called in datagram mode. Default: no-op.
+                virtual void onReactorTick() {}
             };
 
             /// @brief Event flags that can be armed with addSocket() (bit mask).
@@ -1200,6 +1206,9 @@ namespace net
 
             /// @brief true for stream (event-loop) mode, false once a datagram socket was added.
             bool m_streaming{ true };
+
+            /// @brief Maximum wait per loop iteration in milliseconds (see setPollTimeout()).
+            std::atomic<unsigned> m_pollTimeoutMs{ config::REACTOR_POLL_TIMEOUT_MS };
 
 #ifdef _WIN32
             /* use WinSock events on Windows */
@@ -1300,6 +1309,16 @@ namespace net
                 return static_cast<size_t>(-1);
 #endif
             }
+
+            /// @brief Set the maximum wait per loop iteration (default
+            ///        config::REACTOR_POLL_TIMEOUT_MS). A shorter wait makes
+            ///        SocketCallback::onReactorTick() run more often and stop() return sooner.
+            /// @param ms Wait in milliseconds; 0 is treated as 1.
+            /// @note Thread-safe; takes effect from the next wait.
+            void setPollTimeout(unsigned ms) { m_pollTimeoutMs = (ms == 0) ? 1u : ms; }
+
+            /// @brief Current maximum wait per loop iteration, in milliseconds.
+            unsigned pollTimeout() const { return m_pollTimeoutMs.load(); }
 
             /// @brief Register a socket or update its armed flags.
             /// @param socket Socket to watch (not owned).
@@ -1525,7 +1544,7 @@ namespace net
                     {
                         // Wait (bounded) for a datagram instead of spinning on a
                         // non-blocking recvfrom() that returns EWOULDBLOCK.
-                        int ready = waitReadable(socket, config::REACTOR_POLL_TIMEOUT_MS);
+                        int ready = waitReadable(socket, m_pollTimeoutMs.load());
                         if (ready == 0)
                         {
                             continue;
@@ -1545,6 +1564,9 @@ namespace net
 
                 while (!shouldTerminate())
                 {
+                    // Periodic hook (e.g. connection timeouts), before every wait.
+                    m_callback.onReactorTick();
+
                     // TCP and Unix Domain Server implementation.
                     //
                     // Use event-based notification with array of client
@@ -1558,7 +1580,7 @@ namespace net
 #ifdef _WIN32
                     DWORD numEvents = static_cast<DWORD>(m_events.size());
                     DWORD dwResult = ::WSAWaitForMultipleEvents(numEvents,
-                        m_events.data(), FALSE, config::REACTOR_POLL_TIMEOUT_MS, FALSE);
+                        m_events.data(), FALSE, static_cast<DWORD>(m_pollTimeoutMs.load()), FALSE);
                     if (dwResult == WSA_WAIT_TIMEOUT)
                     {
                         continue;
@@ -1623,7 +1645,7 @@ namespace net
 #ifdef __linux__
                     {
                         epoll_event events[4];
-                        int result = ::epoll_wait(m_epollFd, events, sizeof(events) / sizeof(events[0]), config::REACTOR_POLL_TIMEOUT_MS);
+                        int result = ::epoll_wait(m_epollFd, events, sizeof(events) / sizeof(events[0]), static_cast<int>(m_pollTimeoutMs.load()));
                         if (result == 0)
                             continue;
                         if (result < 0)
@@ -1687,7 +1709,7 @@ namespace net
 
 #if defined(TARGET_OS_MAC)
                     {
-                        constexpr unsigned waitms = config::REACTOR_POLL_TIMEOUT_MS;
+                        const unsigned waitms = m_pollTimeoutMs.load();
                         struct timespec timeout;
                         timeout.tv_sec = waitms / 1000;
                         timeout.tv_nsec = (waitms % 1000) * 1000 * 1000;

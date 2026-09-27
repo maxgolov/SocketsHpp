@@ -370,6 +370,7 @@ STDIO.
 | `auth.enabled`, `type`, `headerName`, `secretOrPublicKey`, `validator` | off | See [Authentication](#authentication) |
 | `maxRequestsPerMinute`, `trustProxyHeaders` | 0, `false` | See [Rate limiting](#rate-limiting) |
 | `sseWriteDeadlineSeconds` | 30 | Keepalive interval on idle streams |
+| `idleTimeoutMs`, `requestTimeoutMs` | 60000, 30000 | HTTP connection timeouts (`HttpServer::setIdleTimeout()` / `setRequestTimeout()`): idle connections are closed, incomplete requests get 408; `0` disables. SSE streams and running tool calls are never cut |
 
 `parseArgs(argc, argv)` understands `--transport http|streamable|http-streamable|stdio`,
 `--port`, `--endpoint`, `--host`, `--response-mode stream|batch`, `--max-message-size`,

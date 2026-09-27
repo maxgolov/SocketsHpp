@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <cctype>
@@ -1001,8 +1002,13 @@ namespace http
         /// thread, one at a time, so a slow handler stalls all connections. With
         /// enableThreadPool() they run on worker threads instead.
         ///
-        /// Configuration (listening ports, routes, limits, keep-alive, CORS, thread
-        /// pool) is not synchronized with the reactor: finish it before start().
+        /// Timeouts: connections waiting for a request are closed after the idle
+        /// timeout (setIdleTimeout(), default 60 s), and a request not fully received
+        /// within the request timeout (setRequestTimeout(), default 30 s) gets 408.
+        /// Running handlers, responses being sent and streams are never timed out.
+        ///
+        /// Configuration (listening ports, routes, limits, timeouts, keep-alive, CORS,
+        /// thread pool) is not synchronized with the reactor: finish it before start().
         ///
         /// Goals: enough of HTTP to embed or mock a service. Out of scope: high
         /// performance, TLS, full RFC 9110/9112 coverage.
@@ -1065,6 +1071,13 @@ namespace http
                 /// Streamed body uses chunked framing (HTTP/1.1). HTTP/1.0 clients get the
                 /// raw data, delimited by closing the connection.
                 bool chunkedStream = true;
+
+                /// @brief When data was last received, or a response finished (accept time
+                ///        initially). Measures the idle timeout (setIdleTimeout()).
+                std::chrono::steady_clock::time_point lastActivity = std::chrono::steady_clock::now();
+                /// @brief When the current request's first byte was taken up (entering
+                ///        ReceivingHeaders). Measures the request timeout (setRequestTimeout()).
+                std::chrono::steady_clock::time_point requestStart = std::chrono::steady_clock::now();
             };
 
             std::string m_serverHost;                ///< Value of the "Server" response header.
@@ -1129,6 +1142,15 @@ namespace http
             SessionManager m_sessionManager;  ///< Sessions used by createSession() and the built-in DELETE handling.
             CorsConfig m_corsConfig;          ///< CORS settings.
             std::atomic<bool> m_stopped{false};  ///< Set by stop(); cleared by start().
+
+            /// @brief Idle timeout (setIdleTimeout()); 0 = disabled.
+            std::chrono::milliseconds m_idleTimeout{ config::HTTP_IDLE_TIMEOUT_MS };
+            /// @brief Request timeout (setRequestTimeout()); 0 = disabled.
+            std::chrono::milliseconds m_requestTimeout{ config::HTTP_REQUEST_TIMEOUT_MS };
+            /// @brief How often the reactor checks the timeouts (derived in start()).
+            std::chrono::milliseconds m_timeoutSweepInterval{ config::REACTOR_POLL_TIMEOUT_MS };
+            /// @brief Earliest time of the next timeout check; used on the reactor thread only.
+            std::chrono::steady_clock::time_point m_nextTimeoutSweep{};
 
         public:
             /// @brief Enable or disable HTTP keep-alive for all connections.
@@ -1207,6 +1229,45 @@ namespace http
 
             /// @brief Set the value of the "Server" response header. Call before start().
             void setServerName(std::string const& name) { m_serverHost = name; }
+
+            /// @brief Close connections that wait for a request and receive nothing for
+            ///        @p timeout (default config::HTTP_IDLE_TIMEOUT_MS = 60 s).
+            ///
+            /// Applies to freshly accepted and keep-alive connections between requests
+            /// (closed silently), to connections shut down after their last response that
+            /// the peer does not close, and - measured from the last received byte - to a
+            /// request that is still being received (which then gets 408, see
+            /// setRequestTimeout()). Never applies while a handler runs, a response is
+            /// sent or a stream (send_chunk_stream(), SSE) is open.
+            /// @param timeout Timeout; 0 (or negative) disables it.
+            /// @note Enforced by the reactor thread about every timeout/4 (at most every
+            ///       config::REACTOR_POLL_TIMEOUT_MS, at least every 10 ms), so a connection
+            ///       may live slightly longer. Call before start().
+            void setIdleTimeout(std::chrono::milliseconds timeout)
+            {
+                m_idleTimeout = (timeout.count() > 0) ? timeout : std::chrono::milliseconds(0);
+            }
+
+            /// @brief Limit the time to receive a whole request (head and body), measured
+            ///        from its first byte (default config::HTTP_REQUEST_TIMEOUT_MS = 30 s).
+            ///
+            /// A request not complete in time - e.g. a slowloris client trickling header
+            /// bytes - gets "408 Request Timeout" with "Connection: close" and the
+            /// connection is closed (if a "100 Continue" is still unsent, it is closed
+            /// without a response). Handler run time, response sending and streams are
+            /// not limited.
+            /// @param timeout Timeout; 0 (or negative) disables it.
+            /// @note Enforced like setIdleTimeout(). Call before start().
+            void setRequestTimeout(std::chrono::milliseconds timeout)
+            {
+                m_requestTimeout = (timeout.count() > 0) ? timeout : std::chrono::milliseconds(0);
+            }
+
+            /// @brief Current idle timeout (0 = disabled); see setIdleTimeout().
+            std::chrono::milliseconds getIdleTimeout() const { return m_idleTimeout; }
+
+            /// @brief Current request timeout (0 = disabled); see setRequestTimeout().
+            std::chrono::milliseconds getRequestTimeout() const { return m_requestTimeout; }
 
             /// @brief Run request handlers (and streaming callbacks) on a worker pool so
             /// slow handlers never block the I/O reactor or other connections.
@@ -1454,6 +1515,23 @@ namespace http
             void start()
             {
                 m_stopped = false;
+                // Check the timeouts about four times per shortest timeout, bounded by
+                // [10 ms, REACTOR_POLL_TIMEOUT_MS]; the reactor must wake up that often.
+                using std::chrono::milliseconds;
+                milliseconds shortest(0);
+                for (milliseconds t : { m_idleTimeout, m_requestTimeout })
+                {
+                    if (t.count() > 0 && (shortest.count() == 0 || t < shortest))
+                    {
+                        shortest = t;
+                    }
+                }
+                const milliseconds maxInterval(config::REACTOR_POLL_TIMEOUT_MS);
+                m_timeoutSweepInterval = (shortest.count() == 0)
+                    ? maxInterval
+                    : std::min(maxInterval, std::max(milliseconds(10), shortest / 4));
+                m_nextTimeoutSweep = std::chrono::steady_clock::now();
+                m_reactor.setPollTimeout(static_cast<unsigned>(m_timeoutSweepInterval.count()));
                 m_reactor.start();
             }
 
@@ -1497,6 +1575,7 @@ namespace http
                         conn.socket = csocket;
                         conn.state = Connection::Idle;
                         conn.request.client = caddr.toString();
+                        conn.lastActivity = std::chrono::steady_clock::now();
                     }
                     m_reactor.addSocket(csocket, Reactor::Readable | Reactor::Closed);
                     LOG_TRACE("HttpServer: [%s] accepted", caddr.toString().c_str());
@@ -1533,6 +1612,7 @@ namespace http
                     return;
                 }
                 conn.receiveBuffer.append(buffer, buffer + received);
+                conn.lastActivity = std::chrono::steady_clock::now();
 
                 handleConnection(conn);  // May close and erase conn - must be the last use
             }
@@ -1591,6 +1671,93 @@ namespace http
                 Connection& conn = connIt->second;
 
                 handleConnectionClosed(conn);
+            }
+
+            /// @brief Reactor callback run before every wait: enforces the idle and request
+            ///        timeouts (see setIdleTimeout(), setRequestTimeout()) at most once per
+            ///        sweep interval. Runs on the reactor thread.
+            virtual void onReactorTick() override
+            {
+                if (m_idleTimeout.count() == 0 && m_requestTimeout.count() == 0)
+                {
+                    return;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now < m_nextTimeoutSweep)
+                {
+                    return;
+                }
+                m_nextTimeoutSweep = now + m_timeoutSweepInterval;
+
+                std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                if (m_stopped.load())
+                {
+                    return;
+                }
+                std::vector<Socket> expired;
+                for (auto const& entry : m_connections)
+                {
+                    if (isTimedOut(entry.second, now))
+                    {
+                        expired.push_back(entry.first);
+                    }
+                }
+                for (Socket sock : expired)
+                {
+                    auto connIt = m_connections.find(sock);
+                    if (connIt != m_connections.end())
+                    {
+                        onConnectionTimeout(connIt->second);  // may erase the entry
+                    }
+                }
+            }
+
+            /// @brief Whether @p conn has exceeded a timeout at @p now. Only connections
+            ///        waiting for the client qualify: Idle / Closing (idle timeout) and a
+            ///        request being received (request or idle timeout). Processing,
+            ///        sending and streaming connections never time out.
+            bool isTimedOut(const Connection& conn, std::chrono::steady_clock::time_point now) const
+            {
+                const bool idleExpired =
+                    (m_idleTimeout.count() > 0) && (now - conn.lastActivity >= m_idleTimeout);
+                switch (conn.state)
+                {
+                case Connection::Idle:
+                case Connection::Closing:
+                    return idleExpired;
+                case Connection::ReceivingHeaders:
+                case Connection::Sending100Continue:
+                case Connection::ReceivingBody:
+                case Connection::ReceivingChunkedBody:
+                    return idleExpired ||
+                        ((m_requestTimeout.count() > 0) && (now - conn.requestStart >= m_requestTimeout));
+                default:
+                    return false;
+                }
+            }
+
+            /// @brief Act on a timed-out connection: close an idle one silently; answer a
+            ///        partially received request with 408 and close. Called with
+            ///        m_connectionsMutex held on the reactor thread.
+            /// @warning May close and erase conn; callers must not use it afterwards.
+            void onConnectionTimeout(Connection& conn)
+            {
+                if (conn.state == Connection::ReceivingHeaders || conn.state == Connection::ReceivingBody ||
+                    conn.state == Connection::ReceivingChunkedBody)
+                {
+                    // Nothing is queued for sending in these states: answer 408 through
+                    // the normal response path, which then shuts the connection down.
+                    LOG_WARN("HttpServer: [%s] request timeout - sending 408", conn.request.client.c_str());
+                    conn.receiveBuffer.clear();
+                    failRequest(conn, 408);  // Request Timeout, Connection: close
+                    handleConnection(conn);  // may close and erase conn - last use
+                    return;
+                }
+                // Idle / Closing, or a "100 Continue" the client does not read: close.
+                LOG_INFO("HttpServer: [%s] %s timeout - closing", conn.request.client.c_str(),
+                    (conn.state == Connection::Sending100Continue) ? "request" : "idle");
+                conn.closeRequested = true;
+                handleConnectionClosed(conn);  // erases conn - last use
             }
 
             /// @brief Whether a socket error means "try again later" (would-block,
@@ -1976,6 +2143,7 @@ namespace http
                     {
                         resetForNextRequest(conn);
                         conn.state = Connection::ReceivingHeaders;
+                        conn.requestStart = std::chrono::steady_clock::now();  // request timeout starts
                         LOG_TRACE("HttpServer: [%s] receiving headers", conn.request.client.c_str());
                     }
 
@@ -2211,6 +2379,7 @@ namespace http
                         }
 
                         conn.keepalive &= allowKeepalive;
+                        conn.lastActivity = std::chrono::steady_clock::now();  // idle timeout restarts
 
                         if (conn.keepalive)
                         {

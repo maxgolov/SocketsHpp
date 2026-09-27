@@ -21,7 +21,7 @@ HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protoc
   reactor backend.
 - **HTTP/1.1 server** (`HttpServer`): prefix routing, keep-alive, pipelining,
   chunked request bodies, `Expect: 100-continue`, HEAD, CORS, request size limits,
-  strict request parsing (ambiguous `Content-Length` / `Transfer-Encoding` framing is
+  idle and request timeouts (slowloris protection), strict request parsing (ambiguous `Content-Length` / `Transfer-Encoding` framing is
   rejected), optional worker thread pool, chunked streaming responses and SSE.
 - **Static files** (`HttpFileServer`): serves a document root with path-traversal
   protection and MIME types.
@@ -348,7 +348,8 @@ several ports (`getListeningPorts()`).
   `server[path] = callback` store a reference, so that object must outlive the server.
 
 Other knobs: `setRequestLimits(maxHeaderBytes, maxBodyBytes)` (defaults 8 KB / 2 MB;
-oversized requests get 431 / 413), `setKeepalive(false)`, and
+oversized requests get 431 / 413), `setIdleTimeout(ms)` and `setRequestTimeout(ms)`
+(see below), `setKeepalive(false)`, and
 `createSession()` / `validateSession()` / `terminateSession()` / `setSessionTimeout()`
 (sessions default to a 1 h timeout and at most 10,000 at a time).
 
@@ -358,8 +359,20 @@ otherwise uses `text/plain`.
 
 **Lifecycle and errors.** `HttpServer(name, port)` and `addListeningPort()` throw
 `std::runtime_error` if the port cannot be bound. Configure ports, routes, limits,
-CORS and the thread pool before `start()`; they are not synchronized with the
-reactor. A handler that throws gets a 500 response. `stop()` stops the reactor; a
+timeouts, CORS and the thread pool before `start()`; they are not synchronized with
+the reactor. A handler that throws gets a 500 response.
+
+**Timeouts.** A connection waiting for a request (just accepted, keep-alive between
+requests, or shut down after `Connection: close`) that receives nothing for
+`setIdleTimeout()` (default 60 s) is closed without a response. A request whose head
+and body are not fully received within `setRequestTimeout()` (default 30 s) of its
+first byte - a slowloris client trickling header bytes, or a stalled body - gets
+`408 Request Timeout` with `Connection: close`; a stalled partial request also gets
+408 once it has been silent for the idle timeout. Time spent in handlers (on the
+reactor or the thread pool), sending responses and streaming (`send_chunk_stream()`,
+SSE) is never limited, so long-lived SSE streams stay open. `0` disables either
+timeout. The reactor checks them about every timeout/4 (10-500 ms), so a connection
+may live slightly longer than the limit. `stop()` stops the reactor; a
 stopped server cannot be restarted (create a new one), and open client connections are
 closed when the server object is destroyed.
 
@@ -731,7 +744,11 @@ int main()
 - `TrustProxyConfig` matches exact proxy IP addresses (no CIDR ranges).
 - Protocol limits are compile-time constants in `SocketsHpp/config.h` (request
   target 8 KB, listen backlog 10, query keys/values 256/4096 bytes, reactor poll
-  interval, ...); `setRequestLimits()` adjusts the header/body limits at run time.
+  interval, default idle/request timeouts 60 s / 30 s, ...); `setRequestLimits()`,
+  `setIdleTimeout()` and `setRequestTimeout()` adjust them at run time.
+- The server's timeouts do not cover a client that stops reading a response or
+  stream (there is no send timeout); keep a reverse proxy in front of servers
+  exposed to untrusted networks.
 - Unix domain sockets are available on POSIX systems and on Windows when the SDK
   provides `<afunix.h>` (Windows 10 SDK 17063 or later).
 - Logging is compiled out by default. Define `HAVE_CONSOLE_LOG` to print to stdout,

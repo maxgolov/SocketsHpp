@@ -50,8 +50,10 @@ namespace config
     /// @brief listen() backlog (max pending connections) for HttpServer listening sockets.
     constexpr int SOCKET_LISTEN_BACKLOG = 10;
 
-    /// @brief Maximum wait per Reactor poll iteration, in milliseconds (epoll_wait /
+    /// @brief Default maximum wait per Reactor poll iteration, in milliseconds (epoll_wait /
     ///        kevent / WSAWaitForMultipleEvents / UDP poll). Also bounds Reactor::stop() latency.
+    ///        Reactor::setPollTimeout() changes it per reactor (HttpServer lowers it for
+    ///        connection timeouts shorter than about 2 s).
     constexpr unsigned REACTOR_POLL_TIMEOUT_MS = 500;
 
     /// @brief Maximum kevents fetched per Reactor iteration on Apple platforms (kqueue).
@@ -63,6 +65,18 @@ namespace config
     /// @brief Default HttpServer limit for request bodies, in bytes (2 MiB); also the
     ///        default limit for decompressed request bodies. Larger bodies get HTTP 413.
     constexpr size_t MAX_HTTP_BODY_SIZE = 2 * 1024 * 1024;
+
+    /// @brief Default HttpServer idle timeout, in milliseconds (60 s): a connection that
+    ///        waits for a request (keep-alive, freshly accepted, or shut down after its
+    ///        last response) and receives no data for this long is closed. 0 disables it.
+    /// @see HttpServer::setIdleTimeout()
+    constexpr int HTTP_IDLE_TIMEOUT_MS = 60000;
+
+    /// @brief Default HttpServer request timeout, in milliseconds (30 s): a request whose
+    ///        head and body are not fully received this long after its first byte gets
+    ///        HTTP 408 and the connection is closed (slowloris protection). 0 disables it.
+    /// @see HttpServer::setRequestTimeout()
+    constexpr int HTTP_REQUEST_TIMEOUT_MS = 30000;
 
     /// @brief Default idle timeout of HTTP sessions, in seconds (1 hour).
     constexpr int DEFAULT_SESSION_TIMEOUT_SECONDS = 3600;

@@ -942,6 +942,281 @@ TEST_F(HttpServerThreadPoolTest, StopWithHandlerInFlightIsSafe)
     server.reset();  // waits for the worker; must not touch freed state
 }
 
+// --- Connection timeouts ---------------------------------------------------------
+// Short timeouts with generous margins: the reactor checks them about every
+// timeout/4, so a connection is closed within timeout + ~timeout/4 (+ scheduling).
+
+namespace
+{
+    using Clock = std::chrono::steady_clock;
+    using std::chrono::milliseconds;
+
+    long long elapsedMs(Clock::time_point since)
+    {
+        return std::chrono::duration_cast<milliseconds>(Clock::now() - since).count();
+    }
+
+    /// Stream callback producing @p chunks chunks, one every @p intervalMs.
+    void addSlowStream(HttpServer& server, int chunks, int intervalMs)
+    {
+        server.route("/slowstream", [chunks, intervalMs](const HttpRequest&, HttpResponse& res) {
+            res.set_header("Content-Type", "text/event-stream");
+            int n = 0;
+            res.send_chunk_stream([n, chunks, intervalMs]() mutable -> std::string {
+                if (n == chunks)
+                    return std::string();
+                std::this_thread::sleep_for(milliseconds(intervalMs));
+                return "data: " + std::to_string(++n) + "\n\n";
+            });
+            return 200;
+        });
+    }
+
+    std::string expectedSlowStream(int chunks)
+    {
+        std::string body;
+        for (int i = 1; i <= chunks; ++i)
+            body += "data: " + std::to_string(i) + "\n\n";
+        return body;
+    }
+}  // namespace
+
+TEST_F(HttpServerRobustnessTest, IdleKeepAliveConnectionIsClosed)
+{
+    server->setIdleTimeout(milliseconds(200));
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("GET /first HTTP/1.1\r\nHost: x\r\n\r\n"));
+    auto res = client.readResponse();
+    ASSERT_TRUE(res.complete);
+    EXPECT_EQ(res.body, "/first");
+    EXPECT_EQ(toLower(res.header("connection")), "keep-alive");
+
+    const auto t0 = Clock::now();
+    EXPECT_TRUE(client.waitForClose(5000)) << "idle keep-alive connection was not closed";
+    EXPECT_GE(elapsedMs(t0), 150);
+    EXPECT_LT(elapsedMs(t0), 3000);
+}
+
+TEST_F(HttpServerRobustnessTest, IdleTimeoutClosesSilentFreshConnection)
+{
+    server->setIdleTimeout(milliseconds(200));
+    start();
+    RawClient silent(port);
+    ASSERT_TRUE(silent.connected());
+    const auto t0 = Clock::now();
+    EXPECT_TRUE(silent.waitForClose(5000));
+    EXPECT_GE(elapsedMs(t0), 150);
+    EXPECT_EQ(silent.readResponse(false, 100).code, 0) << "idle close must not send a response";
+}
+
+TEST_F(HttpServerRobustnessTest, KeepAliveReuseAcrossManyIdleTimeouts)
+{
+    // Each gap is shorter than the idle timeout, the total is many times longer.
+    server->setIdleTimeout(milliseconds(300));
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    for (int i = 0; i < 10; ++i)
+    {
+        ASSERT_TRUE(client.send("GET /r" + std::to_string(i) + " HTTP/1.1\r\nHost: x\r\n\r\n")) << i;
+        auto res = client.readResponse();
+        ASSERT_TRUE(res.complete) << i;
+        EXPECT_EQ(res.body, "/r" + std::to_string(i));
+        std::this_thread::sleep_for(milliseconds(120));
+    }
+}
+
+TEST_F(HttpServerRobustnessTest, SlowlorisHeadersGet408)
+{
+    server->setIdleTimeout(milliseconds(10000));
+    server->setRequestTimeout(milliseconds(300));
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    const auto t0 = Clock::now();
+    ASSERT_TRUE(client.send("GET /slow HTTP/1.1\r\nHost: x\r\n"));
+    // Trickle one header byte every 50 ms: never idle, but never complete either.
+    const std::string trickle(100, 'a');
+    ASSERT_TRUE(client.send("X-Slow: "));
+    for (size_t i = 0; i < trickle.size() && elapsedMs(t0) < 3000; ++i)
+    {
+        if (!client.send(trickle.substr(i, 1)) || client.fill(50))
+            break;  // server answered or closed
+    }
+    auto res = client.readResponse(false, 3000);
+    ASSERT_TRUE(res.complete);
+    EXPECT_EQ(res.code, 408);
+    EXPECT_EQ(toLower(res.header("connection")), "close");
+    EXPECT_TRUE(client.waitForClose(3000));
+    EXPECT_GE(elapsedMs(t0), 250);
+    EXPECT_LT(elapsedMs(t0), 3000);
+    EXPECT_EQ(dispatchCount.load(), 0);
+}
+
+TEST_F(HttpServerRobustnessTest, IncompleteBodyGets408)
+{
+    server->setRequestTimeout(milliseconds(200));
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly-a-part"));
+    auto res = client.readResponse(false, 5000);
+    ASSERT_TRUE(res.complete);
+    EXPECT_EQ(res.code, 408);
+    EXPECT_TRUE(client.waitForClose(3000));
+    EXPECT_EQ(dispatchCount.load(), 0);
+}
+
+TEST_F(HttpServerRobustnessTest, StalledHeadersHitIdleTimeoutWhenRequestTimeoutIsOff)
+{
+    server->setRequestTimeout(milliseconds(0));
+    server->setIdleTimeout(milliseconds(200));
+    start();
+    RawClient client(port);
+    ASSERT_TRUE(client.connected());
+    ASSERT_TRUE(client.send("GET /stalled HTTP/1.1\r\nHost: x\r\n"));
+    auto res = client.readResponse(false, 5000);
+    ASSERT_TRUE(res.complete);
+    EXPECT_EQ(res.code, 408);
+    EXPECT_TRUE(client.waitForClose(3000));
+}
+
+TEST_F(HttpServerRobustnessTest, TimeoutsDisabledKeepConnectionsOpen)
+{
+    server->setIdleTimeout(milliseconds(0));
+    server->setRequestTimeout(milliseconds(0));
+    EXPECT_EQ(server->getIdleTimeout().count(), 0);
+    EXPECT_EQ(server->getRequestTimeout().count(), 0);
+    start();
+    RawClient idle(port);
+    RawClient partial(port);
+    ASSERT_TRUE(idle.connected());
+    ASSERT_TRUE(partial.connected());
+    ASSERT_TRUE(partial.send("GET /late HTTP/1.1\r\n"));
+    // Longer than the maximum sweep interval (config::REACTOR_POLL_TIMEOUT_MS).
+    EXPECT_FALSE(idle.fill(1200)) << "nothing may be sent";
+    EXPECT_FALSE(partial.waitForClose(10));
+
+    ASSERT_TRUE(partial.send("Host: x\r\n\r\n"));
+    auto res = partial.readResponse();
+    EXPECT_EQ(res.code, 200);
+    EXPECT_EQ(res.body, "/late");
+    ASSERT_TRUE(idle.send("GET /idle HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+    EXPECT_EQ(idle.readResponse().body, "/idle");
+}
+
+TEST_F(HttpServerRobustnessTest, DefaultTimeouts)
+{
+    EXPECT_EQ(server->getIdleTimeout().count(), SocketsHpp::config::HTTP_IDLE_TIMEOUT_MS);
+    EXPECT_EQ(server->getRequestTimeout().count(), SocketsHpp::config::HTTP_REQUEST_TIMEOUT_MS);
+    server->setIdleTimeout(milliseconds(-5));  // negative = disabled
+    EXPECT_EQ(server->getIdleTimeout().count(), 0);
+}
+
+// Handlers and streams outlive both timeouts - on the reactor and on the thread pool.
+
+namespace
+{
+    void expectSlowHandlerNotCut(HttpServer& server, int port)
+    {
+        server.setIdleTimeout(milliseconds(150));
+        server.setRequestTimeout(milliseconds(150));
+        server.route("/sleepy", [](const HttpRequest&, HttpResponse& res) {
+            std::this_thread::sleep_for(milliseconds(700));
+            res.set_content("rested");
+            return 200;
+        });
+        server.route("/", [](const HttpRequest& req, HttpResponse& res) {
+            res.set_content(req.uri);
+            return 200;
+        });
+        server.start();
+
+        RawClient client(port);
+        ASSERT_TRUE(client.connected());
+        ASSERT_TRUE(client.send("GET /sleepy HTTP/1.1\r\nHost: x\r\n\r\n"));
+        auto res = client.readResponse(false, 5000);
+        ASSERT_TRUE(res.complete);
+        EXPECT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "rested");
+        // The connection stays usable afterwards (the response restarted the idle timer).
+        ASSERT_TRUE(client.send("GET /next HTTP/1.1\r\nHost: x\r\n\r\n"));
+        EXPECT_EQ(client.readResponse().body, "/next");
+    }
+
+    void expectLongStreamNotCut(HttpServer& server, int port)
+    {
+        server.setIdleTimeout(milliseconds(150));
+        server.setRequestTimeout(milliseconds(150));
+        addSlowStream(server, 8, 100);  // ~800 ms
+        server.route("/", [](const HttpRequest& req, HttpResponse& res) {
+            res.set_content(req.uri);
+            return 200;
+        });
+        server.start();
+
+        RawClient client(port);
+        ASSERT_TRUE(client.connected());
+        ASSERT_TRUE(client.send("GET /slowstream HTTP/1.1\r\nHost: x\r\n\r\n"));
+        auto res = client.readResponse(false, 5000);
+        ASSERT_TRUE(res.complete);
+        EXPECT_EQ(res.body, expectedSlowStream(8));
+        ASSERT_TRUE(client.send("GET /after HTTP/1.1\r\nHost: x\r\n\r\n"));
+        EXPECT_EQ(client.readResponse().body, "/after");
+    }
+}  // namespace
+
+TEST_F(HttpServerRobustnessTest, SlowHandlerIsNotTimedOut)
+{
+    expectSlowHandlerNotCut(*server, port);
+}
+
+TEST_F(HttpServerRobustnessTest, LongStreamIsNotTimedOut)
+{
+    expectLongStreamNotCut(*server, port);
+}
+
+TEST_F(HttpServerThreadPoolTest, SlowHandlerIsNotTimedOut)
+{
+    expectSlowHandlerNotCut(*server, port);
+}
+
+TEST_F(HttpServerThreadPoolTest, LongStreamIsNotTimedOut)
+{
+    expectLongStreamNotCut(*server, port);
+}
+
+TEST_F(HttpServerThreadPoolTest, SlowlorisGets408WhileHandlersRun)
+{
+    std::atomic<bool> release{ false };
+    server->setRequestTimeout(milliseconds(200));
+    server->setIdleTimeout(milliseconds(200));
+    server->route("/busy", [&release](const HttpRequest&, HttpResponse& res) {
+        for (int i = 0; i < 300 && !release.load(); ++i)
+            std::this_thread::sleep_for(milliseconds(10));
+        res.set_content("done");
+        return 200;
+    });
+    start();
+    RawClient busy(port);
+    ASSERT_TRUE(busy.connected());
+    ASSERT_TRUE(busy.send("GET /busy HTTP/1.1\r\nHost: x\r\n\r\n"));
+
+    RawClient slow(port);
+    ASSERT_TRUE(slow.connected());
+    ASSERT_TRUE(slow.send("GET /x HTTP/1.1\r\n"));
+    auto res = slow.readResponse(false, 5000);
+    EXPECT_EQ(res.code, 408);
+    EXPECT_TRUE(slow.waitForClose(3000));
+
+    release = true;
+    auto done = busy.readResponse(false, 5000);
+    EXPECT_EQ(done.code, 200);
+    EXPECT_EQ(done.body, "done");
+}
+
 int main(int argc, char** argv)
 {
     testing::InitGoogleTest(&argc, argv);

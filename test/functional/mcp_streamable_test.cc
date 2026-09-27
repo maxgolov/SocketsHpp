@@ -1072,6 +1072,54 @@ TEST_F(StreamableHttpTest, GetStreamDeliversEventsPushedBeforeItOpened)
         << "event pushed between initialize and GET was lost";
 }
 
+// HTTP idle / request timeouts must never cut the GET notification stream or a
+// long-running tools/call, even when both last much longer than the timeouts.
+TEST(McpTimeoutTest, SseStreamAndSlowToolOutliveHttpTimeouts)
+{
+    ServerConfig cfg;
+    cfg.idleTimeoutMs = 150;
+    cfg.requestTimeoutMs = 150;
+    CustomServer srv(cfg, [](MCPServer& s) {
+        s.registerMethod("tools/call", [](const json&) -> json {
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            return {{"content", json::array({{{"type", "text"}, {"text", "slow-done"}}})}};
+        });
+    });
+
+    auto init = http_request(srv.port, "POST", kInitBody, json_headers());
+    const std::string session = init.session_id;
+    ASSERT_FALSE(session.empty());
+
+    int sock = open_sse_stream(srv.port, session);
+    ASSERT_GE(sock, 0);
+
+    // Slow tool call while the stream is open: longer than both timeouts.
+    auto call = http_request(srv.port, "POST",
+        R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}})",
+        json_headers({{"Mcp-Session-Id", session}}));
+    EXPECT_EQ(call.status, 200);
+    EXPECT_NE(call.body.find("slow-done"), std::string::npos) << call.body;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ASSERT_TRUE(srv.server->push_log(session, "error", "t", json("late-marker")));
+
+    timeval tv{};
+    tv.tv_sec = 3;
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::string received;
+    char buf[1024];
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (received.find("late-marker") == std::string::npos &&
+           std::chrono::steady_clock::now() < deadline) {
+        ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        received.append(buf, static_cast<size_t>(n));
+    }
+    ::close(sock);
+    EXPECT_NE(received.find("late-marker"), std::string::npos)
+        << "SSE stream was cut after the HTTP timeouts";
+}
+
 // ── #7 JSON-RPC batch / message validation ───────────────────────────────────
 
 TEST_F(StreamableHttpTest, EmptyBatchIsInvalidRequest)

@@ -9,6 +9,7 @@
 #include "../common/test_utils.h"
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -323,6 +324,144 @@ namespace testing
         ASSERT_TRUE(client.get(base + "/ok", res));
         EXPECT_EQ(res.code, 200);
         EXPECT_EQ(res.body, "alive");
+        server.stop();
+    }
+
+    // --- Connection timeouts (portable: run on Windows too) ---------------------
+
+    // Connect a blocking client socket, then make it non-blocking for polling reads.
+    static bool ConnectRaw(Socket& sock, int port)
+    {
+        sock = Socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (!sock.connect(SocketAddr("127.0.0.1", port)))
+            return false;
+        sock.setNonBlocking();
+        return true;
+    }
+
+    static bool SendRaw(Socket& sock, const std::string& data)
+    {
+        return sock.send(data.data(), data.size()) == static_cast<int>(data.size());
+    }
+
+    // Read into `out` until the peer closes (true) or `timeoutMs` elapses (false).
+    static bool ReadUntilClosed(Socket& sock, std::string& out, int timeoutMs)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        char buf[4096];
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            int n = sock.recv(buf, sizeof(buf));
+            if (n > 0)
+            {
+                out.append(buf, static_cast<size_t>(n));
+                continue;
+            }
+            if (n == 0 || !Socket::isWouldBlock(sock.error()))
+                return true;  // orderly close or reset
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+
+    TEST_P(HttpServerEndToEndTest, IdleConnectionIsClosedAfterIdleTimeout)
+    {
+        HttpServer server("127.0.0.1", 0);
+        if (GetParam())
+            server.enableThreadPool(2);
+        server.setIdleTimeout(std::chrono::milliseconds(200));
+        server.route("/", [](const HttpRequest& req, HttpResponse& res) {
+            res.set_content(req.uri);
+            return 200;
+        });
+        server.start();
+
+        Socket sock;
+        ASSERT_TRUE(ConnectRaw(sock, server.getListeningPort()));
+        ASSERT_TRUE(SendRaw(sock, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"));
+        std::string received;
+        const auto t0 = std::chrono::steady_clock::now();
+        EXPECT_TRUE(ReadUntilClosed(sock, received, 5000)) << "keep-alive connection not closed";
+        EXPECT_GE(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(150));
+        EXPECT_EQ(received.rfind("HTTP/1.1 200", 0), 0u) << received;
+        EXPECT_NE(received.find("/a"), std::string::npos);
+        sock.close();
+        server.stop();
+    }
+
+    TEST_P(HttpServerEndToEndTest, SlowRequestGets408AfterRequestTimeout)
+    {
+        HttpServer server("127.0.0.1", 0);
+        if (GetParam())
+            server.enableThreadPool(2);
+        server.setRequestTimeout(std::chrono::milliseconds(200));
+        server.setIdleTimeout(std::chrono::milliseconds(5000));
+        std::atomic<int> dispatched{0};
+        server.route("/", [&dispatched](const HttpRequest&, HttpResponse& res) {
+            ++dispatched;
+            res.set_content("x");
+            return 200;
+        });
+        server.start();
+
+        Socket sock;
+        ASSERT_TRUE(ConnectRaw(sock, server.getListeningPort()));
+        ASSERT_TRUE(SendRaw(sock, "GET /slow HTTP/1.1\r\nHost: x\r\nX-Slow: "));
+        std::string received;
+        // Keep trickling header bytes: the connection is never idle.
+        for (int i = 0; i < 40 && received.empty(); ++i)
+        {
+            if (!SendRaw(sock, "a"))
+                break;
+            ReadUntilClosed(sock, received, 50);
+        }
+        ReadUntilClosed(sock, received, 3000);
+        EXPECT_EQ(received.rfind("HTTP/1.1 408 Request Timeout\r\n", 0), 0u) << received;
+        EXPECT_NE(received.find("Connection: close"), std::string::npos) << received;
+        EXPECT_EQ(dispatched.load(), 0);
+        sock.close();
+        server.stop();
+    }
+
+    TEST_P(HttpServerEndToEndTest, SlowHandlerAndStreamOutliveTimeouts)
+    {
+        HttpServer server("127.0.0.1", 0);
+        if (GetParam())
+            server.enableThreadPool(2);
+        server.setIdleTimeout(std::chrono::milliseconds(150));
+        server.setRequestTimeout(std::chrono::milliseconds(150));
+        server.route("/sleepy", [](const HttpRequest&, HttpResponse& res) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            res.set_content("rested");
+            return 200;
+        });
+        server.route("/events", [](const HttpRequest&, HttpResponse& res) {
+            res.set_header("Content-Type", "text/event-stream");
+            int n = 0;
+            res.send_chunk_stream([n]() mutable -> std::string {
+                if (n == 6)
+                    return "";
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                ++n;
+                return SSEEvent::message("e" + std::to_string(n), std::to_string(n)).format();
+            });
+            return 200;
+        });
+        server.start();
+        const std::string base = "http://127.0.0.1:" + std::to_string(server.getListeningPort());
+
+        SOCKETSHPP_NS::http::client::HttpClient client;
+        client.setReadTimeout(5000);
+        SOCKETSHPP_NS::http::client::HttpClientResponse res;
+        ASSERT_TRUE(client.get(base + "/sleepy", res));
+        EXPECT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "rested");
+        ASSERT_TRUE(client.get(base + "/events", res));
+        EXPECT_EQ(res.code, 200);
+        std::string expected;
+        for (int i = 1; i <= 6; ++i)
+            expected += SSEEvent::message("e" + std::to_string(i), std::to_string(i)).format();
+        EXPECT_EQ(res.body, expected);
         server.stop();
     }
 

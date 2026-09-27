@@ -268,6 +268,16 @@ namespace mcp
         /// @note Independently of this value, an idle stream writes an empty SSE comment
         ///       about every 200 ms.
         int sseWriteDeadlineSeconds = 30;
+        /// @brief HTTP idle timeout in milliseconds (default config::HTTP_IDLE_TIMEOUT_MS =
+        ///        60000; 0 disables it): a connection waiting for a request that receives
+        ///        nothing for this long is closed. Open SSE streams and running tool calls
+        ///        are never affected. Forwarded to HttpServer::setIdleTimeout().
+        int idleTimeoutMs = config::HTTP_IDLE_TIMEOUT_MS;
+        /// @brief HTTP request timeout in milliseconds (default config::HTTP_REQUEST_TIMEOUT_MS
+        ///        = 30000; 0 disables it): a request whose head and body are not received
+        ///        this long after its first byte gets 408 and the connection is closed.
+        ///        Forwarded to HttpServer::setRequestTimeout().
+        int requestTimeoutMs = config::HTTP_REQUEST_TIMEOUT_MS;
 
         /// @brief Override settings from command-line arguments. Unknown arguments are ignored.
         ///

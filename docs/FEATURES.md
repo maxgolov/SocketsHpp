@@ -36,6 +36,12 @@ Protocol handling:
   most 100 query parameters.
 - Error responses for malformed requests (400, 413, 414, 417, 431, 501, 505) are generated
   by the server before any handler runs.
+- Connection timeouts (slowloris protection): connections waiting for a request are
+  closed after `setIdleTimeout()` (default 60 s) without data; a request not fully
+  received within `setRequestTimeout()` (default 30 s) of its first byte gets 408 and
+  the connection is closed. Running handlers, responses being sent and streams / SSE
+  are never timed out. `0` disables either; checked by the reactor about every
+  timeout/4.
 
 Application features:
 
@@ -131,7 +137,7 @@ Server helpers (opt-in headers, applied from your handlers):
 | Range requests | No `206 Partial Content`. |
 | Multipart / form parsing | Bodies are delivered raw in `HttpRequest::content`. |
 | Global middleware chain | Auth, compression and proxy helpers are called from handlers. |
-| Connection timeouts on the server | Idle or slow connections are not timed out by the server; use a reverse proxy for slowloris protection. |
+| Send timeout on the server | A client that stops reading a response or stream is not timed out; use a reverse proxy. |
 | Host header validation | Duplicate `Host` is rejected, but the value is not checked. |
 | Legacy MCP HTTP+SSE transport (2024-11-05) | The `endpoint`-event handshake of the old SSE transport is not implemented; clients that speak only that transport cannot connect. Current SDKs, VS Code and Claude use Streamable HTTP, which is supported. |
 | MCP server-to-client requests | Sampling, `roots/list` and server `ping` are not sent; only notifications. |

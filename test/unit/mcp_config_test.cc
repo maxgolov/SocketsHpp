@@ -96,6 +96,8 @@ TEST(MCPConfigTest, ServerConfigDefaults) {
     EXPECT_TRUE(config.session.enabled);
     EXPECT_FALSE(config.resumability.enabled);
     EXPECT_FALSE(config.auth.enabled);
+    EXPECT_EQ(config.idleTimeoutMs, 60000);
+    EXPECT_EQ(config.requestTimeoutMs, 30000);
 }
 
 TEST(MCPConfigTest, ServerConfigParseArgs) {
