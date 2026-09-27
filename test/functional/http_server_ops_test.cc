@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -293,6 +294,153 @@ TEST(HttpServerOpsTest, WellKnownResponseHeaderCasing)
     EXPECT_TRUE(has("X-Custom-Header"));
     EXPECT_TRUE(has("Content-Length"));
     server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Runtime log handler
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    struct CapturedLog
+    {
+        std::mutex mutex;
+        std::vector<std::pair<SocketsHpp::LogLevel, std::string>> messages;
+
+        bool contains(SocketsHpp::LogLevel level, const std::string& text)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto const& m : messages)
+            {
+                if (m.first == level && m.second.find(text) != std::string::npos)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool any(SocketsHpp::LogLevel level)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto const& m : messages)
+            {
+                if (m.first == level)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
+
+    int g_evaluations = 0;
+    int countEvaluation()
+    {
+        return ++g_evaluations;
+    }
+}  // namespace
+
+TEST(HttpServerOpsTest, LogHandlerReceivesLibraryMessages)
+{
+    auto captured = std::make_shared<CapturedLog>();
+    SocketsHpp::setLogHandler([captured](SocketsHpp::LogLevel level, const char* msg) {
+        std::lock_guard<std::mutex> lock(captured->mutex);
+        captured->messages.emplace_back(level, msg);
+    });
+    SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Info);
+    {
+        HttpServer server;
+        int port = server.addListeningPort("127.0.0.1", 0);
+        server.route("/hello", [](const HttpRequest&, HttpResponse& res) {
+            res.set_content("hi");
+            return 200;
+        });
+        server.start();
+        RawConn c(port);
+        ASSERT_TRUE(c.connected());
+        EXPECT_EQ(c.request(get("/hello")).code, 200);
+        server.stop();
+    }
+    SocketsHpp::setLogHandler(nullptr);
+
+    EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Info, "Listening on 127.0.0.1:"));
+    EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Info, "GET /hello HTTP/1.1"));
+    EXPECT_FALSE(captured->any(SocketsHpp::LogLevel::Trace));  // below the Info threshold
+}
+
+TEST(HttpServerOpsTest, TraceLevelFormatsEveryMessage)
+{
+    // Exercises the trace statements of the reactor, the server state machine,
+    // the thread pool and streaming (useful under sanitizers).
+    std::atomic<size_t> count{ 0 };
+    SocketsHpp::setLogHandler([&count](SocketsHpp::LogLevel, const char* msg) {
+        if (msg != nullptr && msg[0] != '\0')
+        {
+            ++count;
+        }
+    });
+    SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Trace);
+    {
+        HttpServer server;
+        int port = server.addListeningPort("127.0.0.1", 0);
+        server.enableThreadPool(2);
+        server.route("/stream", [](const HttpRequest&, HttpResponse& res) {
+            auto n = std::make_shared<int>(0);
+            res.set_header("Content-Type", "text/event-stream");
+            res.send_chunk_stream([n]() { return (++*n <= 2) ? std::string("data: x\n\n") : std::string(); });
+            return 200;
+        });
+        server.route("/", [](const HttpRequest& req, HttpResponse& res) {
+            res.set_content(req.content);
+            return 200;
+        });
+        server.start();
+        RawConn c(port);
+        ASSERT_TRUE(c.connected());
+        EXPECT_EQ(c.request("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc").body, "abc");
+        RawResponse s = c.request(get("/stream"));
+        EXPECT_EQ(s.body, "data: x\n\ndata: x\n\n");
+        server.stop();
+    }
+    SocketsHpp::setLogHandler(nullptr);
+    SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Info);
+    EXPECT_GT(count.load(), 10u);
+}
+
+TEST(HttpServerOpsTest, LogLevelFiltersAndArgumentsAreLazy)
+{
+    auto captured = std::make_shared<CapturedLog>();
+    g_evaluations = 0;
+    LOG_ERROR("no handler: %d", countEvaluation());
+    EXPECT_EQ(g_evaluations, 0);  // arguments not evaluated without a handler
+
+    SocketsHpp::setLogHandler([captured](SocketsHpp::LogLevel level, const char* msg) {
+        std::lock_guard<std::mutex> lock(captured->mutex);
+        captured->messages.emplace_back(level, msg);
+    });
+    SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Warn);
+    LOG_INFO("filtered %d", countEvaluation());
+    EXPECT_EQ(g_evaluations, 0);
+    LOG_WARN("warned %d", countEvaluation());
+    LOG_ERROR("plain error");
+    EXPECT_EQ(g_evaluations, 1);
+    EXPECT_EQ(SocketsHpp::getLogLevel(), SocketsHpp::LogLevel::Warn);
+
+    SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Trace);
+    LOG_TRACE("trace %s", "on");
+
+    SocketsHpp::setLogHandler(nullptr);
+    SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Info);
+    LOG_ERROR("removed %d", countEvaluation());
+    EXPECT_EQ(g_evaluations, 1);
+
+    EXPECT_FALSE(captured->any(SocketsHpp::LogLevel::Info));
+    EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Warn, "warned 1"));
+    EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Error, "plain error"));
+    EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Trace, "trace on"));
+    EXPECT_FALSE(captured->contains(SocketsHpp::LogLevel::Error, "removed"));
+    EXPECT_STREQ(SocketsHpp::logLevelName(SocketsHpp::LogLevel::Warn), "WARN");
 }
 
 TEST(HttpServerOpsTest, CorsMethodsAreConfigurable)

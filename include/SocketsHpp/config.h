@@ -32,6 +32,10 @@
 #define SOCKETSHPP_SERVER_NS_END } }
 #endif
 
+// Runtime log hook (SocketsHpp::setLogHandler()) targeted by the default LOG_* macros.
+// Included after the namespace macros, which it needs.
+#include "./utils/log.h"
+
 #ifdef HAVE_HTTP_DEBUG
 #  ifdef LOG_TRACE
 #    undef LOG_TRACE

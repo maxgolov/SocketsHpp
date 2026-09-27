@@ -22,6 +22,7 @@ MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = YES
 PREDEFINED             = SOCKETSHPP_NS_BEGIN="namespace SocketsHpp {" \
                          SOCKETSHPP_NS_END="}" \
-                         SOCKETSHPP_NS=SocketsHpp
+                         SOCKETSHPP_NS=SocketsHpp \
+                         "SOCKETSHPP_PRINTF_FORMAT(a,b)="
 EXCLUDE_SYMBOLS        = detail
 HAVE_DOT               = NO

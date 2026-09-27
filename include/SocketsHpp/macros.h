@@ -10,7 +10,10 @@
 /// defining the macros yourself before including SocketsHpp (define at least
 /// LOG_DEBUG, which marks them as provided), or define HAVE_CONSOLE_LOG to print each
 /// message to stdout via printf with a leading space and a trailing newline.
-/// Otherwise they compile to no-ops (arguments are not evaluated).
+/// Otherwise they route to the runtime hook SocketsHpp::setLogHandler() (see
+/// utils/log.h): while no handler is installed a log statement is one relaxed atomic
+/// load and its arguments are not evaluated. Define SOCKETSHPP_NO_RUNTIME_LOG to make
+/// them compile to no-ops instead.
 /// Defining HAVE_HTTP_DEBUG (see config.h) sends LOG_TRACE to printf regardless.
 
 #include <mutex>
@@ -45,18 +48,35 @@
 #  define LOG_ERROR(...) SOCKETSHPP_CONSOLE_LOG(__VA_ARGS__)
 #endif
 
-#ifndef LOG_DEBUG
-// Don't log anything if there's no standard log facility defined
-/// @brief Debug-level log: LOG_DEBUG(fmt, ...) with printf-style arguments.
+#if !defined(LOG_DEBUG) && defined(SOCKETSHPP_NO_RUNTIME_LOG)
+// Don't log anything: no log facility defined and the runtime hook is disabled.
 #  define LOG_DEBUG(...) ((void)0)
-/// @brief Trace-level log: LOG_TRACE(fmt, ...) with printf-style arguments.
 #  define LOG_TRACE(...) ((void)0)
-/// @brief Info-level log: LOG_INFO(fmt, ...) with printf-style arguments.
 #  define LOG_INFO(...) ((void)0)
-/// @brief Warning-level log: LOG_WARN(fmt, ...) with printf-style arguments.
 #  define LOG_WARN(...) ((void)0)
-/// @brief Error-level log: LOG_ERROR(fmt, ...) with printf-style arguments.
 #  define LOG_ERROR(...) ((void)0)
+#endif
+
+#ifndef LOG_DEBUG
+// Default: route to the runtime log hook (SocketsHpp::setLogHandler(), utils/log.h,
+// included by config.h). The level check comes first, so the arguments are only
+// evaluated - and the message only formatted - when a handler wants the message.
+/// @brief Route one message of level @p level (a SocketsHpp::LogLevel enumerator
+///        name) to the runtime log handler, if one is installed and the level enabled.
+#  define SOCKETSHPP_RUNTIME_LOG(level, ...)                                                   \
+    (::SOCKETSHPP_NS::log_detail::enabled(::SOCKETSHPP_NS::LogLevel::level)                    \
+         ? ::SOCKETSHPP_NS::log_detail::write(::SOCKETSHPP_NS::LogLevel::level, __VA_ARGS__) \
+         : (void)0)
+/// @brief Debug-level log: LOG_DEBUG(fmt, ...) with printf-style arguments.
+#  define LOG_DEBUG(...) SOCKETSHPP_RUNTIME_LOG(Debug, __VA_ARGS__)
+/// @brief Trace-level log: LOG_TRACE(fmt, ...) with printf-style arguments.
+#  define LOG_TRACE(...) SOCKETSHPP_RUNTIME_LOG(Trace, __VA_ARGS__)
+/// @brief Info-level log: LOG_INFO(fmt, ...) with printf-style arguments.
+#  define LOG_INFO(...) SOCKETSHPP_RUNTIME_LOG(Info, __VA_ARGS__)
+/// @brief Warning-level log: LOG_WARN(fmt, ...) with printf-style arguments.
+#  define LOG_WARN(...) SOCKETSHPP_RUNTIME_LOG(Warn, __VA_ARGS__)
+/// @brief Error-level log: LOG_ERROR(fmt, ...) with printf-style arguments.
+#  define LOG_ERROR(...) SOCKETSHPP_RUNTIME_LOG(Error, __VA_ARGS__)
 #endif
 
 // SAL macro
