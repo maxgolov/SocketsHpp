@@ -6,8 +6,8 @@
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO maxgolov/SocketsHpp
-    REF 614606f5290965e6372e33ce783562ea55e986de
-    SHA512 b12beb4dd8f79b9c356a5e0bdf312b818da6f9a3d5e7e928008e7bea7d9bef80d3bca46fb5b7c4f8e097df975f86404c6189143d94e4065814ae4c9ff42e9d21
+    REF 99fd57c6b020f005c506fa0f8ebaacdcccf31a84 # v1.1.0
+    SHA512 fd0398ac4cec3b38fa07bdf17adee3e63dd383bc7f05497da36cef566eb79e50b9fac705578a02f0ccd5cc2b8627413039a4640eea7aa0dd3f8332500b904610
     HEAD_REF main
 )
 
@@ -23,7 +23,7 @@ vcpkg_cmake_configure(
     OPTIONS
         ${FEATURE_OPTIONS}
         -DBUILD_TESTING=OFF
-        -DBUILD_EXAMPLES=OFF
+        -DSOCKETSHPP_BUILD_EXAMPLES=OFF
         -DSOCKETSHPP_BUILD_TESTS=OFF
         # BS_thread_pool.hpp comes from the bshoshany-thread-pool port
         -DSOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL=OFF
