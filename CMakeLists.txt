@@ -9,7 +9,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT DEFINED CMAKE_TOOL
         "Toolchain file (vcpkg, from the VCPKG_ROOT environment variable)")
 endif()
 
-project ("SocketsHpp" VERSION 1.0.0)
+project ("SocketsHpp" VERSION 1.1.0)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(SOCKETSHPP_IS_TOP_LEVEL ON)

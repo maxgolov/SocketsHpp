@@ -1011,6 +1011,7 @@ See [examples/README.md](examples/README.md). Build them with
 ## Documentation
 
 - [docs/FEATURES.md](docs/FEATURES.md) - what is and is not implemented
+- [CHANGELOG.md](CHANGELOG.md) - release notes
 - [docs/DESIGN.md](docs/DESIGN.md) - architecture, design patterns and future directions
 - [docs/INTEGRATION.md](docs/INTEGRATION.md) - adding SocketsHpp to a project
 - [docs/MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md) - MCP server/client guide

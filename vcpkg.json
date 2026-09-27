@@ -1,6 +1,6 @@
 {
   "name": "socketshpp",
-  "version-string": "1.0.0",
+  "version-string": "1.1.0",
   "description": "Header-only C++ sockets library with HTTP/1.1 and MCP support",
   "homepage": "https://github.com/maxgolov/SocketsHpp",
   "license": "Apache-2.0",
