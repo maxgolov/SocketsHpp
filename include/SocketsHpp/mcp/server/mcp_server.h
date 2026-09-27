@@ -697,7 +697,8 @@ namespace mcp
             ///        requests are served on background threads until stop().
             ///
             /// Binds only to ServerConfig::host and ServerConfig::port (0 = ephemeral; see
-            /// port()) and enables a 4-thread worker pool for handlers. No-op if already
+            /// port()) and sizes the handler pool using ServerConfig::workerThreads.
+            /// No-op if already
             /// running (the loopback guard is still checked first).
             /// SSRF guard: refuses a host other than "127.0.0.1", "localhost", "::1" or
             /// "[::1]" unless ServerConfig::allowNonLoopback is true.
@@ -722,7 +723,7 @@ namespace mcp
                     m_httpServer.setServerName(m_config.serverName.empty() ? std::string("mcp-server") : m_config.serverName);
                     m_httpServer.addListeningUnixSocket(m_config.unixSocketPath, m_config.unixSocketPermissions);
                     m_running = true;
-                    m_httpServer.enableThreadPool(4);
+                    m_httpServer.enableThreadPool(m_config.workerThreads);
                     m_httpServer.start();
                     return;
                 }
@@ -745,7 +746,7 @@ namespace mcp
                 m_httpServer.addListeningPort(m_config.host, m_config.port);
 
                 m_running = true;
-                m_httpServer.enableThreadPool(4);  // SSE callbacks run on pool; reactor stays free
+                m_httpServer.enableThreadPool(m_config.workerThreads);  // SSE callbacks run on pool; reactor stays free
                 m_httpServer.start();
             }
 

@@ -379,6 +379,13 @@ namespace mcp
         ///        Forwarded to HttpServer::setRequestTimeout().
         int requestTimeoutMs = config::HTTP_REQUEST_TIMEOUT_MS;
 
+        /// @brief HTTP handler and streaming callback worker count. 0 (default)
+        ///        uses hardware concurrency, or 4 if unknown, as in HttpServer.
+        /// @note Applies to TCP and Unix domain listeners; ignored for STDIO.
+        ///       Handlers on different connections must be thread-safe. Set 4
+        ///       explicitly to retain the previous fixed pool size.
+        size_t workerThreads = 0;
+
         /// @brief Override settings from command-line arguments. Unknown arguments are ignored.
         ///
         /// Recognized: `--transport http|streamable|http-streamable` (any other value = STDIO),

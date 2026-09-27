@@ -12,7 +12,15 @@
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <tuple>
+#include <vector>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -102,3 +110,102 @@ TEST(McpUnixSocketTest, TcpStillGuardedWithoutUnixSocket)
     MCPServer server(cfg);
     EXPECT_THROW(server.listen(), std::runtime_error);  // loopback guard
 }
+
+class McpWorkerPoolTest : public ::testing::TestWithParam<std::tuple<TransportType, bool, size_t>>
+{
+};
+
+TEST_P(McpWorkerPoolTest, ConfiguredConcurrency)
+{
+    ServerConfig cfg;
+    cfg.transport = std::get<0>(GetParam());
+    const bool useUnix = std::get<1>(GetParam());
+    cfg.workerThreads = std::get<2>(GetParam());
+    cfg.port = 0;
+    cfg.session.enabled = false;
+    if (useUnix)
+    {
+#ifdef HAVE_UNIX_DOMAIN
+        cfg.unixSocketPath = socketPath();
+#else
+        GTEST_SKIP() << "AF_UNIX is unavailable";
+#endif
+    }
+
+    size_t workers = cfg.workerThreads;
+    if (workers == 0)
+    {
+        workers = std::thread::hardware_concurrency();
+        if (workers == 0) workers = 4;
+    }
+    const size_t expected = std::min<size_t>(workers, 6);
+    const size_t requests = expected == 1 ? 2 : expected;
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t entered = 0;
+    bool released = false;
+    std::atomic<size_t> completed{0};
+    MCPServer server(cfg);
+    server.registerMethod("probe", [&](const json&) {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++entered;
+        cv.notify_all();
+        // Bound cleanup even if the test fails before releasing the handlers.
+        cv.wait_for(lock, std::chrono::seconds(15), [&] { return released; });
+        return json{{"ok", true}};
+    });
+    try
+    {
+        server.listen();
+    }
+    catch (const std::runtime_error& e)
+    {
+#ifdef _WIN32
+        if (useUnix) GTEST_SKIP() << "AF_UNIX not usable here: " << e.what();
+#endif
+        throw;
+    }
+    const std::string url = useUnix ? "http://localhost/mcp" :
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/mcp";
+    std::vector<std::thread> clients;
+    for (size_t i = 0; i < requests; ++i)
+    {
+        clients.emplace_back([&, i] {
+            HttpClient client;
+            if (useUnix) client.setUnixSocketPath(cfg.unixSocketPath);
+            HttpClientRequest request;
+            request.method = "POST";
+            request.uri = url;
+            request.setHeader("Content-Type", "application/json");
+            request.setHeader("Accept", "application/json");
+            request.body = json{{"jsonrpc", "2.0"}, {"id", i}, {"method", "probe"}}.dump();
+            HttpClientResponse response;
+            if (client.send(request, response) && response.code == 200)
+            {
+                const auto body = json::parse(response.body, nullptr, false);
+                if (body.is_object() && body.contains("result") &&
+                    body["result"] == json{{"ok", true}})
+                    ++completed;
+            }
+        });
+    }
+    bool reached = false;
+    bool exceeded = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        reached = cv.wait_for(lock, std::chrono::seconds(5), [&] { return entered >= expected; });
+        if (expected == 1)
+            exceeded = cv.wait_for(lock, std::chrono::milliseconds(250), [&] { return entered > 1; });
+        released = true;
+    }
+    cv.notify_all();
+    for (auto& client : clients) client.join();
+    server.stop();
+    EXPECT_TRUE(reached) << "configured workers did not enter together";
+    EXPECT_FALSE(exceeded) << "a single-worker pool ran handlers concurrently";
+    EXPECT_EQ(completed.load(), requests);
+}
+
+INSTANTIATE_TEST_SUITE_P(TransportsAndListeners, McpWorkerPoolTest,
+    ::testing::Combine(::testing::Values(TransportType::HTTP, TransportType::HTTP_STREAMABLE),
+                       ::testing::Bool(), ::testing::Values(size_t{0}, size_t{1}, size_t{6})));

@@ -91,8 +91,12 @@ Key points:
   produces that error, and any other `std::exception` becomes `-32603 Internal error`.
   Unknown methods get `-32601 Method not found`.
 - Methods may be registered at any time, including after `listen()`.
-- `listen()` binds `config.host:config.port`, starts a 4-thread worker pool and the
-  reactor, and returns immediately. `port()` returns the bound port (useful with
+- `listen()` binds `config.host:config.port`, starts a worker pool sized by
+  `config.workerThreads` and the reactor, and returns immediately. The default `0`
+  uses hardware concurrency (4 if unknown); set `4` explicitly to retain the
+  previous fixed size. This applies to both TCP and Unix-domain HTTP listeners;
+  STDIO ignores the setting. Handlers on different connections must be thread-safe.
+  `port()` returns the bound port (useful with
   `config.port = 0`), or -1 before `listen()`. `stop()` closes all notification streams
   and stops the HTTP server. `listen()` throws for `TransportType::STDIO`.
 - **Loopback guard:** `listen()` refuses to bind anything other than `127.0.0.1`,
@@ -506,6 +510,7 @@ launches it.
 | `responseMode` | `BATCH` | `STREAM` only affects legacy `initialize` (see above) |
 | `maxMessageSize` | 4 MB | HTTP request body limit |
 | `batchTimeoutMs` | 30000 | Not used by the current implementation |
+| `workerThreads` | 0 | HTTP worker count for TCP and Unix-domain listeners; `0` = hardware concurrency (4 if unknown). Ignored for STDIO. Set in code before constructing the server. |
 | `cors.*` | see [CORS](#cors) | |
 | `session.enabled`, `headerName`, `allowClientTermination`, `sessionTimeoutSeconds` | `true`, `"Mcp-Session-Id"`, `true`, 3600 | |
 | `resumability.enabled`, `historyDurationMs`, `maxHistorySize` | `false`, 300000, 1000 | See [Resumability](#resumability) |
