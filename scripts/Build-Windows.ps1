@@ -57,11 +57,12 @@ $ConfigureArgs = @(
     "-B", "build/windows-x64",
     "-S", ".",
     "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain",
-    "-DCMAKE_BUILD_TYPE=$Configuration"
+    "-DCMAKE_BUILD_TYPE=$Configuration",
+    "-DSOCKETSHPP_BUILD_TESTS=ON"
 )
 
 if ($BuildExamples) {
-    $ConfigureArgs += "-DBUILD_EXAMPLES=ON"
+    $ConfigureArgs += "-DSOCKETSHPP_BUILD_EXAMPLES=ON"
 }
 
 Write-Host "Running: cmake $($ConfigureArgs -join ' ')" -ForegroundColor Gray

@@ -5,6 +5,9 @@
 #include <SocketsHpp/mcp/common/mcp_config.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
+#include <stdexcept>
+
 using namespace SocketsHpp::mcp;
 using json = nlohmann::json;
 
@@ -75,7 +78,8 @@ TEST(MCPConfigTest, ClientConfigFromJsonHttp) {
 
     auto config = ClientConfig::fromJson(server_json);
     
-    EXPECT_EQ(config.transport, TransportType::HTTP);
+    // VS Code writes "type": "http" for Streamable HTTP servers.
+    EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
     EXPECT_EQ(config.http.url, "http://localhost:3000/mcp");
     EXPECT_EQ(config.http.headers["Authorization"], "Bearer xyz");
 }
@@ -92,6 +96,8 @@ TEST(MCPConfigTest, ServerConfigDefaults) {
     EXPECT_TRUE(config.session.enabled);
     EXPECT_FALSE(config.resumability.enabled);
     EXPECT_FALSE(config.auth.enabled);
+    EXPECT_EQ(config.idleTimeoutMs, 60000);
+    EXPECT_EQ(config.requestTimeoutMs, 30000);
 }
 
 TEST(MCPConfigTest, ServerConfigParseArgs) {
@@ -209,6 +215,64 @@ TEST(MCPConfigTest, ClientConfigFromJsonHttpStreamableAlias) {
     json server_json = {{"type", "http-streamable"}, {"url", "http://localhost:3601/mcp"}};
     auto config = ClientConfig::fromJson(server_json);
     EXPECT_EQ(config.transport, TransportType::HTTP_STREAMABLE);
+}
+
+TEST(MCPConfigTest, ClientConfigFromJsonSseUsesHttpTransport) {
+    json server_json = {{"type", "sse"}, {"url", "http://localhost:3000/sse"}};
+    auto config = ClientConfig::fromJson(server_json);
+    EXPECT_EQ(config.transport, TransportType::HTTP);
+    EXPECT_EQ(config.http.url, "http://localhost:3000/sse");
+}
+
+TEST(MCPConfigTest, ClientConfigDefaultTransportInitialized) {
+    ClientConfig config;
+    EXPECT_EQ(config.transport, TransportType::STDIO);
+}
+
+TEST(MCPConfigTest, ClientConfigFromJsonUnknownTypeThrows) {
+    json server_json = {{"type", "websocket"}, {"url", "ws://localhost/mcp"}};
+    EXPECT_THROW(ClientConfig::fromJson(server_json), std::invalid_argument);
+}
+
+TEST(MCPConfigTest, ServerConfigProxyHeadersNotTrustedByDefault) {
+    ServerConfig config;
+    EXPECT_FALSE(config.trustProxyHeaders);
+    EXPECT_EQ(config.maxRequestsPerMinute, 0);
+}
+
+namespace
+{
+    void setEnv(const char* name, const char* value)
+    {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+            ::setenv(name, value, 1);
+        else
+            ::unsetenv(name);
+#endif
+    }
+}  // namespace
+
+TEST(MCPConfigTest, ParseEnvAuthTypes)
+{
+    {
+        setEnv("MCP_AUTH_TYPE", "api-key");
+        ServerConfig cfg;
+        cfg.parseEnv();
+        EXPECT_TRUE(cfg.auth.enabled);
+        EXPECT_EQ(cfg.auth.type, ServerConfig::AuthConfig::Type::API_KEY);
+        EXPECT_EQ(cfg.auth.headerName, "x-api-key");
+    }
+    {
+        // An unknown type used to enable auth with no usable method (every request
+        // rejected); it is now a startup error.
+        setEnv("MCP_AUTH_TYPE", "basic");
+        ServerConfig cfg;
+        EXPECT_THROW(cfg.parseEnv(), std::invalid_argument);
+    }
+    setEnv("MCP_AUTH_TYPE", nullptr);
 }
 
 int main(int argc, char **argv) {

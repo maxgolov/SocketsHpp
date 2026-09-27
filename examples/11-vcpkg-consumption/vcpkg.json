@@ -5,6 +5,9 @@
   "dependencies": [
     "socketshpp"
   ],
-  "builtin-baseline": "latest",
-  "overrides": []
+  "vcpkg-configuration": {
+    "overlay-ports": [
+      "../../ports"
+    ]
+  }
 }

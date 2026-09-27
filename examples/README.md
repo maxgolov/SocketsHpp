@@ -1,200 +1,64 @@
 # SocketsHpp Examples
 
-Standalone examples demonstrating SocketsHpp features. Each example is self-contained with its own CMakeLists.txt and can be built independently.
+Small programs showing how to use the library. Each directory has a `main.cpp` (or
+two sources for example 10), a `CMakeLists.txt` and a README.
 
-## Available Examples
+## Building
 
-### [01-tcp-echo](01-tcp-echo/)
-Simple TCP client that sends 1MB of data to a server.
-
-**Demonstrates:**
-- Creating TCP sockets
-- Connecting to servers
-- Sending data
-- Socket cleanup
-
-**Run:**
-```bash
-cd 01-tcp-echo && mkdir build && cd build
-cmake .. && cmake --build .
-./tcp-echo  # or tcp-echo.exe on Windows
-```
-
----
-
-### [02-udp-echo](02-udp-echo/)
-UDP client that sends a datagram to a server.
-
-**Demonstrates:**
-- Creating UDP sockets
-- Datagram transmission
-- Address configuration
-- Connectionless communication
-
-**Run:**
-```bash
-cd 02-udp-echo && mkdir build && cd build
-cmake .. && cmake --build .
-./udp-echo
-```
-
----
-
-### [03-http-server](03-http-server/)
-HTTP/1.1 server with routing, query parameters, and JSON responses.
-
-**Demonstrates:**
-- HTTP server creation
-- Route handlers
-- Query parameter parsing
-- Multiple content types (HTML, JSON, plain text)
-- Different HTTP methods (GET, POST)
-
-**Run:**
-```bash
-cd 03-http-server && mkdir build && cd build
-cmake .. && cmake --build .
-./http-server
-# Visit http://localhost:8080
-```
-
----
-
-### [04-http-sse](04-http-sse/)
-Server-Sent Events (SSE) for real-time streaming.
-
-**Demonstrates:**
-- SSE event streams
-- `text/event-stream` content type
-- Event IDs and custom event types
-- JSON data in events
-- Browser client integration
-- Chunked responses
-
-**Run:**
-```bash
-cd 04-http-sse && mkdir build && cd build
-cmake .. && cmake --build .
-./http-sse
-# Visit http://localhost:8080 or curl -N http://localhost:8080/events
-```
-
----
-
-### [05-mcp-server](05-mcp-server/)
-Model Context Protocol (MCP) server with HTTP+SSE transport.
-
-**Demonstrates:**
-- MCP transport layer
-- CORS configuration
-- Session management
-- DELETE/OPTIONS methods
-- Base64 encoding
-- JSON-RPC message format (simplified)
-- SSE for bidirectional communication
-
-**Run:**
-```bash
-cd 05-mcp-server && mkdir build && cd build
-cmake .. && cmake --build .
-./mcp-server
-# curl -N http://localhost:8080/sse
-```
-
----
-
-## Building All Examples
-
-To build all examples at once:
+Build the examples from the repository root together with the library:
 
 ```bash
-# From the examples directory
-for dir in */; do
-    cd "$dir"
-    mkdir -p build && cd build
-    cmake .. && cmake --build .
-    cd ../..
-done
+git submodule update --init --recursive      # nlohmann-json, needed by sockets.hpp
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
+cmake --build build --parallel               # or: --target http-server
 ```
 
-Or on Windows PowerShell:
+Executables are placed in `build/examples/<directory>/` (on Visual Studio generators,
+in `build/examples/<directory>/<Config>/`), for example
+`build/examples/03-http-server/http-server`.
 
-```powershell
-Get-ChildItem -Directory | ForEach-Object {
-    cd $_.FullName
-    if (!(Test-Path build)) { mkdir build }
-    cd build
-    cmake ..
-    cmake --build .
-    cd ../..
-}
-```
+Each example's own `CMakeLists.txt` can also be configured directly from its directory
+inside a checkout of this repository. Example 11 is not part of the top-level build: it
+consumes SocketsHpp as an installed vcpkg package (see its README).
+
+## Examples
+
+| Directory | Target | What it does |
+|-----------|--------|--------------|
+| [01-tcp-echo](01-tcp-echo/) | `tcp-echo` | TCP echo round trip in one process: `TcpServer` on an ephemeral loopback port; a client sends 1 MiB and verifies the echo |
+| [02-udp-echo](02-udp-echo/) | `udp-echo` | UDP echo round trip in one process: `SocketServer` on a datagram socket with an echoing `onRequest`; a client verifies each reply |
+| [03-http-server](03-http-server/) | `http-server` | HTTP server: HTML, text and JSON routes, query parameters, a JSON POST route, prefix routing with 400/404/405 answers |
+| [04-http-sse](04-http-sse/) | `http-sse` | Server-Sent Events with `send_chunk_stream()`, custom event types, a browser client, the worker pool |
+| [05-mcp-server](05-mcp-server/) | `mcp-server` | `MCPServer` over Streamable HTTP with an `echo` and a cancellable `wait` tool; curl walkthrough of initialize, tools/list, tools/call, cancellation and DELETE |
+| [06-proxy-aware](06-proxy-aware/) | `proxy-aware-server` | Real client IP/scheme/host behind a reverse proxy with `TrustProxyConfig` and `ProxyAwareHelpers`; HTML-escaped page and a JSON route |
+| [07-authentication](07-authentication/) | `authenticated-api` | `AuthenticationMiddleware` with Bearer, Basic and API-key strategies, 401 challenges and a 403 role check |
+| [08-compression](08-compression/) | `compression-server` | `CompressionMiddleware` compressing responses with the toy `rle` codec; `Content-Encoding` and `Vary` |
+| [09-full-featured](09-full-featured/) | `full-featured-server` | Notes API combining the thread pool, CORS, auth middleware, proxy awareness, compression and JSON GET/POST routes |
+| [10-typescript-interop](10-typescript-interop/) | `cpp_server`, `cpp_client` | `MCPServer`/`MCPClient` interop in both directions with the official MCP TypeScript SDK (run in CI) |
+| [11-vcpkg-consumption](11-vcpkg-consumption/) | `vcpkg-consumer` | A separate project that gets SocketsHpp through the vcpkg port (overlay or git registry) and uses `find_package(SocketsHpp)` |
+
+Examples 03, 04 and 06-09 use `HttpServer(name, port)`, which listens on **all IPv4
+interfaces** (the name only appears in the `Server` response header, so
+`HttpServer("localhost", 8080)` is not loopback-only); 05, 10 and 11 bind 127.0.0.1.
+Use `addListeningPort("127.0.0.1", port)` in your own code to bind one address. The
+HTTP servers take an optional port argument (default 8080) and stop cleanly on Ctrl+C.
+
+For the MCP API in depth, see [docs/MCP_IMPLEMENTATION.md](../docs/MCP_IMPLEMENTATION.md).
 
 ## Requirements
 
-- C++17 compatible compiler
-- CMake 3.14 or newer
-- Windows: MSVC, MinGW, or Clang
-- Linux: GCC 7+, Clang 5+
-- macOS: Xcode Command Line Tools
+- C++17 compiler and CMake 3.14+ (example 11: 3.15)
+- The dependencies listed in the [main README](../README.md#dependencies): the bundled
+  `external/BS_thread_pool.hpp`, and nlohmann/json (every example includes
+  `sockets.hpp`)
+- `curl` or a browser to try them out; Node.js 18+ for example 10
 
-## Platform-Specific Notes
+## Adding an example
 
-### Windows
-The examples automatically link `ws2_32.lib` for Winsock2.
-
-### Linux/macOS
-No special libraries needed - standard POSIX sockets are used.
-
-### ARM64
-All examples build successfully for ARM64 (tested via cross-compilation).
-
-## Example Structure
-
-Each example follows this structure:
-
-```
-XX-example-name/
-├── main.cpp         # Source code
-├── CMakeLists.txt   # Build configuration
-└── README.md        # Documentation
-```
-
-Examples are designed to be:
-- **Standalone** - Build and run independently
-- **Educational** - Clear comments and documentation
-- **Practical** - Real-world usage patterns
-- **Cross-platform** - Windows, Linux, macOS, ARM64
-
-## Testing
-
-Each example includes testing instructions in its README.md. Most examples can be tested with:
-
-- `netcat` (nc) for TCP/UDP servers
-- `curl` for HTTP endpoints
-- Web browsers for SSE and HTML
-- MCP clients for the MCP server
-
-## Additional Resources
-
-- [Main README](../README.md) - Library overview
-- [Features Documentation](../docs/FEATURES.md) - Implementation status
-- [Test Documentation](../test/README.md) - Test suite information
-- [MCP Specification](https://spec.modelcontextprotocol.io/) - MCP protocol details
-
-## Contributing
-
-When adding new examples:
-
-1. Create a new numbered directory (e.g., `06-new-example/`)
-2. Include `main.cpp`, `CMakeLists.txt`, and `README.md`
-3. Follow the existing structure and style
-4. Test on Windows and Linux
-5. Update this main README.md
-6. Ensure examples are self-contained (no external dependencies except SocketsHpp)
+1. Create a numbered directory with `main.cpp`, `CMakeLists.txt` and `README.md`.
+2. Add it to the `SOCKETSHPP_BUILD_EXAMPLES` block of the top-level `CMakeLists.txt`.
+3. Add a row to the table above.
 
 ## License
 
-All examples are licensed under Apache-2.0, same as SocketsHpp library.
-
-Copyright Max Golovanov. SPDX-License-Identifier: Apache-2.0
+Apache-2.0, like the library.

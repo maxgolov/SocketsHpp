@@ -1,49 +1,68 @@
 # Proxy-Aware HTTP Server
 
-This example demonstrates how to use `ProxyAwareHelpers` to extract real client information when your server is behind a reverse proxy (nginx, Apache, HAProxy, load balancer).
+Uses `ProxyAwareHelpers` to recover the original client IP, scheme and host when the
+server runs behind a reverse proxy (nginx, Apache, HAProxy, a load balancer).
+
+```
+[Client] -> [nginx / HAProxy] -> [This server]
+```
+
+The proxy describes the original request in `X-Forwarded-For`, `X-Forwarded-Proto`,
+`X-Forwarded-Host`, `X-Real-IP` or RFC 7239 `Forwarded` headers. Anyone can send those
+headers, so they are honoured only when the direct peer is a trusted proxy.
 
 ## Features
 
-- Trust proxy configuration (security-first)
-- X-Forwarded-* header support
-- RFC 7239 Forwarded header support
-- Real client IP extraction
-- Protocol detection (HTTP/HTTPS)
-- Host header extraction
+- `TrustProxyConfig` with an explicit list of trusted proxies (`127.0.0.1`,
+  `10.0.0.1`, `172.16.0.1`)
+- `GET /api/client`: the derived client IP, scheme, host, "secure" flag and the direct
+  peer as JSON (built with nlohmann::json)
+- `GET /` (and every other path): an HTML page with the same details plus the URI and
+  all request headers. Every value taken from the request is HTML-escaped, otherwise a
+  crafted header or URL would inject script into the page (reflected XSS).
+- Each page request is logged to the console
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
+cmake --build build --target proxy-aware-server
 ```
 
 ## Running
 
 ```bash
-./proxy-aware-server
+./build/examples/06-proxy-aware/proxy-aware-server          # port 8080
+./build/examples/06-proxy-aware/proxy-aware-server 9000     # another port
 ```
 
-The server will listen on `http://localhost:8080`.
+The server listens on all IPv4 interfaces. Press Ctrl+C to stop it.
 
 ## Testing
 
-### Basic request
 ```bash
-curl http://localhost:8080/
-```
+# Direct request: reports your own address
+curl http://localhost:8080/api/client
+# {"clientIP":"127.0.0.1","directPeer":"127.0.0.1:47580","host":"localhost:8080","protocol":"http","secure":false}
 
-### With proxy headers
-```bash
+# Simulated proxy headers. They are honoured because curl connects from 127.0.0.1,
+# which is in the trusted list.
 curl -H "X-Forwarded-For: 203.0.113.42" \
      -H "X-Forwarded-Proto: https" \
      -H "X-Forwarded-Host: example.com" \
-     http://localhost:8080/
+     http://localhost:8080/api/client
+# {"clientIP":"203.0.113.42","directPeer":"127.0.0.1:47586","host":"example.com","protocol":"https","secure":true}
+
+# The HTML version
+curl -i http://localhost:8080/
 ```
 
+The same headers sent from an untrusted address (for example from another machine, to
+the server's LAN address) are ignored and the direct connection is reported instead.
+
 ### nginx configuration
-Add this to your nginx config to forward headers:
 
 ```nginx
 location / {
@@ -55,6 +74,12 @@ location / {
 }
 ```
 
-## Security Note
+## Security notes
 
-Always use `TrustMode::TrustSpecific` in production and whitelist only your trusted proxy IPs. Using `TrustMode::TrustAll` allows clients to forge headers.
+- Use `TrustMode::TrustSpecific` (what `addTrustedProxy()` selects) in production and
+  list only your proxies. `TrustMode::TrustAll` lets any client forge its address and
+  scheme.
+- The values returned by `ProxyAwareHelpers` come from request headers: escape them
+  before putting them in HTML. `getClientIP()` only ever returns a literal IPv4/IPv6
+  address (forwarded values that are not addresses are skipped), but `getHost()`
+  returns `X-Forwarded-Host` / `Host` verbatim.

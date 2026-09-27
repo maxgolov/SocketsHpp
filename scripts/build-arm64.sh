@@ -33,9 +33,10 @@ echo "ARM64 Cross-Compilation Build"
 echo "========================================"
 echo ""
 
-cd "$(dirname "$0")/.."
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 
-# Initialize git submodules (simple-uri-parser, nlohmann-json)
+# Initialize git submodules (nlohmann-json)
 echo "Initializing git submodules..."
 git submodule update --init --recursive
 
@@ -92,19 +93,11 @@ if [ ! -d "$GTEST_ARM64_DIR/lib" ]; then
 fi
 
 # Create ARM64 build directory
-cd /mnt/c/build/maxgolov/SocketsHpp
+cd "$ROOT"
 echo "Creating ARM64 build directory..."
 rm -rf build/linux-arm64
-mkdir -p build/linux-arm64/external/include
-
-# Copy BS thread pool header (header-only library from Windows vcpkg)
-echo "Copying BS thread pool header..."
-if [ -f build/windows-x64/vcpkg_installed/x64-windows/include/BS_thread_pool.hpp ]; then
-    cp build/windows-x64/vcpkg_installed/x64-windows/include/BS_thread_pool.hpp build/linux-arm64/external/include/
-    echo "BS thread pool header copied successfully"
-else
-    echo "Warning: BS thread pool header not found in Windows build, attempting to continue..."
-fi
+mkdir -p build/linux-arm64
+# BS_thread_pool.hpp is bundled in external/ and found by the top-level CMakeLists.txt.
 
 # Configure for ARM64
 echo "Configuring CMake for ARM64..."
@@ -124,11 +117,12 @@ CMAKE_ARGS=(
     -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
     -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
     -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+    -DSOCKETSHPP_BUILD_TESTS=ON
 )
 
 # Enable examples if requested
 if [ "$BUILD_EXAMPLES" = true ]; then
-    CMAKE_ARGS+=(-DBUILD_EXAMPLES=ON)
+    CMAKE_ARGS+=(-DSOCKETSHPP_BUILD_EXAMPLES=ON)
 fi
 
 cmake "${CMAKE_ARGS[@]}"
@@ -173,7 +167,6 @@ if [ "$BUILD_EXAMPLES" = true ]; then
     fi
     
     echo ""
-    echo "Note: Examples 03-09 require API updates and are temporarily disabled."
     echo "Note: Examples require manual testing. See examples/README.md for usage."
 fi
 

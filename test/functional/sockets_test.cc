@@ -23,21 +23,22 @@
 using namespace SOCKETSHPP_NS::net::common;
 using namespace std;
 
-namespace testing
+namespace
 {
     static const int kMaxConnections = 16;
 
-    std::string GenerateBigString(size_t maxLength = 60000)
+    // AF_UNIX needs Windows 10 1803+ (and is not implemented by Wine).
+    bool UnixSocketsSupported()
     {
-        char* bigBuff = (char*)calloc(maxLength, sizeof(char));
-        for (size_t i = 0; i < sizeof(bigBuff); i++)
+        try
         {
-            bigBuff[i] = char(i % 255);
+            ScopedSocket probe(AF_UNIX, SOCK_STREAM, 0);
+            return true;
         }
-        bigBuff[maxLength] = 0;
-        std::string bigString((const char*)bigBuff, maxLength);
-        free(bigBuff);
-        return bigString;
+        catch (const std::exception&)
+        {
+            return false;
+        }
     }
 
     struct EchoServerTest
@@ -99,7 +100,7 @@ namespace testing
     TEST(SocketTests, BasicTcpEchoTest)
     {
         SocketParams params{ AF_INET, SOCK_STREAM, 0 };
-        SocketAddr destination("127.0.0.1:3000");
+        SocketAddr destination("127.0.0.1:0");  // ephemeral port
         SocketServer server(destination, params);
         EchoServerTest test(server);
         test.Start();
@@ -110,7 +111,7 @@ namespace testing
     TEST(SocketTests, ManyPacketsTcpEchoTest)
     {
         SocketParams params{ AF_INET, SOCK_STREAM, 0 };
-        SocketAddr destination("127.0.0.1:3000");
+        SocketAddr destination("127.0.0.1:0");  // ephemeral port
         SocketServer server(destination, params);
         EchoServerTest test(server);
         test.Start();
@@ -124,7 +125,7 @@ namespace testing
     TEST(SocketTests, BasicUdpEchoTest)
     {
         SocketParams params{ AF_INET, SOCK_DGRAM, 0 };
-        SocketAddr destination("127.0.0.1:4000");
+        SocketAddr destination("127.0.0.1:0");  // ephemeral port
         SocketServer server(destination, params);
         
         server.onRequest = [&](SocketServer::Connection& conn) {
@@ -142,7 +143,7 @@ namespace testing
         
         // UDP test - single datagram  
         Socket client(params);
-        client.connect(destination);
+        client.connect(server.address());
         
         // Set receive timeout to avoid infinite hang
         struct timeval tv;
@@ -184,10 +185,11 @@ namespace testing
 
     TEST(SocketTests, BasicUnixDomainEchoTest)
     {
-        auto socket_name = GetTempDirectory();
         SocketParams params{ AF_UNIX, SOCK_STREAM, 0 };
-        // Store messenger.sock named Unix domain socket in temp dir
-        socket_name += "messenger.sock";
+        if (!UnixSocketsSupported())
+            GTEST_SKIP() << "AF_UNIX sockets are not supported on this host";
+        // Unique name per test so parallel test runs don't collide.
+        auto socket_name = GetUniqueSocketName("messenger");
         // cpp/io/c/remove
         LOG_TRACE("Temporary AF_UNIX socket name=%s", socket_name.c_str());
         std::remove(socket_name.c_str());
@@ -201,10 +203,11 @@ namespace testing
 
     TEST(SocketTests, ManyPacketsUnixDomainEchoTest)
     {
-        auto socket_name = GetTempDirectory();
         SocketParams params{ AF_UNIX, SOCK_STREAM, 0 };
-        // Store messenger.sock named Unix domain socket in temp dir
-        socket_name += "messenger.sock";
+        if (!UnixSocketsSupported())
+            GTEST_SKIP() << "AF_UNIX sockets are not supported on this host";
+        // Unique name per test so parallel test runs don't collide.
+        auto socket_name = GetUniqueSocketName("messenger");
         // cpp/io/c/remove
         LOG_TRACE("Temporary AF_UNIX socket name=%s", socket_name.c_str());
         std::remove(socket_name.c_str());
@@ -216,10 +219,4 @@ namespace testing
         test.Stop();
     }
 
-}  // namespace testing
-
-int main(int argc, char **argv)
-{
-    testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+}  // namespace

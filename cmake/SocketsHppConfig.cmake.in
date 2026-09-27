@@ -1,0 +1,19 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+if(@SOCKETSHPP_WITH_JWT_CPP@)
+    find_dependency(jwt-cpp CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/SocketsHppTargets.cmake")
+
+# MCP headers need nlohmann-json; attach it when available so consumers that
+# use MCP get the include path, while pure socket/HTTP users need nothing extra.
+find_package(nlohmann_json CONFIG QUIET)
+if(TARGET nlohmann_json::nlohmann_json)
+    set_property(TARGET SocketsHpp::SocketsHpp APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES nlohmann_json::nlohmann_json)
+endif()
+
+check_required_components(SocketsHpp)

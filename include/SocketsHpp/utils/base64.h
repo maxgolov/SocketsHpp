@@ -3,8 +3,9 @@
 
 #pragma once
 
-#include <string>
+#include <cstddef>
 #include <stdexcept>
+#include <string>
 
 namespace SocketsHpp {
 namespace utils {
@@ -12,8 +13,10 @@ namespace utils {
 /**
  * @brief Base64 encoding and decoding utilities
  * 
- * Provides RFC 4648 compliant base64 encoding and decoding.
- * All functions are header-only and have no external dependencies.
+ * Provides RFC 4648 (section 4) base64 encoding and decoding with the standard
+ * alphabet and '=' padding (no URL-safe variant, no line wrapping).
+ * All functions are header-only, stateless (safe to call from any thread) and
+ * have no external dependencies.
  */
 class Base64
 {
@@ -23,9 +26,61 @@ private:
         "abcdefghijklmnopqrstuvwxyz"
         "0123456789+/";
 
-    static inline bool is_base64(unsigned char c)
+    /// Map a base64 alphabet character to its 6-bit value, or -1 if it is not in
+    /// the standard alphabet (locale independent; '=' is not an alphabet char).
+    static inline int decode_char(unsigned char c) noexcept
     {
-        return (isalnum(c) || (c == '+') || (c == '/'));
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    }
+
+    static inline bool is_base64(unsigned char c) noexcept
+    {
+        return decode_char(c) >= 0;
+    }
+
+    /// Strict validation of standard, padded base64 (RFC 4648 section 4).
+    /// On failure returns false and sets `error`.
+    static bool validate(const std::string& s, const char*& error) noexcept
+    {
+        const size_t len = s.size();
+        if (len % 4 != 0)
+        {
+            error = "Invalid base64 length (must be a multiple of 4)";
+            return false;
+        }
+        for (size_t i = 0; i < len; i++)
+        {
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c == '=')
+            {
+                // Padding is only allowed as the last one or two characters of the input.
+                const size_t pad = len - i;
+                if (pad > 2 || (pad == 2 && s[len - 1] != '='))
+                {
+                    error = "Invalid base64 padding";
+                    return false;
+                }
+                // Canonical encoding: unused bits before the padding must be zero.
+                const int last = decode_char(static_cast<unsigned char>(s[i - 1]));
+                if ((pad == 2 && (last & 0x0f) != 0) || (pad == 1 && (last & 0x03) != 0))
+                {
+                    error = "Invalid base64 padding (non-zero trailing bits)";
+                    return false;
+                }
+                return true;
+            }
+            if (!is_base64(c))
+            {
+                error = "Invalid base64 character";
+                return false;
+            }
+        }
+        return true;
     }
 
 public:
@@ -108,7 +163,11 @@ public:
      * 
      * @param encoded_string Base64-encoded string to decode
      * @return std::string Decoded binary data as string
-     * @throws std::invalid_argument if input contains invalid base64 characters
+     * @throws std::invalid_argument if the input is not strictly valid, padded
+     *         standard base64: length must be a multiple of 4, only the standard
+     *         alphabet is allowed, '=' may appear only as the final one or two
+     *         characters, and the unused bits before padding must be zero.
+     *         Whitespace is not accepted.
      * 
      * Example:
      * @code
@@ -118,114 +177,57 @@ public:
      */
     static std::string decode(const std::string& encoded_string)
     {
-        size_t in_len = encoded_string.size();
-        int i = 0;
-        int j = 0;
-        int in_ = 0;
-        unsigned char char_array_4[4], char_array_3[3];
+        const char* error = nullptr;
+        if (!validate(encoded_string, error))
+        {
+            throw std::invalid_argument(error);
+        }
+
         std::string ret;
-
-        while (in_len-- && (encoded_string[in_] != '='))
+        ret.reserve(encoded_string.size() / 4 * 3);
+        for (size_t i = 0; i < encoded_string.size(); i += 4)
         {
-            // Check for invalid characters
-            if (!is_base64(encoded_string[in_]))
+            int v[4];
+            int valid = 0;
+            for (int k = 0; k < 4; k++)
             {
-                throw std::invalid_argument("Invalid base64 character");
-            }
-            
-            char_array_4[i++] = encoded_string[in_];
-            in_++;
-            if (i == 4)
-            {
-                for (i = 0; i < 4; i++)
+                const unsigned char c = static_cast<unsigned char>(encoded_string[i + static_cast<size_t>(k)]);
+                if (c == '=')
                 {
-                    // Find position in base64_chars
-                    const char* pos = base64_chars;
-                    int idx = 0;
-                    while (*pos && *pos != char_array_4[i])
-                    {
-                        pos++;
-                        idx++;
-                    }
-                    if (!*pos)
-                    {
-                        throw std::invalid_argument("Invalid base64 character");
-                    }
-                    char_array_4[i] = static_cast<unsigned char>(idx);
+                    v[k] = 0;
                 }
-
-                char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-                char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-                char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
-
-                for (i = 0; (i < 3); i++)
-                    ret += char_array_3[i];
-                i = 0;
+                else
+                {
+                    v[k] = decode_char(c);
+                    valid++;
+                }
             }
+            const unsigned int triple = (static_cast<unsigned int>(v[0]) << 18) |
+                                        (static_cast<unsigned int>(v[1]) << 12) |
+                                        (static_cast<unsigned int>(v[2]) << 6) |
+                                        static_cast<unsigned int>(v[3]);
+            ret += static_cast<char>((triple >> 16) & 0xff);
+            if (valid > 2)
+                ret += static_cast<char>((triple >> 8) & 0xff);
+            if (valid > 3)
+                ret += static_cast<char>(triple & 0xff);
         }
-
-        if (i)
-        {
-            for (j = 0; j < i; j++)
-            {
-                // Find position in base64_chars
-                const char* pos = base64_chars;
-                int idx = 0;
-                while (*pos && *pos != char_array_4[j])
-                {
-                    pos++;
-                    idx++;
-                }
-                if (!*pos)
-                {
-                    throw std::invalid_argument("Invalid base64 character");
-                }
-                char_array_4[j] = static_cast<unsigned char>(idx);
-            }
-
-            for (j = i; j < 4; j++)
-                char_array_4[j] = 0;
-
-            char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-            char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-            char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
-
-            for (j = 0; (j < i - 1); j++)
-                ret += char_array_3[j];
-        }
-
         return ret;
     }
 
     /**
      * @brief Validate if a string is valid base64
+     *
+     * Uses the same strict rules as decode(): is_valid(s) is true exactly when
+     * decode(s) does not throw.
      * 
      * @param str String to validate
      * @return true if string is valid base64, false otherwise
      */
     static bool is_valid(const std::string& str)
     {
-        if (str.empty())
-            return true;
-
-        // Check if length is multiple of 4 (with padding)
-        size_t len = str.length();
-        
-        // Count padding
-        size_t padding = 0;
-        if (len > 0 && str[len - 1] == '=')
-            padding++;
-        if (len > 1 && str[len - 2] == '=')
-            padding++;
-
-        // Check all non-padding characters
-        for (size_t i = 0; i < len - padding; i++)
-        {
-            if (!is_base64(static_cast<unsigned char>(str[i])))
-                return false;
-        }
-
-        return true;
+        const char* error = nullptr;
+        return validate(str, error);
     }
 };
 
@@ -254,9 +256,10 @@ inline std::string encode(const std::string& data)
 }
 
 /**
- * @brief Decode base64 string
+ * @brief Decode base64 string (strict; see Base64::decode())
  * @param encoded_string Base64-encoded string
  * @return Decoded binary data as string
+ * @throws std::invalid_argument if the input is not strictly valid, padded base64
  */
 inline std::string decode(const std::string& encoded_string)
 {
@@ -264,7 +267,7 @@ inline std::string decode(const std::string& encoded_string)
 }
 
 /**
- * @brief Validate base64 string
+ * @brief Validate base64 string (same strict rules as decode())
  * @param str String to validate
  * @return true if valid base64
  */

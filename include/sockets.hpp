@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+/// @file sockets.hpp
+/// @brief Umbrella header: includes the socket primitives, generic socket server,
+///        HTTP server / file server / client, MCP server and client, and base64 utilities.
+/// @note Not included here: net/tcp/tcp.h and net/server/thread_pool_server.h. JWT
+///       support in the MCP server additionally requires SOCKETSHPP_HAS_JWT_CPP.
+
 #include "SocketsHpp/config.h"
 
 // Socket Tools and common Socket Server

@@ -8,7 +8,7 @@ TEST(MinimalJsonRpcTest, CanCreateRequest) {
     JsonRpcRequest req;
     req.id = 1;
     req.method = "test";
-    EXPECT_EQ(std::get<int>(req.id), 1);
+    EXPECT_EQ(std::get<std::int64_t>(req.id), 1);
 }
 
 int main(int argc, char **argv) {

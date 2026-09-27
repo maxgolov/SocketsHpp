@@ -12,5 +12,5 @@ Or simply include the headers:
 
 Dependencies (automatically handled by vcpkg):
 - nlohmann-json
-- cpp-jwt  
 - bshoshany-thread-pool
+- jwt-cpp (optional, feature "jwt": enables JWT validation in the MCP server)

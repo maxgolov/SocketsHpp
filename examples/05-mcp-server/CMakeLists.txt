@@ -1,13 +1,11 @@
 cmake_minimum_required(VERSION 3.14)
-project(mcp-server-example)
+project(mcp-server-example CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+# Provides SocketsHpp::SocketsHpp (also when this example is built on its own)
+include(${CMAKE_CURRENT_LIST_DIR}/../SocketsHppExample.cmake)
 
 add_executable(mcp-server main.cpp)
-
-if(WIN32)
-    target_link_libraries(mcp-server ws2_32)
-endif()
+socketshpp_example(mcp-server)

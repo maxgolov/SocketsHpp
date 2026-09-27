@@ -4,6 +4,10 @@
 #include <gtest/gtest.h>
 #include <SocketsHpp/utils/base64.h>
 
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
 using namespace SocketsHpp::utils;
 
 // Test basic encoding
@@ -279,6 +283,76 @@ TEST(Base64Test, ZeroLengthBinary)
     const unsigned char* data = nullptr;
     std::string encoded = Base64::encode(data, 0);
     EXPECT_EQ(encoded, "");
+}
+
+// ---------------------------------------------------------------------------
+// Strict decoding: decode() throws and is_valid() returns false for anything
+// that is not canonical, padded, standard-alphabet base64.
+// ---------------------------------------------------------------------------
+
+namespace {
+const char* const kInvalidInputs[] = {
+    "A",            // length not a multiple of 4 (1-char remainder used to drop data)
+    "AB",           // unpadded
+    "ABC",          // unpadded
+    "AB=",          // bad length
+    "==",           // padding only
+    "====",         // padding only
+    "A===",         // too much padding
+    "QQ==garbage",  // data after padding (used to decode as "A")
+    "QQ==QQ==",     // padding in the middle
+    "QQ=Z",         // '=' followed by a non-'=' character
+    "Q=Q=",         // interleaved padding
+    "QR==",         // non-zero unused bits before "==" (non-canonical)
+    "Zm9=",         // non-zero unused bits before "="  (non-canonical)
+    "Zm9v\n",       // whitespace is not accepted
+    " Zm9v",
+    "Zm 9v",
+    "Zm9v-_==",     // URL-safe alphabet is not standard base64
+    "Zm9\xC3\xA9",  // non-ASCII byte
+    "Zg@=",
+};
+}  // namespace
+
+TEST(Base64Test, StrictDecodingRejectsMalformedInput)
+{
+    for (const char* input : kInvalidInputs)
+    {
+        EXPECT_THROW(Base64::decode(input), std::invalid_argument) << "input: \"" << input << "\"";
+        EXPECT_FALSE(Base64::is_valid(input)) << "input: \"" << input << "\"";
+        EXPECT_FALSE(base64::is_valid(input)) << "input: \"" << input << "\"";
+    }
+    // Embedded NUL
+    const std::string withNul("Zm\0v", 4);
+    EXPECT_THROW(Base64::decode(withNul), std::invalid_argument);
+    EXPECT_FALSE(Base64::is_valid(withNul));
+}
+
+TEST(Base64Test, IsValidAgreesWithDecode)
+{
+    const char* const valid[] = {"", "QQ==", "QUI=", "QUJD", "Zm9vYmFy", "AAECA//+/Q==", "+/+/"};
+    for (const char* input : valid)
+    {
+        EXPECT_TRUE(Base64::is_valid(input)) << input;
+        EXPECT_NO_THROW(Base64::decode(input)) << input;
+    }
+    EXPECT_EQ(Base64::decode("QQ=="), "A");
+    EXPECT_EQ(Base64::decode("QUI="), "AB");
+    EXPECT_EQ(Base64::decode("QUJD"), "ABC");
+    EXPECT_EQ(Base64::decode("+/+/"), std::string("\xfb\xff\xbf"));
+}
+
+TEST(Base64Test, RoundTripAllLengths)
+{
+    std::string data;
+    for (int len = 0; len < 64; len++)
+    {
+        std::string encoded = Base64::encode(data);
+        EXPECT_EQ(encoded.size() % 4, 0u);
+        EXPECT_TRUE(Base64::is_valid(encoded));
+        EXPECT_EQ(Base64::decode(encoded), data);
+        data += static_cast<char>((len * 37 + 11) & 0xff);
+    }
 }
 
 int main(int argc, char **argv)

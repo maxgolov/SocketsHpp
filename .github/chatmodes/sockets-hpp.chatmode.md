@@ -10,9 +10,9 @@ tools: ['edit', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'Mic
 **SocketsHpp** is a lean, minimalist, header-only C++17 networking library designed for seamless integration into large C++ projects with minimal impact. The library provides:
 
 - **Cross-platform support**: Windows (x64/ARM64), Linux (x64/ARM64), macOS (x64/ARM64)
-- **Single-threaded reactor pattern**: epoll (Linux), kqueue (BSD/macOS), IOCP (Windows)
-- **HTTP/1.1 server**: ~75% RFC compliance, middleware support (auth, compression, proxy-aware)
-- **Model Context Protocol (MCP)**: JSON-RPC server for AI agent integration
+- **Single-threaded reactor pattern**: epoll (Linux), kqueue (macOS), WSAEventSelect + WSAWaitForMultipleEvents (Windows, at most 64 sockets per reactor)
+- **HTTP/1.1 server and client**: keep-alive, chunked streaming, SSE, CORS, helpers for auth, compression and reverse proxies
+- **Model Context Protocol (MCP)**: MCPServer / MCPClient over Streamable HTTP (2025-03-26), interop-tested against the official TypeScript SDK
 - **Optional multi-threading**: BS::thread_pool integration for CPU-intensive request processing
 - **TCP/UDP/Unix Domain sockets**: Full socket abstraction layer
 
@@ -23,7 +23,7 @@ tools: ['edit', 'runNotebooks', 'search', 'new', 'runCommands', 'runTasks', 'Mic
 - No external runtime dependencies (except optional BS thread pool for multi-threading)
 - Lean and mean - can be dropped into existing projects as a plugin
 - Pragmatic over perfect - 75% HTTP compliance is sufficient for real-world use
-- Performance matters - designed for <10K concurrent connections with low overhead
+- Performance matters - low overhead; one reactor thread per server (Windows: at most 64 sockets per reactor)
 
 **WHEN IN DOUBT, ASK PERPLEXITY**: Use Perplexity research tools for:
 - RFC compliance questions (HTTP/1.1, WebSocket, MCP protocol specs)
@@ -49,14 +49,13 @@ build/
 - **Linux ARM64**: `wsl bash -c "cd /mnt/c/build/maxgolov/SocketsHpp && ./scripts/build-arm64.sh"`
 
 ### Test Coverage
-- **231 tests on Windows** (48 Windows-specific tests)
-- **183 tests on Linux/ARM64** (cross-platform core)
-- **Unit tests**: Socket APIs, URL parsing, base64, auth, compression, middleware
-- **Functional tests**: TCP/UDP echo, HTTP server lifecycle, streaming (SSE, chunked), HTTP methods
+- **500+ GoogleTest cases** (`ctest -N` lists them); CI: Ubuntu GCC/Clang/ASan+UBSan, macOS, Windows MSVC, MinGW-w64 under Wine, Doxygen, MCP TypeScript-SDK interop, vcpkg port
+- **Unit tests**: Socket APIs, URL parsing, base64, auth, compression, MCP config/JSON-RPC
+- **Functional tests**: TCP/UDP, HTTP server/client, streaming (SSE, chunked), MCP Streamable HTTP, robustness
 
 ### Dependencies
-- **vcpkg.json**: gtest, nlohmann-json, cpp-jwt, bshoshany-thread-pool
-- **Git submodule**: simple-uri-parser
+- **vcpkg.json**: gtest, nlohmann-json, bshoshany-thread-pool (jwt-cpp via the optional `jwt` feature)
+- **Git submodule**: nlohmann-json (`external/nlohmann-json`); BS_thread_pool.hpp is bundled in `external/`
 - **NO MANUAL INSTALLATIONS** - all dependencies managed via vcpkg or submodules
 
 ## Architecture & Design Patterns
@@ -64,7 +63,7 @@ build/
 ### Reactor Pattern (Core)
 - Single-threaded event loop using platform-specific I/O multiplexing
 - Non-blocking sockets with edge-triggered events
-- Connection state machine: `Idle → Readable → Processing → SendingHeaders → SendingBody → Idle`
+- Connection state machine in `HttpServer` (reading, processing, sending headers/body, streaming)
 
 ### Multi-Threading (Optional)
 - **Design**: `std::mutex` protecting connection map + optional `BS::thread_pool<>`
@@ -76,11 +75,11 @@ build/
 - HTTP/1.1 with Keep-Alive, chunked transfer encoding
 - Server-Sent Events (SSE) streaming
 - Middleware: authentication (Bearer, API Key, Basic), compression (RLE, identity), proxy-aware headers
-- Request/Response abstraction with query params, headers, cookies
+- Request/Response abstraction with query params (`parse_query()`) and headers
 
 ### Known Limitations
-- ~75% HTTP/1.1 compliance (sufficient for practical use)
-- Designed for <10K concurrent connections
+- Pragmatic HTTP/1.1 subset (see docs/FEATURES.md)
+- Windows: at most 64 sockets per reactor (extra connections are refused)
 - Single-threaded reactor (multi-threading only for request processing)
 - No HTTPS/TLS support (use reverse proxy like nginx)
 - No WebSocket support yet (MCP uses HTTP + SSE)
@@ -94,7 +93,7 @@ build/
 - Guard against multiple includes with `#pragma once`
 
 ### Cross-Platform Compatibility
-- Use `#ifdef _WIN32` for Windows-specific code (WinSock2, IOCP)
+- Use `#ifdef _WIN32` for Windows-specific code (WinSock2, WSAEventSelect)
 - Use `#ifdef __linux__` or `#ifdef __APPLE__` for POSIX (epoll/kqueue)
 - Test on all platforms before merging (Windows, Linux x64, Linux ARM64)
 - Handle platform differences in socket types (`SOCKET` vs `int`)
@@ -110,15 +109,6 @@ build/
 - Comprehensive tests for all new features (unit + functional)
 - No external runtime dependencies (except opt-in BS thread pool)
 - Follow existing code style (no explicit style guide - match surrounding code)
-
-## Recent Critical Fixes
-
-### UDP Server Non-Blocking Socket (CRITICAL)
-**Issue**: UDP tests hung on shutdown - reactor thread stuck in blocking `recvfrom()`
-**Root Cause**: UDP server socket not set to non-blocking mode
-**Fix**: Added `server_socket.setNonBlocking()` in `SocketServer` constructor for UDP sockets
-**Impact**: Affected ALL platforms (not WSL2-specific as initially suspected)
-**Location**: `include/SocketsHpp/net/common/socket_server.h` line 115
 
 ## Development Workflow
 
@@ -139,18 +129,11 @@ build/
 - **No hacks**: Use proper dependency management (vcpkg), no manual installations
 - **Performance aware**: Profile hot paths, minimize allocations, use non-blocking I/O
 
-## Current Focus Areas
-
-1. **Multi-threading**: Extend optional thread pool support to MCP server
-2. **Test coverage**: Add unit tests for thread pool lifecycle, functional tests for concurrent requests
-3. **Documentation**: Update README with multi-threading examples and performance characteristics
-4. **MCP protocol**: Implement full JSON-RPC 2.0 spec for Model Context Protocol
-5. **Performance**: Benchmark and optimize hot paths (connection handling, HTTP parsing)
-
 ## Resources & References
 
 - **Build scripts**: `scripts/Build-Windows.ps1`, `scripts/build-linux.sh`, `scripts/build-arm64.sh`
 - **Main headers**: `include/sockets.hpp`, `include/SocketsHpp/http/server/http_server.h`
 - **Test structure**: `test/unit/`, `test/functional/`
-- **Dependencies**: `vcpkg.json`, `.gitmodules` (simple-uri-parser)
+- **Dependencies**: `vcpkg.json`, `.gitmodules` (nlohmann-json)
+- **Docs**: `README.md`, `docs/FEATURES.md`, `docs/INTEGRATION.md`, `docs/MCP_IMPLEMENTATION.md`, `ports/socketshpp/README.md`
 - **CI/CD**: `build-all.cmd` (orchestrates all platform builds)

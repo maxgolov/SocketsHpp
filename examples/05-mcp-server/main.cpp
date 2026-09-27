@@ -2,206 +2,108 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /// @file main.cpp
-/// @brief Model Context Protocol (MCP) server example
+/// @brief Minimal MCP (Model Context Protocol) server with MCPServer.
 ///
 /// This example demonstrates:
-/// - MCP HTTP+SSE transport
-/// - CORS configuration for web clients
-/// - Session management
-/// - DELETE method for session cleanup
-/// - Base64 encoding for binary data
+/// - MCPServer on the Streamable HTTP transport at http://127.0.0.1:<port>/mcp
+/// - registerTool() / registerCancellableTool(): built-in tools/list and tools/call
+///   with two tools, "echo" and "wait", and the tools capability advertised
+///   automatically in the initialize result
+/// - A cancellable tool ("wait" stops early on notifications/cancelled)
+/// - Sessions (Mcp-Session-Id) and graceful shutdown
 ///
-/// Note: This is a simplified MCP server showing the transport layer.
-/// Full JSON-RPC 2.0 message handling would be needed for production.
+/// Usage: mcp-server [port]   (default 8080)
 
 #include <sockets.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
 #include <iostream>
-#include <map>
-#include <mutex>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
-using namespace SOCKETSHPP_NS::http::server;
-using namespace SOCKETSHPP_NS::utils;
+using namespace SOCKETSHPP_NS::mcp;
+using namespace SOCKETSHPP_NS::mcp::server;
+using json = nlohmann::json;
 
-// Simple session store
-std::map<std::string, std::time_t> sessions;
-std::mutex sessions_mutex;
-
-int main()
+namespace
 {
+    std::atomic<bool> g_running{true};
+    void onSignal(int) { g_running = false; }
+}  // namespace
+
+int main(int argc, char* argv[])
+{
+    std::signal(SIGINT, onSignal);
+    std::signal(SIGTERM, onSignal);
+
     try
     {
-        HttpServer server("0.0.0.0", 8080);
-        std::cout << "MCP Server starting on http://localhost:8080" << std::endl;
+        ServerConfig cfg;
+        cfg.transport = TransportType::HTTP_STREAMABLE;
+        cfg.host = "127.0.0.1";  // MCPServer refuses non-loopback hosts unless allowNonLoopback is set
+        cfg.port = argc > 1 ? std::stoi(argv[1]) : 8080;
+        cfg.endpoint = "/mcp";
+        cfg.serverName = "example-mcp-server";
+        cfg.serverVersion = "1.0.0";
 
-        // Configure CORS for web-based MCP clients (note: CorsConfig not in current API, manual headers)
-        const std::string allow_origin = "*";
-        const std::string allow_methods = "GET, POST, DELETE, OPTIONS";
-        const std::string allow_headers = "Content-Type, Authorization";
-        const int max_age = 3600;
+        MCPServer server(cfg);
 
-        // OPTIONS handler for CORS preflight
-        server.route("/sse", [&](const HttpRequest& req, HttpResponse& res) -> int {
-            if (req.method == "OPTIONS") {
-                res.set_header("Access-Control-Allow-Origin", allow_origin);
-                res.set_header("Access-Control-Allow-Methods", allow_methods);
-                res.set_header("Access-Control-Allow-Headers", allow_headers);
-                res.set_header("Access-Control-Max-Age", std::to_string(max_age));
-                res.set_status(204);
-                res.set_content("");
-                return 0;
-            }
-
-            // SSE endpoint for MCP messages
-            res.set_header("Content-Type", "text/event-stream");
-            res.set_header("Cache-Control", "no-cache");
-            res.set_header("Connection", "keep-alive");
-            res.set_header("Access-Control-Allow-Origin", allow_origin);
-
-            // Create session
-            std::string session_id;
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex);
-                // Simple UUID-like session ID (in production use proper UUID)
-                session_id = "session-" + std::to_string(std::time(nullptr));
-                sessions[session_id] = std::time(nullptr);
-            }
-
-            std::cout << "New MCP session: " << session_id << std::endl;
-
-            // Send initialization message
-            SSEEvent init;
-            init.event = "message";
-            init.id = "1";
-            init.data = R"({
-                "jsonrpc": "2.0",
-                "method": "initialized",
-                "params": {
-                    "sessionId": ")" + session_id + R"(",
-                    "serverInfo": {
-                        "name": "SocketsHpp MCP Server",
-                        "version": "1.0.0"
-                    },
-                    "capabilities": {
-                        "tools": {},
-                        "prompts": {},
-                        "resources": {}
-                    }
-                }
-            })";
-            res.send_chunk(init.format());
-
-            // Send welcome tool list
-            SSEEvent tools;
-            tools.event = "message";
-            tools.id = "2";
-            tools.data = R"({
-                "jsonrpc": "2.0",
-                "method": "tools/list",
-                "result": {
-                    "tools": [
-                        {
-                            "name": "echo",
-                            "description": "Echoes back the input",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "message": {"type": "string"}
-                                }
-                            }
-                        }
-                    ]
-                }
-            })";
-            res.send_chunk(tools.format());
-
-            // Keep connection alive with periodic pings
-            for (int i = 0; i < 5; i++) {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                
-                SSEEvent ping;
-                ping.event = "ping";
-                ping.data = std::to_string(std::time(nullptr));
-                res.send_chunk(ping.format());
-            }
-
-            std::cout << "MCP session ended: " << session_id << std::endl;
-            return 0;
-        });
-
-        // DELETE handler for session cleanup
-        server.route("/session", [&](const HttpRequest& req, HttpResponse& res) -> int {
-            if (req.method == "DELETE") {
-                // Extract session ID from Authorization header or query param
-                std::string session_id = "demo-session";  // Simplified
-                
+        // registerTool() provides tools/list and tools/call, and the default initialize
+        // result (protocol version negotiation, serverInfo from cfg) advertises the tools
+        // capability. A handler returning a string produces one text content item; a
+        // handler that throws produces a result with "isError": true and the message.
+        server.registerTool(
+            "echo", "Return the given text",
+            {{"type", "object"}, {"properties", {{"text", {{"type", "string"}}}}}, {"required", {"text"}}},
+            [](const json& args) -> json {
+                if (!args.contains("text") || !args["text"].is_string())
                 {
-                    std::lock_guard<std::mutex> lock(sessions_mutex);
-                    sessions.erase(session_id);
+                    throw std::invalid_argument("echo: 'text' must be a string");
                 }
-                
-                std::cout << "Deleted session: " << session_id << std::endl;
-                
-                res.set_header("Access-Control-Allow-Origin", allow_origin);
-                res.set_status(204);  // No Content
-                res.set_content("");
-            } else if (req.method == "OPTIONS") {
-                res.set_header("Access-Control-Allow-Origin", allow_origin);
-                res.set_header("Access-Control-Allow-Methods", "DELETE, OPTIONS");
-                res.set_status(204);
-                res.set_content("");
-            } else {
-                res.set_status(405);  // Method Not Allowed
-                res.set_content("Only DELETE and OPTIONS allowed");
-            }
-            return 0;
-        });
+                return args["text"].get<std::string>();
+            });
 
-        // Info endpoint (optional MCP metadata)
-        server.route("/info", [&](const HttpRequest& req, HttpResponse& res) -> int {
-            res.set_header("Content-Type", "application/json");
-            res.set_header("Access-Control-Allow-Origin", allow_origin);
-            res.set_content(R"({
-                "name": "SocketsHpp MCP Server",
-                "version": "1.0.0",
-                "protocol": "mcp/1.0",
-                "transport": "http-sse",
-                "capabilities": {
-                    "tools": true,
-                    "prompts": false,
-                    "resources": false
+        // A cancellable tool: handlers run on MCPServer's worker threads, so a
+        // notifications/cancelled for this request (same session, params.requestId =
+        // this request's id) is processed while "wait" runs and sets `cancelled`.
+        server.registerCancellableTool(
+            "wait", "Wait for the given number of seconds (1-60); cancellable",
+            {{"type", "object"}, {"properties", {{"seconds", {{"type", "integer"}}}}}, {"required", {"seconds"}}},
+            [](const json& args, std::shared_ptr<std::atomic<bool>> cancelled) -> json {
+                if (!args.contains("seconds") || !args["seconds"].is_number_integer())
+                {
+                    throw std::invalid_argument("wait: 'seconds' must be an integer");
                 }
-            })");
-            return 0;
-        });
+                const int seconds = args["seconds"].get<int>();
+                if (seconds < 1 || seconds > 60)
+                {
+                    throw std::invalid_argument("wait: 'seconds' must be between 1 and 60");
+                }
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    if (cancelled->load())
+                    {
+                        throw std::runtime_error("cancelled");  // no response is sent for it
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                return "Waited " + std::to_string(seconds) + " s";
+            });
 
-        // Base64 demo endpoint
-        server.route("/base64", [&](const HttpRequest& req, HttpResponse& res) -> int {
-            if (req.method == "POST") {
-                std::string input = req.content;
-                std::string encoded = base64::encode(input);
-                
-                res.set_header("Content-Type", "application/json");
-                res.set_content(R"({"original":")" + input + R"(","encoded":")" + encoded + R"("})");
-            } else {
-                res.set_content("Send POST request with data to encode");
-            }
-            return 0;
-        });
+        server.listen();  // non-blocking
+        std::cout << "MCP server listening at http://127.0.0.1:" << server.port() << "/mcp" << std::endl;
 
-        std::cout << "MCP Server ready!" << std::endl;
-        std::cout << "Endpoints:" << std::endl;
-        std::cout << "  GET  /sse      - SSE event stream (MCP transport)" << std::endl;
-        std::cout << "  DELETE /session - End MCP session" << std::endl;
-        std::cout << "  GET  /info     - Server metadata" << std::endl;
-        std::cout << "  POST /base64   - Base64 encoding demo" << std::endl;
-
-        server.start();
-        
-        // Keep server running
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        while (g_running)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        
+        std::cout << "Shutting down..." << std::endl;
+        server.stop();
         return 0;
     }
     catch (const std::exception& e)

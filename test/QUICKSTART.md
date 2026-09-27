@@ -1,68 +1,47 @@
 # Quick Test Guide
 
-## Build and Run Tests Quickly
+Tests are opt-in: configure with `-DSOCKETSHPP_BUILD_TESTS=ON` (needs GoogleTest).
+See [README.md](README.md) for the full list of test binaries.
 
-### Windows (PowerShell)
+## Linux / macOS
+
+```bash
+cmake -S . -B build -DSOCKETSHPP_BUILD_TESTS=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+## Windows (PowerShell, vcpkg)
+
 ```powershell
-# Configure and build
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-cmake --build build --config Debug
-
-# Run all tests
-cd build
-ctest -C Debug --output-on-failure
-
-# Run only unit tests (fast)
-ctest -C Debug -R "^unit\." -V
-
-# Run only functional tests
-ctest -C Debug -R "^functional\." -V
+cmake -S . -B build -DSOCKETSHPP_BUILD_TESTS=ON `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --config Debug --parallel
+ctest --test-dir build -C Debug --output-on-failure
 ```
 
-### Linux/macOS (Bash)
-```bash
-# Configure and build
-cmake -B build -S .
-cmake --build build
-
-# Run all tests
-cd build
-ctest --output-on-failure
-
-# Run only unit tests (fast)
-ctest -R "^unit\." -V
-
-# Run only functional tests
-ctest -R "^functional\." -V
-```
-
-## Test Organization
-
-### Unit Tests (fast, isolated)
-- `url_parser_test` - URL parsing validation
-- `socket_addr_test` - Socket address parsing
-- `socket_basic_test` - Basic socket operations
-
-### Functional Tests (integration, end-to-end)
-- `sockets_test` - TCP echo server scenarios
-- `sockets_udp_test` - UDP communication
-- `http_server_test` - HTTP server lifecycle
-
-## Running Individual Tests
+## Running a subset
 
 ```bash
-# Run specific test executable
-./build/test/unit/url_parser_test
-./build/test/functional/sockets_test
-
-# Run with test filtering
-./build/test/unit/url_parser_test --gtest_filter="*IPv6*"
-./build/test/unit/socket_addr_test --gtest_filter="SocketAddrTest.*"
+ctest --test-dir build -R '^unit\.'                  # unit tests only
+ctest --test-dir build -R '^functional\.'            # functional tests only
+ctest --test-dir build -R 'unit\.SocketAddrTest\.'   # one GoogleTest suite
+ctest --test-dir build -N                            # list tests without running them
 ```
 
-## Adding New Tests
+## Running a test binary directly
 
-1. **Unit test**: Create file in `test/unit/`, add to `UNIT_TESTS` in CMakeLists.txt
-2. **Functional test**: Create file in `test/functional/`, add to `FUNCTIONAL_TESTS` in CMakeLists.txt
+```bash
+./build/test/url_parser_test
+./build/test/socket_addr_test --gtest_filter='SocketAddrTest.*IPv6*'
+./build/test/sockets_test --gtest_list_tests
+```
 
-See `test/README.md` for detailed documentation.
+(`build\test\Debug\<name>.exe` with Visual Studio generators.)
+
+## Adding a test
+
+1. Create `test/unit/<name>_test.cc` or `test/functional/<name>_test.cc`.
+2. Add `<name>_test` to `UNIT_TESTS` or `FUNCTIONAL_TESTS` in `test/CMakeLists.txt`.
+3. Re-run CMake; the new cases appear as `unit.<Suite>.<Test>` /
+   `functional.<Suite>.<Test>` in ctest.

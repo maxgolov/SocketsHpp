@@ -1,48 +1,44 @@
-# UDP Echo Client Example
+# UDP Echo Example
 
-A simple UDP client that sends a datagram to a server.
+A UDP echo server and client in one process. The program binds a `SocketServer` to a
+UDP socket on an ephemeral port on `127.0.0.1`, installs an `onRequest` handler that
+sends each datagram back, then sends three datagrams from a client `Socket` and checks
+every reply. It needs no other tools and exits with status 0 on success, 1 on failure.
 
 ## Building
 
+From the repository root:
+
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
+cmake --build build --target udp-echo
 ```
 
 ## Running
 
-First, start a UDP server:
-
 ```bash
-# Using netcat
-nc -u -l -p 40000
-
-# Or on Windows
-ncat -u -l -p 40000
-```
-
-Then run the example:
-
-```bash
-./udp-echo
+./build/examples/02-udp-echo/udp-echo
 ```
 
 ## What it demonstrates
 
-- Creating a UDP socket with `SOCK_DGRAM`
-- Using `SocketAddr` for addressing
-- Sending datagrams with `Socket::send()`
-- UDP is connectionless but `connect()` sets default destination
+- `net::common::SocketServer(SocketAddr("127.0.0.1:0"), SocketParams{AF_INET, SOCK_DGRAM, 0})`:
+  binds in the constructor (check `is_bound`); `address()` reports the actual port
+- An `onRequest` handler: it runs on the reactor thread for each datagram, copies
+  `request_buffer` to `response_buffer` and inserts `Connection::Responding`, and the
+  server sends the reply to the datagram's sender. (The default handler sends nothing.)
+- `connect()` on a UDP client only sets the default peer for `send()` / `recv()`
+- A receive timeout (`SO_RCVTIMEO`): UDP does not guarantee delivery, so the client
+  never waits for a reply forever
 
 ## Expected output
 
 ```
-Sending to 127.0.0.1:40000
-Sent 35 bytes: Hello from SocketsHpp UDP client!
+Echo server listening on udp://127.0.0.1:56113
+echoed: Hello
+echoed: from the
+echoed: SocketsHpp UDP client!
+OK: all datagrams echoed
 ```
 
-The server should receive:
-```
-Hello from SocketsHpp UDP client!
-```
+The port differs from run to run.

@@ -21,10 +21,17 @@ jobs:
             compiler: gcc
             cc: gcc
             cxx: g++
+            package_check: true
           - os: ubuntu-latest
-            compiler: clang
+            compiler: gcc-sanitizers
+            cc: gcc
+            cxx: g++
+            cmake_extra: -DSOCKETSHPP_ENABLE_ASAN=ON -DSOCKETSHPP_ENABLE_UBSAN=ON
+          - os: ubuntu-latest
+            compiler: clang-jwt
             cc: clang
             cxx: clang++
+            jwt: true
           - os: macos-latest
             compiler: clang
             cc: clang
@@ -34,7 +41,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -43,6 +50,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes cmake ninja-build libgtest-dev
+
+      # Optional dependency: builds the MCP server's JWT validation path and its tests.
+      - name: Checkout jwt-cpp
+        if: matrix.jwt
+        uses: actions/checkout@v7
+        with:
+          repository: Thalhammer/jwt-cpp
+          ref: v0.7.1
+          path: jwt-cpp
+
+      - name: Install jwt-cpp
+        if: matrix.jwt
+        run: |
+          sudo apt-get install --yes libssl-dev
+          cmake -S jwt-cpp -B jwt-cpp/build -DJWT_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$PWD/deps"
+          cmake --install jwt-cpp/build
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
@@ -62,7 +85,10 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
           -DSOCKETSHPP_BUILD_TESTS=ON
-          -DBUILD_EXAMPLES=ON
+          -DSOCKETSHPP_WARNINGS_AS_ERRORS=ON
+          -DSOCKETSHPP_BUILD_EXAMPLES=ON
+          -DCMAKE_PREFIX_PATH="$PWD/deps"
+          ${{ matrix.cmake_extra }}
 
       - name: Configure macOS
         if: runner.os == 'macOS'
@@ -74,18 +100,158 @@ jobs:
           -DCMAKE_BUILD_TYPE=Debug
           -DSOCKETSHPP_BUILD_TESTS=ON
           -DCMAKE_PREFIX_PATH="$(brew --prefix googletest)"
-          -DBUILD_EXAMPLES=ON
+          -DSOCKETSHPP_BUILD_EXAMPLES=ON
 
       - name: Configure Windows
         if: runner.os == 'Windows'
         run: >-
           cmake -S . -B build -A x64
           -DSOCKETSHPP_BUILD_TESTS=ON
-          -DBUILD_EXAMPLES=ON
+          -DSOCKETSHPP_BUILD_EXAMPLES=ON
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build
         run: cmake --build build --config Debug --parallel
 
       - name: Test
-        run: ctest --test-dir build --build-config Debug --output-on-failure
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --build-config Debug --output-on-failure --timeout 120
+
+      # Install the package and build a separate consumer against it with
+      # find_package(SocketsHpp) - guards the exported CMake config / vcpkg port.
+      - name: Package consumer check
+        if: matrix.package_check
+        run: |
+          cmake --install build --prefix "$PWD/install"
+          cmake -S test/package -B build-package -G Ninja -DCMAKE_PREFIX_PATH="$PWD/install"
+          cmake --build build-package
+          ctest --test-dir build-package --output-on-failure
+
+  mingw:
+    name: ubuntu-latest / mingw-w64 (tests under Wine)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install toolchain and Wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake ninja-build googletest \
+            g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix wine64 xvfb
+
+      # First Wine invocation bootstraps a prefix (registry, fake explorer.exe, ...).
+      # Doing that here, outside any test run, keeps that one-time cost off the
+      # 5s default gtest_discover_tests timeout for whichever test happens to run first.
+      # wine64 isn't on PATH as a bare command on this runner image, same as the
+      # Configure step below has to resolve it explicitly.
+      - name: Warm up Wine prefix
+        run: xvfb-run -a "$(command -v wine64 || echo /usr/lib/wine/wine64)" wineboot --init
+
+      - name: Build GoogleTest for MinGW
+        run: |
+          cmake -S /usr/src/googletest -B gtest-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchains/mingw-w64-x86_64.cmake" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/mingw-deps"
+          cmake --build gtest-build
+          cmake --install gtest-build
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64-x86_64.cmake
+          -DCMAKE_BUILD_TYPE=Debug
+          -DSOCKETSHPP_BUILD_TESTS=ON
+          -DSOCKETSHPP_WARNINGS_AS_ERRORS=ON
+          -DSOCKETSHPP_BUILD_EXAMPLES=ON
+          -DCMAKE_PREFIX_PATH="$PWD/mingw-deps"
+          -DCMAKE_FIND_ROOT_PATH="$PWD/mingw-deps"
+          -DCMAKE_CROSSCOMPILING_EMULATOR="$(command -v wine64 || echo /usr/lib/wine/wine64)"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          WINEDEBUG: -all
+        # A virtual display lets Wine's window/COM plumbing succeed instead of
+        # hanging (and blowing gtest_discover_tests's timeout) with no driver.
+        run: xvfb-run -a ctest --test-dir build --output-on-failure --timeout 120
+
+  docs:
+    name: ubuntu-latest / API documentation (Doxygen)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes doxygen
+
+      # docs/Doxyfile's OUTPUT_DIRECTORY (build/docs) is created by the CMake
+      # configure step in other jobs; this job never runs CMake, so Doxygen's
+      # own directory creation is left with a missing parent and gives up.
+      - name: Check API documentation
+        run: |
+          mkdir -p build/docs
+          doxygen docs/Doxyfile
+
+  typescript-interop:
+    name: ubuntu-latest / MCP interop with the TypeScript SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive  # nlohmann-json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: examples/10-typescript-interop/ts/package-lock.json
+
+      - name: Build the C++ interop programs
+        run: |
+          cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target cpp_server cpp_client --parallel
+
+      - name: Type-check the TypeScript programs
+        working-directory: examples/10-typescript-interop/ts
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+
+      - name: Audit the TypeScript dependencies
+        working-directory: examples/10-typescript-interop/ts
+        run: npm audit --audit-level=low
+
+      # TypeScript SDK client -> C++ MCPServer, then C++ MCPClient -> TypeScript SDK server.
+      - name: Run interop in both directions
+        run: examples/10-typescript-interop/run-interop.sh build/examples/10-typescript-interop
+
+  vcpkg-port:
+    name: ubuntu-latest / vcpkg port (overlay and git registry)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # registry mode fetches the port tree from this repository's history
+
+      - name: Set up vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+
+      # Builds examples/11-vcpkg-consumption through ports/socketshpp (which downloads
+      # the pinned SocketsHpp commit from GitHub), once as an overlay port and once
+      # with this repository as a git registry, and checks versions/ is up to date.
+      - name: Test the vcpkg port
+        run: scripts/test-vcpkg-port.sh "$RUNNER_TEMP/vcpkg"

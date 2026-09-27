@@ -5,6 +5,10 @@
 #include <SocketsHpp/http/common/json_rpc.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <stdexcept>
+#include <variant>
+
 using namespace SocketsHpp::http::common;
 using json = nlohmann::json;
 
@@ -88,8 +92,8 @@ TEST(JsonRpcTest, RequestParseIntId) {
 
     auto req = JsonRpcRequest::parse(json_str);
     
-    EXPECT_TRUE(std::holds_alternative<int>(req.id));
-    EXPECT_EQ(std::get<int>(req.id), 99);
+    EXPECT_TRUE(std::holds_alternative<std::int64_t>(req.id));
+    EXPECT_EQ(std::get<std::int64_t>(req.id), 99);
     EXPECT_EQ(req.method, "resources/read");
 }
 
@@ -163,7 +167,7 @@ TEST(JsonRpcTest, ResponseParseError) {
 
     auto resp = JsonRpcResponse::parse(json_str);
     
-    EXPECT_EQ(std::get<int>(resp.id), 42);
+    EXPECT_EQ(std::get<std::int64_t>(resp.id), 42);
     EXPECT_TRUE(resp.error.has_value());
     EXPECT_EQ(resp.error->code, -32601);
     EXPECT_EQ(resp.error->message, "Method not found");
@@ -289,7 +293,7 @@ TEST(JsonRpcTest, RoundTripResponse) {
     auto json_str = original.toJson().dump();
     auto parsed = JsonRpcResponse::parse(json_str);
 
-    EXPECT_EQ(std::get<int>(parsed.id), std::get<int>(original.id));
+    EXPECT_EQ(std::get<std::int64_t>(parsed.id), std::get<std::int64_t>(original.id));
     EXPECT_EQ(parsed.result.value()["data"], original.result.value()["data"]);
 }
 
@@ -307,6 +311,97 @@ TEST(JsonRpcTest, MissingRequiredFields) {
     EXPECT_THROW({
         JsonRpcRequest::parse(no_method);
     }, std::exception);
+}
+
+// ── Id representation: absent vs null vs 64-bit ──────────────────────────────
+
+TEST(JsonRpcTest, RequestWithoutIdHasNoId) {
+    auto req = JsonRpcRequest::parse(R"({"jsonrpc":"2.0","method":"notify"})");
+    EXPECT_FALSE(req.hasId());
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(req.id));
+    // Serializing a request without id must not invent one
+    EXPECT_FALSE(req.toJson().contains("id"));
+}
+
+TEST(JsonRpcTest, DefaultConstructedRequestHasNoId) {
+    JsonRpcRequest req;
+    req.method = "x";
+    EXPECT_FALSE(req.hasId());
+    EXPECT_FALSE(req.toJson().contains("id"));
+}
+
+TEST(JsonRpcTest, RequestWithNullIdHasId) {
+    auto req = JsonRpcRequest::parse(R"({"jsonrpc":"2.0","id":null,"method":"m"})");
+    EXPECT_TRUE(req.hasId());
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(req.id));
+    auto j = req.toJson();
+    ASSERT_TRUE(j.contains("id"));
+    EXPECT_TRUE(j["id"].is_null());
+}
+
+TEST(JsonRpcTest, LargeIntegerIdIsNotNarrowed) {
+    const std::int64_t big = (std::int64_t{1} << 40) + 7;
+    auto req = JsonRpcRequest::parse(R"({"jsonrpc":"2.0","id":1099511627783,"method":"m"})");
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(req.id));
+    EXPECT_EQ(std::get<std::int64_t>(req.id), big);
+
+    auto resp = JsonRpcResponse::success(req.id, json::object());
+    auto round = JsonRpcResponse::parse(resp.serialize());
+    EXPECT_EQ(std::get<std::int64_t>(round.id), big);
+    EXPECT_EQ(json::parse(resp.serialize())["id"].get<std::int64_t>(), big);
+}
+
+TEST(JsonRpcTest, NegativeIntegerId) {
+    auto req = JsonRpcRequest::parse(R"({"jsonrpc":"2.0","id":-5,"method":"m"})");
+    EXPECT_EQ(std::get<std::int64_t>(req.id), -5);
+}
+
+TEST(JsonRpcTest, InvalidIdTypesRejected) {
+    EXPECT_THROW(JsonRpcRequest::parse(R"({"jsonrpc":"2.0","id":1.5,"method":"m"})"), std::invalid_argument);
+    EXPECT_THROW(JsonRpcRequest::parse(R"({"jsonrpc":"2.0","id":{},"method":"m"})"), std::invalid_argument);
+    EXPECT_THROW(JsonRpcRequest::parse(R"({"jsonrpc":"2.0","id":[1],"method":"m"})"), std::invalid_argument);
+    EXPECT_THROW(JsonRpcRequest::parse(R"({"jsonrpc":"2.0","id":18446744073709551615,"method":"m"})"),
+                 std::invalid_argument);
+}
+
+TEST(JsonRpcTest, ResponseWithAbsentIdSerializesNull) {
+    JsonRpcResponse resp;
+    resp.result = json::object();
+    auto j = resp.toJson();
+    ASSERT_TRUE(j.contains("id"));
+    EXPECT_TRUE(j["id"].is_null());
+}
+
+TEST(JsonRpcTest, FailureWithNullptrId) {
+    auto resp = JsonRpcResponse::failure(nullptr, JsonRpcError::invalidRequest());
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(resp.id));
+    auto j = resp.toJson();
+    EXPECT_TRUE(j["id"].is_null());
+    EXPECT_EQ(j["error"]["code"], -32600);
+}
+
+TEST(JsonRpcTest, IdHelpersRoundTrip) {
+    JsonRpcId id;
+    ASSERT_TRUE(jsonRpcIdFromJson(json("abc"), id));
+    EXPECT_EQ(jsonRpcIdToJson(id), json("abc"));
+    ASSERT_TRUE(jsonRpcIdFromJson(json(42), id));
+    EXPECT_EQ(jsonRpcIdToJson(id), json(42));
+    ASSERT_TRUE(jsonRpcIdFromJson(json(nullptr), id));
+    EXPECT_TRUE(jsonRpcIdToJson(id).is_null());
+    EXPECT_FALSE(jsonRpcIdFromJson(json(true), id));
+    EXPECT_TRUE(jsonRpcIdToJson(JsonRpcId{}).is_null());
+}
+
+
+TEST(JsonRpcResponseTest, ResponseWithoutResultOrErrorIsRejected)
+{
+    EXPECT_THROW(JsonRpcResponse::parse(R"({"jsonrpc":"2.0","id":1})"), std::invalid_argument);
+}
+
+TEST(JsonRpcErrorTest, DefaultConstructedCodeIsZero)
+{
+    JsonRpcError e;
+    EXPECT_EQ(e.code, 0);
 }
 
 int main(int argc, char **argv) {
