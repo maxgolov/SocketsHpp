@@ -81,6 +81,94 @@ namespace http
             }
 
             /**
+             * @brief true if @p s is a literal IPv4 ("192.0.2.1") or IPv6 ("2001:db8::1",
+             *        "::ffff:192.0.2.1") address, without brackets, port or zone id.
+             *
+             * Used to reject forwarded-header values that are not addresses (RFC 7239
+             * "unknown" / obfuscated identifiers, or forged text) before they are
+             * returned as a client IP.
+             */
+            static bool isIPAddress(const std::string& s)
+            {
+                return isIPv4(s) || isIPv6(s);
+            }
+
+            /// @brief true for a dotted-quad IPv4 address (no leading zeros, octets <= 255).
+            static bool isIPv4(const std::string& s)
+            {
+                int parts = 0;
+                size_t i = 0;
+                while (true)
+                {
+                    size_t start = i;
+                    int value = 0;
+                    while (i < s.size() && s[i] >= '0' && s[i] <= '9')
+                    {
+                        value = value * 10 + (s[i] - '0');
+                        if (i - start >= 3 || value > 255)
+                            return false;
+                        ++i;
+                    }
+                    size_t len = i - start;
+                    if (len == 0 || (len > 1 && s[start] == '0'))
+                        return false;
+                    if (++parts == 4)
+                        return i == s.size();
+                    if (i >= s.size() || s[i] != '.')
+                        return false;
+                    ++i;
+                }
+            }
+
+            /// @brief true for an IPv6 address in RFC 4291 text form (at most one "::",
+            ///        1-4 hex digits per group, optional trailing dotted IPv4).
+            static bool isIPv6(const std::string& s)
+            {
+                if (s.size() < 2 || s.size() > 45)
+                    return false;
+                size_t dbl = s.find("::");
+                if (dbl != std::string::npos && s.find("::", dbl + 1) != std::string::npos)
+                    return false;
+                // Count the groups on each side of "::" (or of the whole string).
+                auto countGroups = [](const std::string& part, bool allowV4Tail, int& groups) -> bool {
+                    groups = 0;
+                    if (part.empty())
+                        return true;
+                    size_t start = 0;
+                    while (true)
+                    {
+                        size_t colon = part.find(':', start);
+                        std::string group = part.substr(start, colon == std::string::npos ? std::string::npos : colon - start);
+                        if (colon == std::string::npos && allowV4Tail && group.find('.') != std::string::npos)
+                        {
+                            if (!isIPv4(group))
+                                return false;
+                            groups += 2;
+                            return true;
+                        }
+                        if (group.empty() || group.size() > 4)
+                            return false;
+                        for (char c : group)
+                        {
+                            if (!std::isxdigit(static_cast<unsigned char>(c)))
+                                return false;
+                        }
+                        ++groups;
+                        if (colon == std::string::npos)
+                            return true;
+                        start = colon + 1;
+                    }
+                };
+                int left = 0, right = 0;
+                if (dbl == std::string::npos)
+                {
+                    return countGroups(s, true, left) && left == 8;
+                }
+                return countGroups(s.substr(0, dbl), false, left) &&
+                       countGroups(s.substr(dbl + 2), true, right) && left + right <= 7;
+            }
+
+            /**
              * @brief Check if a given IP address is trusted.
              * @param remoteAddr The IP address to check; a trailing port
              *        ("ip:port" / "[v6]:port") is ignored.
@@ -212,7 +300,9 @@ namespace http
              * Uses X-Forwarded-For, then X-Real-IP, then the for= parameters of
              * Forwarded. For the list headers the hops are walked right to left and
              * the first address that is not a trusted proxy is returned (if all are
-             * trusted, the left-most one).
+             * trusted, the left-most one). Forwarded values that are not IP addresses
+             * (see TrustProxyConfig::isIPAddress()) are never returned: such an entry
+             * ends the walk and the next source is tried.
              * @param headers Map of HTTP headers
              * @param remoteAddr Direct connection address ("ip:port" accepted)
              * @param trustConfig Trust proxy configuration
@@ -254,7 +344,7 @@ namespace http
                 if (const std::string* realIP = findHeader(headers, "X-Real-IP"))
                 {
                     auto ip = TrustProxyConfig::stripPort(*realIP);
-                    if (!ip.empty())
+                    if (TrustProxyConfig::isIPAddress(ip))
                     {
                         return ip;
                     }
@@ -418,7 +508,10 @@ namespace http
 
             /// Walk a hop list right-to-left and return the first address that is
             /// not a trusted proxy (port stripped). If every hop is trusted, the
-            /// left-most one is returned. Empty if the list is empty.
+            /// left-most one is returned. Empty if the list is empty, or if the walk
+            /// reaches an entry that is not an IP address (forged text, RFC 7239
+            /// "unknown" or an obfuscated identifier): nothing to its left can be
+            /// trusted, and the caller falls back to the next source.
             static std::string rightmostUntrusted(const std::vector<std::string>& hops,
                                                   const TrustProxyConfig& trustConfig)
             {
@@ -429,6 +522,10 @@ namespace http
                     if (ip.empty())
                     {
                         continue;
+                    }
+                    if (!TrustProxyConfig::isIPAddress(ip))
+                    {
+                        return std::string();
                     }
                     candidate = ip;
                     if (!trustConfig.isTrusted(candidate))

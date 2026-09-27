@@ -337,8 +337,7 @@ several ports (`getListeningPorts()`).
 - If no handler takes the request: `OPTIONS` gets 204 when CORS is enabled
   (`enableCors()`, `setCorsOrigin()`, `setCorsHeaders()`) and 405 otherwise; `DELETE`
   with an `Mcp-Session-Id` header terminates that session of the server's built-in
-  session manager (200, or 404 if the id is unknown), and a `DELETE` without that
-  header gets 400; everything else gets 404.
+  session manager (200, or 404 if the id is unknown); everything else gets 404.
 - `HEAD` is dispatched as `GET` and the body is dropped.
 - `route()` owns the callback. `addHandler(path, HttpRequestCallback&)` and
   `server[path] = callback` store a reference, so that object must outlive the server.
@@ -604,7 +603,9 @@ void addWhoAmI(HttpServer& server)
 
 Forwarded headers (`X-Forwarded-For/Proto/Host`, `X-Real-IP`, RFC 7239 `Forwarded`)
 are honoured only when the direct peer (`req.client`) is trusted; otherwise the
-helpers report the direct connection.
+helpers report the direct connection. `getClientIP()` only returns literal IP
+addresses: forwarded values that are not addresses (forged text, `unknown`) are
+skipped.
 
 ### MCP server
 
@@ -661,7 +662,8 @@ are built in. `registerCancellable()` gives a handler a cancel token,
 session's SSE stream, `processMessage()` handles one JSON-RPC message (or batch) for
 a STDIO transport you drive yourself, and `GET /health` returns the server info. See
 [docs/MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md) for transports, sessions,
-resumability, authentication (including JWT via jwt-cpp), rate limiting and CORS.
+resumability, authentication (including JWT via jwt-cpp), rate limiting, CORS and
+`Origin` validation (browser origins other than loopback need `config.allowedOrigins`).
 
 ### MCP client
 

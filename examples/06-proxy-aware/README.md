@@ -80,4 +80,6 @@ location / {
   list only your proxies. `TrustMode::TrustAll` lets any client forge its address and
   scheme.
 - The values returned by `ProxyAwareHelpers` come from request headers: escape them
-  before putting them in HTML, and do not assume they are well-formed IP addresses.
+  before putting them in HTML. `getClientIP()` only ever returns a literal IPv4/IPv6
+  address (forwarded values that are not addresses are skipped), but `getHost()`
+  returns `X-Forwarded-Host` / `Host` verbatim.

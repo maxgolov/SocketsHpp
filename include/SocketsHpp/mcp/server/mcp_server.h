@@ -683,6 +683,54 @@ namespace mcp
                 return true;
             }
 
+            /// @brief true if the request may use the MCP endpoint based on its Origin
+            ///        header (see ServerConfig::allowedOrigins); otherwise answers 403.
+            bool checkOrigin(const HttpRequest& req, HttpResponse& res)
+            {
+                const std::string* origin = findHeader(req, "Origin");
+                if (origin == nullptr || isOriginAllowed(*origin))
+                    return true;
+                applyCorsHeaders(res);
+                auto error = JsonRpcError::serverError(-32000, "Forbidden: origin not allowed");
+                sendJson(res, 403, JsonRpcResponse::failure(nullptr, error).toJson());
+                return false;
+            }
+
+            /// @brief Origin policy: loopback hosts, ServerConfig::allowedOrigins ("*" = any)
+            ///        and a single-origin cors.allowOrigin are allowed.
+            bool isOriginAllowed(const std::string& origin) const
+            {
+                for (const auto& allowed : m_config.allowedOrigins)
+                {
+                    if (allowed == "*" || iequals(allowed, origin))
+                        return true;
+                }
+                if (m_config.cors.allowOrigin != "*" && iequals(m_config.cors.allowOrigin, origin))
+                    return true;
+                // scheme://host[:port] with a loopback host
+                size_t sep = origin.find("://");
+                if (sep == std::string::npos)
+                    return false;
+                std::string host = origin.substr(sep + 3);
+                if (!host.empty() && host.front() == '[')
+                {
+                    size_t close = host.find(']');
+                    if (close == std::string::npos)
+                        return false;
+                    std::string rest = host.substr(close + 1);
+                    host = host.substr(0, close + 1);
+                    if (!rest.empty() && rest.front() != ':')
+                        return false;
+                }
+                else
+                {
+                    size_t colon = host.find(':');
+                    if (colon != std::string::npos)
+                        host = host.substr(0, colon);
+                }
+                return iequals(host, "localhost") || host == "127.0.0.1" || host == "[::1]";
+            }
+
             /// @brief Case-insensitive request header lookup (HTTP field names are
             /// case-insensitive; the server may store them in a normalized form).
             static const std::string* findHeader(const HttpRequest& req, const std::string& name)
@@ -916,6 +964,10 @@ namespace mcp
                 std::string endpoint = m_config.endpoint;
 
                 m_httpServer.route(endpoint, [this](const HttpRequest& req, HttpResponse& res) -> int {
+                    if (!checkOrigin(req, res))
+                    {
+                        return 0;
+                    }
                     if (req.method == "POST")
                     {
                         handleStreamablePost(req, res);
@@ -1090,6 +1142,10 @@ namespace mcp
 
                 // POST: Handle JSON-RPC requests
                 m_httpServer.route(endpoint, [this](const HttpRequest& req, HttpResponse& res) -> int {
+                    if (!checkOrigin(req, res))
+                    {
+                        return 0;
+                    }
                     if (req.method == "POST")
                     {
                         handleHttpPost(req, res);

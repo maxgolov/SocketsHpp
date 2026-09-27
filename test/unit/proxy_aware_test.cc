@@ -264,6 +264,46 @@ TEST(ProxyAwareTest, AddTrustedProxy)
     EXPECT_FALSE(config.isTrusted("192.168.1.2"));
 }
 
+TEST(ProxyAwareTest, IsIPAddress)
+{
+    for (const char* ok : {"192.0.2.1", "0.0.0.0", "255.255.255.255", "::1", "::", "2001:db8::1",
+                           "fe80::a:b:c:d", "1:2:3:4:5:6:7:8", "::ffff:192.0.2.1", "1::"})
+        EXPECT_TRUE(TrustProxyConfig::isIPAddress(ok)) << ok;
+    for (const char* bad : {"", "unknown", "_hidden", "256.1.1.1", "1.2.3", "01.2.3.4", "1.2.3.4.5",
+                            "1:2:3:4:5:6:7:8:9", "1::2::3", "12345::1", "::g", "localhost",
+                            "<script>alert(1)</script>", "1.2.3.4 ", "[::1]", "fe80::1%eth0"})
+        EXPECT_FALSE(TrustProxyConfig::isIPAddress(bad)) << bad;
+}
+
+TEST(ProxyAwareTest, GetClientIP_IgnoresForwardedValuesThatAreNotAddresses)
+{
+    TrustProxyConfig config;
+    config.addTrustedProxy("10.0.0.1");
+
+    MockRequest forged;
+    forged.client = "10.0.0.1:5000";
+    forged.headers["X-Forwarded-For"] = "<script>alert(1)</script>";
+    EXPECT_EQ(ProxyAwareHelpers::getClientIP(forged.headers, forged.client, config), "10.0.0.1");
+
+    // A garbage entry left of the proxy-appended address does not matter.
+    MockRequest mixed;
+    mixed.client = "10.0.0.1:5000";
+    mixed.headers["X-Forwarded-For"] = "junk, 203.0.113.9";
+    EXPECT_EQ(ProxyAwareHelpers::getClientIP(mixed.headers, mixed.client, config), "203.0.113.9");
+
+    // An invalid X-Forwarded-For falls through to a valid X-Real-IP.
+    MockRequest realIp;
+    realIp.client = "10.0.0.1:5000";
+    realIp.headers["X-Forwarded-For"] = "unknown";
+    realIp.headers["X-Real-IP"] = "198.51.100.7";
+    EXPECT_EQ(ProxyAwareHelpers::getClientIP(realIp.headers, realIp.client, config), "198.51.100.7");
+
+    MockRequest forwarded;
+    forwarded.client = "10.0.0.1:5000";
+    forwarded.headers["Forwarded"] = "for=unknown";
+    EXPECT_EQ(ProxyAwareHelpers::getClientIP(forwarded.headers, forwarded.client, config), "10.0.0.1");
+}
+
 int main(int argc, char** argv)
 {
     testing::InitGoogleTest(&argc, argv);

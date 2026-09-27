@@ -303,10 +303,23 @@ Every endpoint response (and `/health`) carries the headers from `config.cors`:
 `Mcp-Session-Id`) and `maxAge`. `OPTIONS` answers 204. Narrow `allowOrigin` for
 browser-facing deployments.
 
-The server does not validate the `Origin` request header, which the 2025-03-26 spec
-requires of Streamable HTTP servers to prevent DNS-rebinding attacks. Keep the default
-loopback bind, or for browser-reachable deployments put a reverse proxy in front that
-rejects unexpected origins, and enable `auth`.
+### Origin validation
+
+As the 2025-03-26 spec requires (against DNS-rebinding attacks), requests to the MCP
+endpoint that carry an `Origin` header are checked; anything not allowed gets
+`403` with a JSON-RPC error. Allowed are:
+
+- requests without `Origin` (non-browser clients such as the SDKs, VS Code, curl);
+- origins whose host is `localhost`, `127.0.0.1` or `[::1]` (any scheme and port);
+- the entries of `config.allowedOrigins` (`scheme://host[:port]`, case-insensitive;
+  `"*"` allows every origin);
+- `config.cors.allowOrigin` when it names a single origin rather than `*`.
+
+```cpp
+config.allowedOrigins = { "https://app.example.com" };  // browser app on another host
+```
+
+`GET /health` is not checked.
 
 ### STDIO transport
 
@@ -345,6 +358,7 @@ STDIO.
 | `serverName`, `serverVersion` | `"mcp-server"`, `"1.0.0"` | Default `serverInfo` and `/health` |
 | `host`, `port`, `endpoint` | `"127.0.0.1"`, `8080`, `"/mcp"` | |
 | `allowNonLoopback` | `false` | Loopback guard for `listen()` |
+| `allowedOrigins` | empty | Browser origins allowed besides loopback ones; see [Origin validation](#origin-validation) |
 | `responseMode` | `BATCH` | `STREAM` only affects legacy `initialize` (see above) |
 | `maxMessageSize` | 4 MB | HTTP request body limit |
 | `batchTimeoutMs` | 30000 | Not used by the current implementation |
@@ -357,9 +371,11 @@ STDIO.
 
 `parseArgs(argc, argv)` understands `--transport http|streamable|http-streamable|stdio`,
 `--port`, `--endpoint`, `--host`, `--response-mode stream|batch`, `--max-message-size`,
-`--enable-resumability` and `--cors-origin`. `parseEnv()` reads `MCP_TRANSPORT`,
+`--enable-resumability`, `--cors-origin` and `--allowed-origin` (repeatable).
+`parseEnv()` reads `MCP_TRANSPORT`,
 `MCP_PORT`, `MCP_ENDPOINT`, `MCP_HOST`, `MCP_RESPONSE_MODE`, `MCP_MAX_MESSAGE_SIZE`,
-`MCP_ENABLE_RESUMABILITY` (`true`/`1`), `MCP_CORS_ORIGIN`, `MCP_AUTH_TYPE`
+`MCP_ENABLE_RESUMABILITY` (`true`/`1`), `MCP_CORS_ORIGIN`, `MCP_ALLOWED_ORIGINS`
+(comma-separated), `MCP_AUTH_TYPE`
 (`bearer` or `api-key`; enables auth) and `MCP_AUTH_SECRET`. Neither sets
 `allowNonLoopback`, so a non-loopback `--host` still needs that flag in code.
 

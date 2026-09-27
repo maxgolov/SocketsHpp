@@ -103,12 +103,13 @@ Server helpers (opt-in headers, applied from your handlers):
 
 - JSON-RPC 2.0 requests, notifications, responses, batches and standard error codes;
   ids as string, 64-bit integer or null.
-- `mcp::server::MCPServer`: MCP 2024-11-05 (HTTP + SSE) and 2025-03-26 (Streamable
-  HTTP) over HTTP, plus `processMessage()` for STDIO; version negotiation, sessions,
+- `mcp::server::MCPServer`: MCP 2025-03-26 (Streamable HTTP) and a POST-based
+  transport for 2024-11-05 (not the legacy SSE `endpoint` handshake), plus
+  `processMessage()` for STDIO; version negotiation, sessions,
   server push (`push_event`, `push_log`, `push_progress`), resumability with
   `Last-Event-ID`, cancellation, `logging/setLevel`, Bearer / API key / capability-token
-  auth (JWT with jwt-cpp), per-client rate limiting, CORS, `/health`, and a
-  loopback-only bind guard.
+  auth (JWT with jwt-cpp), per-client rate limiting, CORS, `Origin` validation,
+  `/health`, and a loopback-only bind guard.
 - `mcp::client::MCPClient`: HTTP and Streamable HTTP transports, tools / prompts /
   resources helpers, notification handlers over SSE. No STDIO client.
 
@@ -132,6 +133,8 @@ Server helpers (opt-in headers, applied from your handlers):
 | Global middleware chain | Auth, compression and proxy helpers are called from handlers. |
 | Connection timeouts on the server | Idle or slow connections are not timed out by the server; use a reverse proxy for slowloris protection. |
 | Host header validation | Duplicate `Host` is rejected, but the value is not checked. |
+| Legacy MCP HTTP+SSE transport (2024-11-05) | The `endpoint`-event handshake of the old SSE transport is not implemented; clients that speak only that transport cannot connect. Current SDKs, VS Code and Claude use Streamable HTTP, which is supported. |
+| MCP server-to-client requests | Sampling, `roots/list` and server `ping` are not sent; only notifications. |
 
 ## Limits and deployment advice
 

@@ -65,7 +65,7 @@ Routes match by **prefix** of the request target, longest prefix first. So:
   });
   ```
 
-  Without a `"/"` route the server answers an unmatched GET or POST with 404 itself.
+  Without a `"/"` route the server answers an unmatched request with 404 itself (`OPTIONS` gets 405, or 204 with CORS enabled).
 - `"/hello"` also matches `/hello/x` and `/helloworld`; check `req.uri` in the handler
   if that matters.
 

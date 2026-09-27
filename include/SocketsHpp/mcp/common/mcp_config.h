@@ -237,6 +237,17 @@ namespace mcp
             std::function<bool(const std::string& token)> validator;
         } auth;  ///< Authentication settings.
 
+        /// @brief Browser origins allowed to use the MCP endpoint, e.g.
+        ///        "https://app.example.com" (scheme://host[:port], compared
+        ///        case-insensitively; "*" allows any origin).
+        ///
+        /// The MCP 2025-03-26 spec requires servers to validate the Origin header to
+        /// prevent DNS-rebinding attacks. Requests without Origin (non-browser clients)
+        /// are always accepted; requests whose Origin host is localhost, 127.0.0.1 or
+        /// [::1] are accepted, as is cors.allowOrigin when it names a single origin.
+        /// Any other Origin gets 403.
+        std::vector<std::string> allowedOrigins;
+
         /// @brief Allow MCPServer::listen() to bind a non-loopback #host (default false).
         ///        This guard only inspects #host; the loopback names are "127.0.0.1",
         ///        "localhost", "::1" and "[::1]".
@@ -262,7 +273,8 @@ namespace mcp
         ///
         /// Recognized: `--transport http|streamable|http-streamable` (any other value = STDIO),
         /// `--port N`, `--endpoint PATH`, `--host ADDR`, `--response-mode stream|batch`,
-        /// `--max-message-size BYTES`, `--enable-resumability`, `--cors-origin ORIGIN`.
+        /// `--max-message-size BYTES`, `--enable-resumability`, `--cors-origin ORIGIN`,
+        /// `--allowed-origin ORIGIN` (repeatable; adds to #allowedOrigins).
         /// @param argc Argument count (argv[0] is skipped).
         /// @param argv Argument vector.
         /// @throws std::invalid_argument / std::out_of_range for a non-numeric port or size.
@@ -309,6 +321,10 @@ namespace mcp
                 {
                     cors.allowOrigin = argv[++i];
                 }
+                else if (arg == "--allowed-origin" && i + 1 < argc)
+                {
+                    allowedOrigins.push_back(argv[++i]);
+                }
             }
         }
 
@@ -317,6 +333,7 @@ namespace mcp
         /// MCP_TRANSPORT (as --transport), MCP_PORT, MCP_ENDPOINT, MCP_HOST,
         /// MCP_RESPONSE_MODE (stream|batch), MCP_MAX_MESSAGE_SIZE,
         /// MCP_ENABLE_RESUMABILITY ("true"/"1"; anything else disables), MCP_CORS_ORIGIN,
+        /// MCP_ALLOWED_ORIGINS (comma-separated; replaces #allowedOrigins),
         /// MCP_AUTH_TYPE (enables auth; "bearer" = BEARER, "api-key" = API_KEY with
         /// header "x-api-key"), MCP_AUTH_SECRET.
         /// @throws std::invalid_argument / std::out_of_range for a non-numeric port or
@@ -362,6 +379,23 @@ namespace mcp
             if (auto val = getEnv("MCP_CORS_ORIGIN"))
             {
                 cors.allowOrigin = *val;
+            }
+            if (auto val = getEnv("MCP_ALLOWED_ORIGINS"))
+            {
+                allowedOrigins.clear();
+                size_t start = 0;
+                while (start <= val->size())
+                {
+                    size_t comma = val->find(',', start);
+                    std::string origin = val->substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                    origin.erase(0, origin.find_first_not_of(" \t"));
+                    origin.erase(origin.find_last_not_of(" \t") + 1);
+                    if (!origin.empty())
+                        allowedOrigins.push_back(origin);
+                    if (comma == std::string::npos)
+                        break;
+                    start = comma + 1;
+                }
             }
             if (auto val = getEnv("MCP_AUTH_TYPE"))
             {

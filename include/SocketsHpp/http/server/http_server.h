@@ -994,7 +994,7 @@ namespace http
         /// candidate. Candidates run longest prefix first, then in registration order,
         /// until one handles the request (see CallbackFunction). If none does, OPTIONS
         /// gets 204 (CORS enabled) or 405, DELETE with an Mcp-Session-Id header
-        /// terminates that session (200/404; 400 without the header), and anything
+        /// terminates that session (200, or 404 if unknown), and anything
         /// else gets 404. HEAD is dispatched as GET and a buffered body is dropped.
         ///
         /// Threading: by default handlers and stream callbacks run on the reactor
@@ -2912,27 +2912,20 @@ namespace http
                                 conn.response.message = "Method Not Allowed";
                             }
                         }
-                        else if (originalMethod == "DELETE")
+                        else if (originalMethod == "DELETE" &&
+                                 conn.request.headers.find(MCP_SESSION_ID) != conn.request.headers.end())
                         {
-                            // Session termination against the server's own SessionManager
-                            auto sessionIt = conn.request.headers.find(MCP_SESSION_ID);
-                            if (sessionIt != conn.request.headers.end())
+                            // Session termination against the server's own SessionManager.
+                            // A DELETE without the header is an ordinary unmatched request (404).
+                            if (m_sessionManager.terminateSession(conn.request.headers.find(MCP_SESSION_ID)->second))
                             {
-                                if (m_sessionManager.terminateSession(sessionIt->second))
-                                {
-                                    conn.response.code = 200;  // OK
-                                    conn.response.message = "Session terminated";
-                                }
-                                else
-                                {
-                                    conn.response.code = 404;  // Not Found
-                                    conn.response.message = "Session not found";
-                                }
+                                conn.response.code = 200;  // OK
+                                conn.response.message = "Session terminated";
                             }
                             else
                             {
-                                conn.response.code = 400;  // Bad Request
-                                conn.response.message = "Missing session ID";
+                                conn.response.code = 404;  // Not Found
+                                conn.response.message = "Session not found";
                             }
                         }
                         else

@@ -1696,3 +1696,82 @@ TEST(McpBindingTest, NonLoopbackRefusedBeforeBinding)
     EXPECT_THROW(srv.listen(), std::runtime_error);
     EXPECT_EQ(srv.port(), -1) << "the SSRF guard must reject before binding";
 }
+
+// Origin validation (MCP 2025-03-26: servers must validate Origin against DNS rebinding)
+static TestHttpResponse init_with_origin(int port, const std::string& origin)
+{
+    HeaderList headers = {{"Content-Type", "application/json"}, {"Accept", "application/json"}};
+    if (!origin.empty())
+        headers.emplace_back("Origin", origin);
+    return http_request(port, "POST",
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})",
+        headers);
+}
+
+TEST_F(StreamableHttpTest, OriginDefaultPolicyAllowsOnlyLoopback)
+{
+    EXPECT_EQ(init_with_origin(port_, "").status, 200) << "non-browser clients send no Origin";
+    for (const char* ok : {"http://localhost:5173", "http://127.0.0.1", "https://[::1]:8443", "http://LOCALHOST"})
+        EXPECT_EQ(init_with_origin(port_, ok).status, 200) << ok;
+    for (const char* bad : {"http://evil.example", "http://localhost.evil.example", "http://127.0.0.1.nip.io",
+                            "null", "localhost"})
+    {
+        auto r = init_with_origin(port_, bad);
+        EXPECT_EQ(r.status, 403) << bad;
+        EXPECT_TRUE(r.session_id.empty()) << bad;
+    }
+    // GET and DELETE are checked as well
+    HeaderList evil = {{"Origin", "http://evil.example"}, {"Accept", "text/event-stream"}};
+    EXPECT_EQ(http_request(port_, "GET", "", evil).status, 403);
+    EXPECT_EQ(http_request(port_, "DELETE", "", evil).status, 403);
+}
+
+TEST(McpOriginTest, AllowedOriginsAndSingleCorsOrigin)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    cfg.host = "127.0.0.1";
+    cfg.port = 0;
+    cfg.allowedOrigins = {"https://app.example.com"};
+    cfg.cors.allowOrigin = "https://admin.example.com";
+    MCPServer srv(cfg);
+    srv.listen();
+    const int port = srv.port();
+
+    EXPECT_EQ(init_with_origin(port, "https://app.example.com").status, 200);
+    EXPECT_EQ(init_with_origin(port, "HTTPS://APP.EXAMPLE.COM").status, 200);
+    EXPECT_EQ(init_with_origin(port, "https://admin.example.com").status, 200);
+    EXPECT_EQ(init_with_origin(port, "https://other.example.com").status, 403);
+    srv.stop();
+
+    ServerConfig any = cfg;
+    any.allowedOrigins = {"*"};
+    MCPServer srvAny(any);
+    srvAny.listen();
+    EXPECT_EQ(init_with_origin(srvAny.port(), "https://other.example.com").status, 200);
+    srvAny.stop();
+}
+
+TEST(McpOriginTest, ParseEnvAndArgs)
+{
+#ifdef _WIN32
+    _putenv_s("MCP_ALLOWED_ORIGINS", "https://a.example, https://b.example");
+#else
+    ::setenv("MCP_ALLOWED_ORIGINS", "https://a.example, https://b.example", 1);
+#endif
+    ServerConfig cfg;
+    cfg.parseEnv();
+    ASSERT_EQ(cfg.allowedOrigins.size(), 2u);
+    EXPECT_EQ(cfg.allowedOrigins[1], "https://b.example");
+#ifdef _WIN32
+    _putenv_s("MCP_ALLOWED_ORIGINS", "");
+#else
+    ::unsetenv("MCP_ALLOWED_ORIGINS");
+#endif
+
+    const char* argv[] = {"server", "--allowed-origin", "https://c.example"};
+    ServerConfig fromArgs;
+    fromArgs.parseArgs(3, const_cast<char**>(argv));
+    ASSERT_EQ(fromArgs.allowedOrigins.size(), 1u);
+    EXPECT_EQ(fromArgs.allowedOrigins[0], "https://c.example");
+}
