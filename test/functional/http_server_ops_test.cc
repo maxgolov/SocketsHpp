@@ -1083,7 +1083,9 @@ TEST(HttpServerMetricsTest, MaxConnectionsRefusesAndTimeoutsAreCounted)
     HttpServer server;
     int port = server.addListeningPort("127.0.0.1", 0);
     server.setMaxConnections(2);
-    server.setIdleTimeout(std::chrono::milliseconds(300));
+    // Long enough that a and b are certainly still open when the third connection is
+    // checked, even on a loaded machine (with 300 ms this test flaked under ctest -j8).
+    server.setIdleTimeout(std::chrono::milliseconds(1500));
     server.route("/", [](const HttpRequest&, HttpResponse& res) {
         res.set_content("ok");
         return 200;
@@ -1103,8 +1105,8 @@ TEST(HttpServerMetricsTest, MaxConnectionsRefusesAndTimeoutsAreCounted)
     EXPECT_EQ(server.metrics().connectionsRefused, 1u);
 
     // a and b go idle and are closed by the idle timeout.
-    EXPECT_TRUE(a.waitForClose(3000));
-    EXPECT_TRUE(b.waitForClose(3000));
+    EXPECT_TRUE(a.waitForClose(6000));
+    EXPECT_TRUE(b.waitForClose(6000));
     ASSERT_TRUE(waitFor([&]() { return server.metrics().timeouts >= 2; }));
     HttpServerMetrics m = server.metrics();
     EXPECT_EQ(m.connectionsAccepted, 2u);
