@@ -2186,6 +2186,10 @@ namespace http
                 }
 
                 csocket.setNonBlocking();
+                // Headers, bodies and stream chunks are separate writes. Nagle's
+                // algorithm can otherwise hold a small write until a delayed ACK.
+                if (!isUnix)
+                    csocket.setNoDelay();
                 // Unix domain peers are unnamed: report a fixed marker instead of an address.
                 const std::string client = isUnix ? std::string("unix") : caddr.toString();
                 {

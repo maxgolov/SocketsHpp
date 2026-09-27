@@ -12,6 +12,7 @@
 #include <SocketsHpp/http/server/http_server.h>
 #include <SocketsHpp/http/server/multipart.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -271,6 +272,79 @@ namespace
         return "GET " + path + " HTTP/1.1\r\nHost: test\r\n" + extra + "\r\n";
     }
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Persistent connections and small response latency
+// ---------------------------------------------------------------------------
+
+class HttpKeepaliveTest : public ::testing::TestWithParam<bool>
+{
+};
+
+TEST_P(HttpKeepaliveTest, SmallResponsesDoNotWaitForDelayedAck)
+{
+    class InspectableServer : public HttpServer
+    {
+    public:
+        int acceptedNoDelay()
+        {
+            std::lock_guard<std::mutex> lock(m_connectionsMutex);
+            if (m_connections.size() != 1)
+                return -1;
+            int value = 0;
+            if (m_connections.begin()->second.socket.getsockopt(IPPROTO_TCP, TCP_NODELAY, value) != 0)
+                return -1;
+            return value;
+        }
+    };
+
+    InspectableServer server;
+    const int port = server.addListeningPort("127.0.0.1", 0);
+    ASSERT_GT(port, 0);
+    if (GetParam())
+        server.enableThreadPool(2);
+    server.route("/small", [](const HttpRequest&, HttpResponse& res) {
+        res.set_content("{}", "application/json");
+        return 200;
+    });
+    server.route("/stream", [](const HttpRequest&, HttpResponse& res) {
+        res.streaming = true;
+        res.useChunkedEncoding = true;
+        res.streamCallback = [remaining = 2]() mutable {
+            return remaining-- > 0 ? std::string("{}") : std::string();
+        };
+        return 200;
+    });
+    server.start();
+    RawConn conn(port);
+    ASSERT_TRUE(conn.connected());
+    for (const std::string path : {"/small", "/stream"})
+    {
+        std::vector<double> elapsed;
+        for (int i = 0; i < 40; ++i)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            ASSERT_TRUE(conn.send("POST " + path +
+                " HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n{}"));
+            const auto response = conn.readResponse();
+            elapsed.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+            ASSERT_TRUE(response.complete) << "request " << i;
+            ASSERT_EQ(response.code, 200);
+            ASSERT_EQ(response.body, path == "/small" ? "{}" : "{}{}");
+        }
+        std::sort(elapsed.begin(), elapsed.end());
+        std::printf("%s pool=%d keep-alive p50=%.3fms p95=%.3fms\n",
+            path.c_str(), GetParam(), elapsed[20], elapsed[38]);
+    }
+    // Inspect the real accepted socket rather than imposing a timing threshold
+    // that could fail when a CI runner is descheduled. Both paths reused it.
+    EXPECT_EQ(server.metrics().connectionsAccepted, 1u);
+    EXPECT_GT(server.acceptedNoDelay(), 0);
+    server.stop();
+}
+
+INSTANTIATE_TEST_SUITE_P(DispatchModes, HttpKeepaliveTest, ::testing::Bool());
 
 // ---------------------------------------------------------------------------
 // Header casing and CORS methods
