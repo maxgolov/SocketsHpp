@@ -98,6 +98,7 @@ TEST(MCPConfigTest, ServerConfigDefaults) {
     EXPECT_FALSE(config.auth.enabled);
     EXPECT_EQ(config.idleTimeoutMs, 60000);
     EXPECT_EQ(config.requestTimeoutMs, 30000);
+    EXPECT_EQ(config.workerThreads, 0u);
 }
 
 TEST(MCPConfigTest, ServerConfigParseArgs) {

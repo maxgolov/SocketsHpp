@@ -1181,7 +1181,11 @@ TEST(HttpServerMetricsTest, MaxConnectionsRefusesAndTimeoutsAreCounted)
     // a and b go idle and are closed by the idle timeout.
     EXPECT_TRUE(a.waitForClose(6000));
     EXPECT_TRUE(b.waitForClose(6000));
-    ASSERT_TRUE(waitFor([&]() { return server.metrics().timeouts >= 2; }));
+    // Peer EOF and the timeout counter precede the reactor's accounting update.
+    ASSERT_TRUE(waitFor([&]() {
+        const auto current = server.metrics();
+        return current.timeouts >= 2 && current.connectionsActive == 0;
+    }));
     HttpServerMetrics m = server.metrics();
     EXPECT_EQ(m.connectionsAccepted, 2u);
     EXPECT_EQ(m.connectionsActive, 0u);
