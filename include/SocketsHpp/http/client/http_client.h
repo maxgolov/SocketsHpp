@@ -537,6 +537,9 @@ namespace http
             /// @brief Upper bound on a response body accumulated into HttpClientResponse::body,
             /// and on any single chunk of a chunked response (default 1 GiB).
             size_t m_maxResponseBodySize = static_cast<size_t>(1) << 30;  // 1 GiB
+            /// @brief Unix domain socket to connect to instead of the URL's host and port
+            /// (empty = TCP; see setUnixSocketPath()).
+            std::string m_unixSocketPath;
 
             /// @brief Set by sendOnce() when request bytes are about to be written
             /// (see lastRequestSent()).
@@ -581,6 +584,17 @@ namespace http
             ///              any single chunk of a chunked response (the chunk limit also
             ///              applies when a chunkCallback is used). Exceeding it fails the request.
             void setMaxResponseBodySize(size_t bytes) { m_maxResponseBodySize = bytes; }
+            /// @brief Send every request over the Unix domain socket at @p path instead of
+            ///        connecting to the URL's host and port (like curl --unix-socket).
+            ///
+            /// The URL still supplies the request target and the Host header, e.g.
+            /// `http://localhost/api`. Redirects are followed over the same socket.
+            /// @param path Socket path; empty (default) restores TCP.
+            /// @note Requires Unix domain socket support (HAVE_UNIX_DOMAIN); otherwise
+            ///       requests fail to connect.
+            void setUnixSocketPath(const std::string& path) { m_unixSocketPath = path; }
+            /// @brief Unix domain socket path set with setUnixSocketPath() (empty = TCP).
+            const std::string& getUnixSocketPath() const { return m_unixSocketPath; }
 
             /// @brief Abort the request currently in flight on this client (if any) from another
             /// thread by shutting its socket down. The blocked send() then returns false.
@@ -1091,6 +1105,30 @@ namespace http
             /// @return true if connected.
             bool connectTo(const detail::ParsedUrl& url, net::utils::ScopedSocket& out) const
             {
+                if (!m_unixSocketPath.empty())
+                {
+#ifdef HAVE_UNIX_DOMAIN
+                    try
+                    {
+                        SocketAddr addr(m_unixSocketPath.c_str(), true);
+                        net::utils::ScopedSocket candidate(AF_UNIX, SOCK_STREAM, 0);
+                        if (connectWithTimeout(candidate.get().m_sock, addr, addr.size()))
+                        {
+                            out = std::move(candidate);
+                            return true;
+                        }
+                    }
+                    catch (const std::exception&)
+                    {
+                        // Path too long or socket() failed
+                    }
+                    LOG_ERROR("HttpClient: Failed to connect to unix:%s", m_unixSocketPath.c_str());
+#else
+                    LOG_ERROR("HttpClient: Unix domain sockets are not supported (%s)", m_unixSocketPath.c_str());
+#endif
+                    return false;
+                }
+
                 addrinfo hints{};
                 hints.ai_family = AF_UNSPEC;
                 hints.ai_socktype = SOCK_STREAM;

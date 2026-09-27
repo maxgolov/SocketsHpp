@@ -8,12 +8,18 @@
 
 #include <gtest/gtest.h>
 
+#include <SocketsHpp/http/client/http_client.h>
 #include <SocketsHpp/http/server/http_server.h>
 
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +30,13 @@
 using namespace SocketsHpp::http::server;
 using SocketsHpp::net::utils::SocketAddr;
 using SocketsHpp::net::utils::Socket;
+namespace fs = std::filesystem;
+
+#ifndef _WIN32
+#  include <fcntl.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
+#endif
 
 namespace
 {
@@ -459,3 +472,345 @@ TEST(HttpServerOpsTest, CorsMethodsAreConfigurable)
     EXPECT_EQ(res.header("access-control-allow-methods"), "GET, PUT");
     server.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Unix domain listening sockets
+// ---------------------------------------------------------------------------
+
+#ifdef HAVE_UNIX_DOMAIN
+namespace
+{
+    /// Short, unique socket path in the temp directory (sun_path is ~104-108 bytes).
+    std::string uniqueSocketPath(const char* tag)
+    {
+        static std::atomic<int> counter{ 0 };
+        std::string dir = fs::temp_directory_path().string();
+#  ifdef _WIN32
+        const long pid = static_cast<long>(::GetCurrentProcessId());
+        const char sep = '\\';
+#  else
+        const long pid = static_cast<long>(::getpid());
+        const char sep = '/';
+#  endif
+        if (!dir.empty() && dir.back() != '/' && dir.back() != '\\')
+        {
+            dir += sep;
+        }
+        std::string path = dir + "shpp-" + tag + "-" + std::to_string(pid) + "-" + std::to_string(++counter) + ".sock";
+        std::error_code ec;
+        fs::remove(path, ec);
+        return path;
+    }
+
+    /// Bind a Unix socket at @p path; false if AF_UNIX is unusable here (e.g. Wine).
+    bool unixSocketsUsable()
+    {
+        const std::string path = uniqueSocketPath("probe");
+        try
+        {
+            Socket s(AF_UNIX, SOCK_STREAM, 0);
+            const bool ok = s.bind(SocketAddr(path.c_str(), true)) == 0;
+            s.close();
+            std::error_code ec;
+            fs::remove(path, ec);
+            return ok;
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+}  // namespace
+
+#  define REQUIRE_UNIX_SOCKETS()                                                  \
+      do                                                                          \
+      {                                                                           \
+          if (!unixSocketsUsable())                                               \
+          {                                                                       \
+              GTEST_SKIP() << "AF_UNIX sockets are not usable on this platform";  \
+          }                                                                       \
+      } while (0)
+
+TEST(HttpServerUnixSocketTest, RoundTripReplacesStaleFileAndCleansUp)
+{
+    REQUIRE_UNIX_SOCKETS();
+    const std::string path = uniqueSocketPath("rt");
+    {
+        // A stale socket file: bound, then closed without unlinking.
+        Socket stale(AF_UNIX, SOCK_STREAM, 0);
+        ASSERT_EQ(stale.bind(SocketAddr(path.c_str(), true)), 0);
+        stale.close();
+        ASSERT_TRUE(fs::exists(path));
+    }
+
+    HttpServer server;
+    server.addListeningUnixSocket(path, 0600);
+    EXPECT_EQ(server.getListeningPort(), -1);
+    ASSERT_EQ(server.getListeningUnixSockets().size(), 1u);
+    EXPECT_EQ(server.getListeningUnixSockets()[0], path);
+#  ifndef _WIN32
+    struct stat st;
+    ASSERT_EQ(::lstat(path.c_str(), &st), 0);
+    EXPECT_TRUE(S_ISSOCK(st.st_mode));
+    EXPECT_EQ(st.st_mode & 0777, 0600u);
+#  endif
+    server.route("/who", [](const HttpRequest& req, HttpResponse& res) {
+        res.set_content(req.client);
+        return 200;
+    });
+    server.start();
+
+    {
+        RawConn c(path);
+        ASSERT_TRUE(c.connected());
+        RawResponse res = c.request(get("/who"));
+        ASSERT_TRUE(res.complete);
+        EXPECT_EQ(res.code, 200);
+        EXPECT_EQ(res.body, "unix");
+        // Keep-alive works over the Unix socket too.
+        EXPECT_EQ(c.request(get("/who")).body, "unix");
+    }
+
+    SocketsHpp::http::client::HttpClient client;
+    client.setUnixSocketPath(path);
+    EXPECT_EQ(client.getUnixSocketPath(), path);
+    SocketsHpp::http::client::HttpClientResponse response;
+    ASSERT_TRUE(client.get("http://localhost/who", response));
+    EXPECT_EQ(response.code, 200);
+    EXPECT_EQ(response.body, "unix");
+
+    server.stop();
+    EXPECT_FALSE(fs::exists(path));  // removed on stop
+    SocketsHpp::http::client::HttpClientResponse after;
+    EXPECT_FALSE(client.get("http://localhost/who", after));
+}
+
+TEST(HttpServerUnixSocketTest, RefusesNonSocketFileAndLiveSocket)
+{
+    REQUIRE_UNIX_SOCKETS();
+    const std::string path = uniqueSocketPath("ns");
+    {
+        std::ofstream f(path);
+        f << "not a socket";
+    }
+    {
+        HttpServer server;
+        EXPECT_THROW(server.addListeningUnixSocket(path), std::runtime_error);
+    }
+    EXPECT_TRUE(fs::exists(path));  // left alone
+    std::error_code ec;
+    fs::remove(path, ec);
+
+    HttpServer first;
+    first.addListeningUnixSocket(path);
+    first.route("/", [](const HttpRequest&, HttpResponse& res) {
+        res.set_content("first");
+        return 200;
+    });
+    first.start();
+    {
+        HttpServer second;
+        EXPECT_THROW(second.addListeningUnixSocket(path), std::runtime_error);
+    }
+    RawConn c(path);
+    ASSERT_TRUE(c.connected());
+    EXPECT_EQ(c.request(get("/")).body, "first");  // the live server is untouched
+    first.stop();
+    EXPECT_FALSE(fs::exists(path));
+
+    HttpServer bad;
+    EXPECT_THROW(bad.addListeningUnixSocket(""), std::invalid_argument);
+    EXPECT_THROW(bad.addListeningUnixSocket(std::string(300, 'x')), std::invalid_argument);
+}
+
+TEST(HttpServerUnixSocketTest, TcpAndUnixListenersTogether)
+{
+    REQUIRE_UNIX_SOCKETS();
+    const std::string path = uniqueSocketPath("mix");
+    HttpServer server;
+    server.addListeningUnixSocket(path);
+    int port = server.addListeningPort("127.0.0.1", 0);
+    EXPECT_EQ(server.getListeningPort(), port);
+    server.route("/who", [](const HttpRequest& req, HttpResponse& res) {
+        res.set_content(req.client);
+        return 200;
+    });
+    server.start();
+    RawConn u(path);
+    RawConn t(port);
+    ASSERT_TRUE(u.connected());
+    ASSERT_TRUE(t.connected());
+    EXPECT_EQ(u.request(get("/who")).body, "unix");
+    EXPECT_EQ(t.request(get("/who")).body.rfind("127.0.0.1:", 0), 0u);
+    server.stop();
+    EXPECT_FALSE(fs::exists(path));
+}
+#endif  // HAVE_UNIX_DOMAIN
+
+// ---------------------------------------------------------------------------
+// Adopted / inherited listening sockets (systemd socket activation)
+// ---------------------------------------------------------------------------
+
+TEST(HttpServerAdoptTest, RejectsNonListeningSocket)
+{
+    Socket s(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    HttpServer server;
+    EXPECT_THROW(server.adoptListeningSocket(s.m_sock), std::invalid_argument);
+    EXPECT_THROW(server.adoptListeningSocket(Socket::Invalid), std::invalid_argument);
+    s.close();  // still ours after a failed adoption
+}
+
+TEST(HttpServerAdoptTest, AdoptsListeningTcpSocket)
+{
+    Socket s(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_EQ(s.bind(SocketAddr("127.0.0.1", 0)), 0);
+    ASSERT_TRUE(s.listen(8));
+    SocketAddr bound;
+    ASSERT_TRUE(s.getsockname(bound));
+
+    HttpServer server;
+    EXPECT_EQ(server.adoptListeningSocket(s.m_sock), bound.port());
+    EXPECT_EQ(server.getListeningPort(), bound.port());
+    server.route("/", [](const HttpRequest&, HttpResponse& res) {
+        res.set_content("adopted");
+        return 200;
+    });
+    server.start();
+    RawConn c(bound.port());
+    ASSERT_TRUE(c.connected());
+    EXPECT_EQ(c.request(get("/")).body, "adopted");
+    server.stop();  // closes the adopted socket
+}
+
+#ifdef __linux__
+namespace
+{
+    /// Runs @p body with a listening TCP socket installed as fd 3 (as systemd passes
+    /// it), restoring whatever fd 3 was before.
+    template <typename Body>
+    void withSocketAtFd3(Body body)
+    {
+        int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(lfd, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ASSERT_EQ(::bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+        ASSERT_EQ(::listen(lfd, 8), 0);
+        socklen_t len = sizeof(addr);
+        ASSERT_EQ(::getsockname(lfd, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+        const int port = ntohs(addr.sin_port);
+
+        const int saved = (::fcntl(3, F_GETFD) != -1) ? ::fcntl(3, F_DUPFD_CLOEXEC, 10) : -1;
+        if (lfd != 3)
+        {
+            ASSERT_EQ(::dup2(lfd, 3), 3);
+            ::close(lfd);
+        }
+        body(port);
+        if (::fcntl(3, F_GETFD) != -1)
+        {
+            ::close(3);  // not adopted: close our copy
+        }
+        if (saved >= 0)
+        {
+            ::dup2(saved, 3);
+            ::close(saved);
+        }
+    }
+}  // namespace
+
+TEST(HttpServerAdoptTest, SystemdSocketActivation)
+{
+    withSocketAtFd3([](int port) {
+        ::setenv("LISTEN_PID", std::to_string(::getpid()).c_str(), 1);
+        ::setenv("LISTEN_FDS", "1", 1);
+        ::setenv("LISTEN_FDNAMES", "http", 1);
+        HttpServer server;
+        EXPECT_EQ(server.addInheritedListeningSockets(), 1u);
+        EXPECT_EQ(std::getenv("LISTEN_PID"), nullptr);
+        EXPECT_EQ(std::getenv("LISTEN_FDS"), nullptr);
+        EXPECT_EQ(std::getenv("LISTEN_FDNAMES"), nullptr);
+        EXPECT_EQ(server.getListeningPort(), port);
+        EXPECT_NE(::fcntl(3, F_GETFD) & FD_CLOEXEC, 0);
+        server.route("/", [](const HttpRequest&, HttpResponse& res) {
+            res.set_content("activated");
+            return 200;
+        });
+        server.start();
+        {
+            RawConn c(port);
+            ASSERT_TRUE(c.connected());
+            EXPECT_EQ(c.request(get("/")).body, "activated");
+        }
+        server.stop();
+        EXPECT_EQ(::fcntl(3, F_GETFD), -1);  // closed by the server
+    });
+}
+
+TEST(HttpServerAdoptTest, SocketActivationIgnoresOtherProcess)
+{
+    withSocketAtFd3([](int) {
+        ::setenv("LISTEN_PID", std::to_string(::getpid() + 1).c_str(), 1);
+        ::setenv("LISTEN_FDS", "1", 1);
+        HttpServer server;
+        EXPECT_EQ(server.addInheritedListeningSockets(), 0u);
+        EXPECT_EQ(std::getenv("LISTEN_PID"), nullptr);
+        EXPECT_EQ(server.getListeningPort(), -1);
+
+        ::setenv("LISTEN_PID", "garbage", 1);
+        ::setenv("LISTEN_FDS", "1", 1);
+        EXPECT_EQ(server.addInheritedListeningSockets(false), 0u);
+        EXPECT_NE(std::getenv("LISTEN_PID"), nullptr);  // kept on request
+        ::unsetenv("LISTEN_PID");
+        ::unsetenv("LISTEN_FDS");
+        EXPECT_EQ(server.addInheritedListeningSockets(), 0u);  // not activated
+    });
+}
+
+TEST(HttpServerAdoptTest, SdNotifySendsDatagram)
+{
+    ::unsetenv("NOTIFY_SOCKET");
+    EXPECT_FALSE(SocketsHpp::net::utils::sdNotify("READY=1"));
+
+    // Filesystem socket
+    const std::string path = uniqueSocketPath("notify");
+    int fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.c_str(), path.size());
+    ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ::setenv("NOTIFY_SOCKET", path.c_str(), 1);
+    EXPECT_TRUE(SocketsHpp::net::utils::sdNotify("READY=1"));
+    char buf[64] = {};
+    EXPECT_EQ(::recv(fd, buf, sizeof(buf), MSG_DONTWAIT), 7);
+    EXPECT_EQ(std::string(buf, 7), "READY=1");
+    ::close(fd);
+    ::unlink(path.c_str());
+
+    // Abstract socket ("@name")
+    const std::string name = "shpp-notify-" + std::to_string(::getpid());
+    fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_un abs{};
+    abs.sun_family = AF_UNIX;
+    std::memcpy(abs.sun_path + 1, name.data(), name.size());
+    ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&abs),
+        static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name.size())), 0);
+    ::setenv("NOTIFY_SOCKET", ("@" + name).c_str(), 1);
+    EXPECT_TRUE(SocketsHpp::net::utils::sdNotify("STATUS=serving\nREADY=1"));
+    std::memset(buf, 0, sizeof(buf));
+    EXPECT_EQ(::recv(fd, buf, sizeof(buf), MSG_DONTWAIT), 22);
+    EXPECT_EQ(std::string(buf), "STATUS=serving\nREADY=1");
+    ::close(fd);
+    ::unsetenv("NOTIFY_SOCKET");
+}
+#else
+TEST(HttpServerAdoptTest, SocketActivationIsLinuxOnly)
+{
+    HttpServer server;
+    EXPECT_EQ(server.addInheritedListeningSockets(), 0u);
+    EXPECT_FALSE(SocketsHpp::net::utils::sdNotify("READY=1"));
+}
+#endif

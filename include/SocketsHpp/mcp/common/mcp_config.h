@@ -226,6 +226,21 @@ namespace mcp
         ///        "::1" or "[::1]" requires allowNonLoopback.
         std::string host = "127.0.0.1";
 
+        /// @brief Unix domain socket path to listen on instead of #host / #port (default
+        ///        empty = TCP). When set, MCPServer::listen() binds only this socket
+        ///        (HttpServer::addListeningUnixSocket(): a stale socket file is replaced and
+        ///        the file is removed on stop), #host and #port are ignored, the
+        ///        non-loopback guard (#allowNonLoopback) does not apply - access is governed
+        ///        by filesystem permissions - and MCPServer::port() returns -1.
+        ///        Put a reverse proxy in front, e.g. nginx
+        ///        `proxy_pass http://unix:/run/mcp.sock:;`. Clients are then reported as
+        ///        "unix", so per-client rate limiting sees one client unless
+        ///        #trustProxyHeaders is set.
+        std::string unixSocketPath;
+        /// @brief POSIX permission bits for #unixSocketPath (e.g. 0660); -1 (default)
+        ///        keeps the process umask. Ignored on Windows.
+        int unixSocketPermissions = -1;
+
         /// @brief How an initialize response is sent on the HTTP (2024-11-05) transport.
         enum class ResponseMode
         {

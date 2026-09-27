@@ -14,6 +14,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -1045,6 +1046,52 @@ namespace net
             };
         };
 
+        /// @brief Send a service state notification to systemd (sd_notify(3) protocol),
+        ///        e.g. "READY=1" once the service accepts requests, or "STOPPING=1".
+        ///
+        /// Sends @p state as one datagram to the AF_UNIX socket named by the NOTIFY_SOCKET
+        /// environment variable (a path, or an abstract name starting with '@'). No
+        /// libsystemd dependency. Returns false - doing nothing - when NOTIFY_SOCKET is not
+        /// set (the service does not run under systemd with Type=notify), and always on
+        /// platforms other than Linux.
+        /// @param state Newline-separated VARIABLE=value assignments.
+        /// @return true if the datagram was sent.
+        inline bool sdNotify(const std::string& state)
+        {
+#ifdef __linux__
+            const char* path = std::getenv("NOTIFY_SOCKET");
+            if (path == nullptr || path[0] == '\0' || state.empty())
+            {
+                return false;
+            }
+            const size_t len = std::strlen(path);
+            sockaddr_un addr{};
+            if ((path[0] != '/' && path[0] != '@') || len >= sizeof(addr.sun_path))
+            {
+                return false;
+            }
+            addr.sun_family = AF_UNIX;
+            std::memcpy(addr.sun_path, path, len);
+            if (addr.sun_path[0] == '@')
+            {
+                addr.sun_path[0] = '\0';  // abstract namespace
+            }
+            const socklen_t addrLen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + len);
+            int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+            if (fd < 0)
+            {
+                return false;
+            }
+            ssize_t sent = ::sendto(fd, state.data(), state.size(), MSG_NOSIGNAL,
+                reinterpret_cast<const sockaddr*>(&addr), addrLen);
+            ::close(fd);
+            return sent == static_cast<ssize_t>(state.size());
+#else
+            (void)state;
+            return false;
+#endif
+        }
+
         /// @brief Move-only RAII owner of a Socket: closes the handle on destruction.
         /// @note Not thread-safe; use from one thread or synchronize externally.
         class ScopedSocket
@@ -1210,6 +1257,10 @@ namespace net
             /// @brief Maximum wait per loop iteration in milliseconds (see setPollTimeout()).
             std::atomic<unsigned> m_pollTimeoutMs{ config::REACTOR_POLL_TIMEOUT_MS };
 
+            /// @brief Whether stop() closes the first registered socket (see
+            ///        setCloseFirstSocketOnStop()).
+            bool m_closeFirstOnStop{ true };
+
 #ifdef _WIN32
             /* use WinSock events on Windows */
             std::vector<WSAEVENT> m_events{};
@@ -1319,6 +1370,14 @@ namespace net
 
             /// @brief Current maximum wait per loop iteration, in milliseconds.
             unsigned pollTimeout() const { return m_pollTimeoutMs.load(); }
+
+            /// @brief Choose whether stop() closes the first registered socket (default
+            ///        true: the listening / bound server socket). Owners that close their
+            ///        sockets themselves - and may unregister the first one before stopping,
+            ///        as HttpServer does when draining - pass false.
+            /// @param close true to close the first registered socket in stop().
+            /// @note Call before start().
+            void setCloseFirstSocketOnStop(bool close) { m_closeFirstOnStop = close; }
 
             /// @brief Register a socket or update its armed flags.
             /// @param socket Socket to watch (not owned).
@@ -1468,7 +1527,8 @@ namespace net
             }
 
             /// @brief Stop the event loop, unregister all sockets and close the first
-            /// registered socket (the listening / bound server socket).
+            /// registered socket (the listening / bound server socket; see
+            /// setCloseFirstSocketOnStop()).
             /// Other sockets are unregistered but not closed. Safe to call more than once.
             /// @note Blocks until the reactor thread exits (up to one poll timeout).
             ///       If called from a callback the thread is detached instead of joined.
@@ -1510,7 +1570,7 @@ namespace net
 #endif
                 }
                 // unbind
-                if (m_sockets.size() && !m_sockets[0].socket.invalid())
+                if (m_closeFirstOnStop && m_sockets.size() && !m_sockets[0].socket.invalid())
                 {
                     m_sockets[0].socket.close();
                 }

@@ -26,7 +26,13 @@
 #include <optional>
 #include <random>
 #include <unordered_map>
+#include <set>
 #include <BS_thread_pool.hpp>
+
+#ifndef _WIN32
+#  include <sys/stat.h>
+#  include <cerrno>
+#endif
 
 SOCKETSHPP_NS_BEGIN
 namespace http
@@ -528,7 +534,7 @@ namespace http
         /// @brief A parsed HTTP request as passed to request handlers.
         struct HttpRequest
         {
-            std::string client;    ///< Peer address as "ip:port".
+            std::string client;    ///< Peer address as "ip:port" ("[ipv6]:port"), or "unix" for a Unix domain socket peer.
             std::string method;    ///< Request method, e.g. "GET". Handlers see "GET" for HEAD requests.
             std::string uri;       ///< Request target exactly as received (path plus any query string), not decoded.
             std::string protocol;  ///< "HTTP/1.0" or "HTTP/1.1".
@@ -1102,8 +1108,25 @@ namespace http
             std::string m_serverHost;                ///< Value of the "Server" response header.
             bool allowKeepalive{ true };             ///< Server-wide keep-alive switch (setKeepalive()).
             Reactor m_reactor;                       ///< Socket event loop; owns the I/O thread.
-            std::list<Socket> m_listeningSockets;    ///< Listening sockets, in the order added.
-            std::vector<int> m_listeningPorts;       ///< Bound port of each listening socket.
+            std::list<Socket> m_listeningSockets;    ///< Listening sockets, in the order added (Invalid once closed).
+            std::vector<int> m_listeningPorts;       ///< Bound port of each TCP listening socket.
+            /// @brief Guards m_listeningSockets and the Unix socket bookkeeping against
+            ///        accept() on the reactor thread racing closeListeningSockets().
+            std::mutex m_listenMutex;
+            /// @brief Listening sockets of family AF_UNIX (their clients are reported as "unix").
+            std::set<Socket> m_unixListeners;
+            /// @brief Paths of the Unix domain listening sockets, in the order added.
+            std::vector<std::string> m_unixSocketPaths;
+
+            /// @brief A socket file created by addListeningUnixSocket(); removed when the
+            ///        server stops if it is still the same file (device and inode match).
+            struct UnixSocketFile
+            {
+                std::string path;             ///< Filesystem path.
+                unsigned long long dev = 0;   ///< st_dev after bind (POSIX).
+                unsigned long long ino = 0;   ///< st_ino after bind (POSIX).
+            };
+            std::vector<UnixSocketFile> m_unixSocketFiles;  ///< Socket files to remove on stop.
 
             /// @brief A route: URI prefix (first) and non-owning handler pointer (second).
             ///        A null handler is skipped during dispatch.
@@ -1185,7 +1208,12 @@ namespace http
                 m_reactor(*this),
                 m_maxRequestHeadersSize(config::MAX_HTTP_HEADER_SIZE),
                 m_maxRequestContentSize(config::MAX_HTTP_BODY_SIZE),
-                m_maxSessions(config::DEFAULT_MAX_SESSIONS) {};
+                m_maxSessions(config::DEFAULT_MAX_SESSIONS)
+            {
+                // The server closes its listening sockets itself (closeListeningSockets()),
+                // possibly before the reactor stops (shutdown()).
+                m_reactor.setCloseFirstSocketOnStop(false);
+            }
 
             /// @brief Create a server and bind a listening socket on all IPv4 interfaces.
             /// @note @p serverHost is not a bind address: it only forms the "Server"
@@ -1417,7 +1445,334 @@ namespace http
                 return addListeningSocket(SocketAddr(host.c_str(), port));
             }
 
+            /// @brief Listen on a Unix domain (AF_UNIX) stream socket at @p path, e.g. for a
+            ///        reverse proxy on the same host (nginx:
+            ///        `proxy_pass http://unix:/run/app.sock:;`).
+            ///
+            /// A stale socket file left at @p path by a previous run is removed first; a
+            /// path that exists but is not a socket, or a socket another server is still
+            /// accepting on, is refused. The file is removed again when the server stops
+            /// (stop(), shutdown() or the destructor) if it is still the file this call
+            /// created. Requests from such a connection have HttpRequest::client == "unix".
+            /// @param path Socket path (shorter than sockaddr_un::sun_path, about 104-108
+            ///        bytes). Abstract (Linux) names are not supported here; use
+            ///        adoptListeningSocket() for those.
+            /// @param permissions POSIX permission bits applied with chmod() after bind,
+            ///        e.g. 0660 to let a proxy in the socket's group connect; -1 (default)
+            ///        keeps what the process umask gives. Ignored on Windows.
+            /// @throws std::invalid_argument for an empty or too long path;
+            ///         std::runtime_error if Unix domain sockets are unavailable (Windows
+            ///         without <afunix.h>), the path is in use / not a socket, or
+            ///         bind / chmod / listen fail.
+            /// @note Call before start(). Does not affect getListeningPort().
+            void addListeningUnixSocket(const std::string& path, int permissions = -1)
+            {
+#ifdef HAVE_UNIX_DOMAIN
+                if (path.empty())
+                {
+                    throw std::invalid_argument("Unix socket path must not be empty");
+                }
+                SocketAddr addr(path.c_str(), true);  // throws if too long
+                removeStaleUnixSocketFile(path);
+
+                ScopedSocket scoped(AF_UNIX, SOCK_STREAM, 0);
+                Socket& socket = scoped.get();
+                socket.setNonBlocking();
+                if (socket.bind(addr) != 0)
+                {
+                    int err = socket.error();
+                    throw std::runtime_error("Failed to bind Unix socket " + path + ", error: " + std::to_string(err));
+                }
+                UnixSocketFile file;
+                file.path = path;
+#  ifndef _WIN32
+                struct stat st;
+                if (::lstat(path.c_str(), &st) == 0)
+                {
+                    file.dev = static_cast<unsigned long long>(st.st_dev);
+                    file.ino = static_cast<unsigned long long>(st.st_ino);
+                }
+                if (permissions >= 0 && ::chmod(path.c_str(), static_cast<mode_t>(permissions)) != 0)
+                {
+                    int err = errno;
+                    ::unlink(path.c_str());
+                    throw std::runtime_error("Failed to chmod Unix socket " + path + ", error: " + std::to_string(err));
+                }
+#  else
+                (void)permissions;
+#  endif
+                if (!socket.listen(config::SOCKET_LISTEN_BACKLOG))
+                {
+                    int err = socket.error();
+                    removeUnixSocketFile(file);
+                    throw std::runtime_error("Failed to listen on Unix socket " + path + ", error: " + std::to_string(err));
+                }
+
+                registerListeningSocket(scoped.release(), addr, true);
+                std::lock_guard<std::mutex> lock(m_listenMutex);
+                m_unixSocketFiles.push_back(file);
+#else
+                (void)permissions;
+                throw std::runtime_error("Unix domain sockets are not supported on this platform: " + path);
+#endif
+            }
+
+            /// @brief Paths of the Unix domain sockets this server listens on
+            ///        (addListeningUnixSocket() and adopted AF_UNIX sockets), in the
+            ///        order added. An abstract or unnamed adopted socket appears as "".
+            const std::vector<std::string>& getListeningUnixSockets() const
+            {
+                return m_unixSocketPaths;
+            }
+
+            /// @brief Serve on an existing, already bound and listening stream socket
+            ///        (TCP or Unix domain), e.g. one passed by a supervisor.
+            ///
+            /// The server takes ownership: the socket is made non-blocking and
+            /// close-on-exec and is closed when the server stops. A Unix socket file is
+            /// never removed for an adopted socket (its creator owns it).
+            /// @param handle Native socket handle (fd on POSIX, SOCKET on Windows).
+            /// @return The bound TCP port, or -1 for a Unix domain socket.
+            /// @throws std::invalid_argument if @p handle is not a listening stream socket
+            ///         (the handle is then left open and not owned).
+            /// @note Call before start().
+            int adoptListeningSocket(Socket::Type handle)
+            {
+                Socket sock(handle);
+                if (sock.invalid())
+                {
+                    throw std::invalid_argument("adoptListeningSocket: invalid socket handle");
+                }
+                int type = 0;
+                if (sock.getsockopt(SOL_SOCKET, SO_TYPE, type) != 0 || type != SOCK_STREAM)
+                {
+                    throw std::invalid_argument("adoptListeningSocket: not a stream socket");
+                }
+#ifdef SO_ACCEPTCONN
+                int accepting = 0;
+                if (sock.getsockopt(SOL_SOCKET, SO_ACCEPTCONN, accepting) == 0 && accepting == 0)
+                {
+                    throw std::invalid_argument("adoptListeningSocket: socket is not listening");
+                }
+#endif
+                SocketAddr addr;
+                if (!sock.getsockname(addr))
+                {
+                    throw std::invalid_argument("adoptListeningSocket: getsockname failed");
+                }
+                bool isUnix = false;
+#ifdef HAVE_UNIX_DOMAIN
+                isUnix = (addr.m_data.sa_family == AF_UNIX);
+                addr.isUnixDomain = isUnix;
+#endif
+                sock.setNonBlocking();
+                sock.setCloseOnExec();
+                registerListeningSocket(sock, addr, isUnix);
+                return isUnix ? -1 : addr.port();
+            }
+
+            /// @brief Adopt the listening sockets passed by systemd socket activation
+            ///        (sd_listen_fds(3) protocol, Linux only).
+            ///
+            /// If LISTEN_PID equals this process id, the LISTEN_FDS descriptors starting
+            /// at fd 3 are adopted with adoptListeningSocket(); descriptors that are not
+            /// listening stream sockets (e.g. a datagram socket) are skipped with a
+            /// warning and left open. LISTEN_FDNAMES is ignored. No libsystemd needed.
+            /// Pair it with net::utils::sdNotify("READY=1") after start() for
+            /// Type=notify services.
+            /// @param unsetEnvironment Remove LISTEN_PID, LISTEN_FDS and LISTEN_FDNAMES
+            ///        from the environment (default true), so child processes do not
+            ///        pick them up. Not thread-safe with concurrent getenv()/setenv().
+            /// @return Number of sockets adopted; always 0 on platforms other than Linux.
+            /// @note Call before start(). Can be combined with the other listening methods.
+            size_t addInheritedListeningSockets(bool unsetEnvironment = true)
+            {
+                size_t adopted = 0;
+#ifdef __linux__
+                const char* pidText = std::getenv("LISTEN_PID");
+                const char* fdsText = std::getenv("LISTEN_FDS");
+                long pid = 0;
+                long count = 0;
+                if (parseDecimal(pidText, pid) && parseDecimal(fdsText, count) &&
+                    pid == static_cast<long>(::getpid()) && count > 0 && count <= 4096)
+                {
+                    constexpr int kListenFdsStart = 3;  // SD_LISTEN_FDS_START
+                    for (int fd = kListenFdsStart; fd < kListenFdsStart + static_cast<int>(count); ++fd)
+                    {
+                        try
+                        {
+                            adoptListeningSocket(fd);
+                            ++adopted;
+                        }
+                        catch (const std::exception& e)
+                        {
+                            LOG_WARN("HttpServer: inherited fd %d not adopted: %s", fd, e.what());
+                        }
+                    }
+                }
+                if (unsetEnvironment)
+                {
+                    ::unsetenv("LISTEN_PID");
+                    ::unsetenv("LISTEN_FDS");
+                    ::unsetenv("LISTEN_FDNAMES");
+                }
+#else
+                (void)unsetEnvironment;
+#endif
+                return adopted;
+            }
+
         private:
+            /// @brief Parse a whole non-negative decimal number (false for null, empty,
+            ///        signs, garbage or overflow).
+            static bool parseDecimal(const char* text, long& out)
+            {
+                if (text == nullptr || *text == '\0')
+                {
+                    return false;
+                }
+                long value = 0;
+                for (const char* p = text; *p; ++p)
+                {
+                    if (*p < '0' || *p > '9' || value > ((std::numeric_limits<long>::max)() - 9) / 10)
+                    {
+                        return false;
+                    }
+                    value = value * 10 + (*p - '0');
+                }
+                out = value;
+                return true;
+            }
+
+            /// @brief Register an owned listening socket with the server and the reactor.
+            void registerListeningSocket(Socket owned, const SocketAddr& addr, bool isUnix)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_listenMutex);
+                    m_listeningSockets.push_back(owned);
+                    if (isUnix)
+                    {
+                        m_unixListeners.insert(owned);
+                        m_unixSocketPaths.push_back(addr.toString());
+                    }
+                    else
+                    {
+                        m_listeningPorts.push_back(addr.port());
+                    }
+                }
+                m_reactor.addSocket(owned, Reactor::Acceptable);
+                LOG_INFO("HttpServer: Listening on %s%s", isUnix ? "unix:" : "", addr.toString().c_str());
+            }
+
+#ifdef HAVE_UNIX_DOMAIN
+            /// @brief Whether a server accepts connections on the Unix socket @p path.
+            static bool unixSocketInUse(const std::string& path)
+            {
+                try
+                {
+                    ScopedSocket probe(AF_UNIX, SOCK_STREAM, 0);
+#  ifndef _WIN32
+                    // Non-blocking, so a live server with a full backlog cannot block us.
+                    probe.get().setNonBlocking();
+#  endif
+                    if (probe.get().connect(SocketAddr(path.c_str(), true)))
+                    {
+                        return true;
+                    }
+#  ifndef _WIN32
+                    const int err = errno;
+                    return err == EAGAIN || err == EWOULDBLOCK || err == EINPROGRESS;
+#  else
+                    return false;
+#  endif
+                }
+                catch (const std::exception&)
+                {
+                    return false;
+                }
+            }
+
+            /// @brief Remove a stale socket file at @p path before binding.
+            /// @throws std::runtime_error if @p path exists but is not a socket, is in
+            ///         use by a live server, or cannot be removed.
+            static void removeStaleUnixSocketFile(const std::string& path)
+            {
+#  ifndef _WIN32
+                struct stat st;
+                if (::lstat(path.c_str(), &st) != 0)
+                {
+                    return;  // Nothing there (or not accessible: bind reports it)
+                }
+                if (!S_ISSOCK(st.st_mode))
+                {
+                    throw std::runtime_error("Refusing to replace " + path + ": exists and is not a socket");
+                }
+#  else
+                const DWORD attrs = ::GetFileAttributesA(path.c_str());
+                if (attrs == INVALID_FILE_ATTRIBUTES)
+                {
+                    return;
+                }
+                if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+                {
+                    throw std::runtime_error("Refusing to replace " + path + ": exists and is not a socket");
+                }
+#  endif
+                if (unixSocketInUse(path))
+                {
+                    throw std::runtime_error("Unix socket " + path + " is in use by another server");
+                }
+                LOG_INFO("HttpServer: removing stale Unix socket %s", path.c_str());
+#  ifndef _WIN32
+                if (::unlink(path.c_str()) != 0 && errno != ENOENT)
+#  else
+                if (!::DeleteFileA(path.c_str()))
+#  endif
+                {
+                    throw std::runtime_error("Failed to remove stale Unix socket " + path);
+                }
+            }
+#endif
+
+            /// @brief Remove a socket file created by addListeningUnixSocket() if it is
+            ///        still the same file (POSIX: same device and inode).
+            static void removeUnixSocketFile(const UnixSocketFile& file)
+            {
+#ifndef _WIN32
+                struct stat st;
+                if (::lstat(file.path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) &&
+                    static_cast<unsigned long long>(st.st_dev) == file.dev &&
+                    static_cast<unsigned long long>(st.st_ino) == file.ino)
+                {
+                    ::unlink(file.path.c_str());
+                }
+#else
+                ::DeleteFileA(file.path.c_str());
+#endif
+            }
+
+            /// @brief Stop accepting: unregister and close every listening socket and
+            ///        remove the Unix socket files this server created. Thread-safe and
+            ///        idempotent.
+            void closeListeningSockets()
+            {
+                std::lock_guard<std::mutex> lock(m_listenMutex);
+                for (auto& sock : m_listeningSockets)
+                {
+                    if (!sock.invalid())
+                    {
+                        m_reactor.removeSocket(sock);
+                        m_unixListeners.erase(sock);
+                        sock.close();  // invalidates the list entry
+                    }
+                }
+                for (auto const& file : m_unixSocketFiles)
+                {
+                    removeUnixSocketFile(file);
+                }
+                m_unixSocketFiles.clear();
+            }
+
             int addListeningSocket(SocketAddr addr)
             {
                 const int port = addr.port();
@@ -1446,23 +1801,20 @@ namespace http
                 }
 
                 // Success: the server owns the socket from here on.
-                Socket owned = scoped.release();
-                m_listeningSockets.push_back(owned);
-                m_listeningPorts.push_back(addr.port());
-                m_reactor.addSocket(owned, Reactor::Acceptable);
-                LOG_INFO("HttpServer: Listening on %s", addr.toString().c_str());
+                registerListeningSocket(scoped.release(), addr, false);
                 return addr.port();
             }
 
         public:
             /// @brief Port bound by the first addListeningPort() call (useful with port 0).
-            /// @return The port, or -1 if the server is not listening.
+            /// @return The port, or -1 if the server has no TCP listening socket (e.g.
+            ///         only addListeningUnixSocket()).
             int getListeningPort() const
             {
                 return m_listeningPorts.empty() ? -1 : m_listeningPorts.front();
             }
 
-            /// @brief All ports this server listens on, in the order they were added.
+            /// @brief All TCP ports this server listens on, in the order they were added.
             const std::vector<int>& getListeningPorts() const
             {
                 return m_listeningPorts;
@@ -1534,8 +1886,8 @@ namespace http
             /// @brief Start the reactor thread and begin serving. Non-blocking: returns
             ///        immediately.
             /// @note Add listening ports, routes and settings before calling this.
-            ///       Restarting after stop() is not supported (stop() unregisters the
-            ///       listening sockets and closes the first one).
+            ///       Restarting after stop() is not supported (stop() closes the
+            ///       listening sockets).
             void start()
             {
                 m_stopped = false;
@@ -1559,7 +1911,8 @@ namespace http
                 m_reactor.start();
             }
 
-            /// @brief Stop serving and join the reactor thread. Idempotent.
+            /// @brief Stop serving: join the reactor thread, then close the listening
+            ///        sockets (removing Unix socket files this server created). Idempotent.
             /// @note Client connections are closed by the destructor, not here. Thread-pool
             ///       work already queued still runs, but no longer sends responses.
             void stop()
@@ -1569,14 +1922,7 @@ namespace http
                     return;
                 }
                 m_reactor.stop();
-                // Reactor::stop() "unbinds" by closing the first socket registered with
-                // it, which is our first listening socket. Forget that descriptor so it
-                // is not closed a second time (by then the number may belong to an
-                // unrelated, newly opened file).
-                if (!m_listeningSockets.empty())
-                {
-                    m_listeningSockets.front().m_sock = Socket::Invalid;
-                }
+                closeListeningSockets();
             }
 
         protected:
@@ -1585,25 +1931,39 @@ namespace http
             virtual void onSocketAcceptable(Socket socket) override
             {
                 LOG_TRACE("HttpServer: accepting socket fd=0x%llx", static_cast<unsigned long long>(socket.m_sock));
-                assert(std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) !=
-                    m_listeningSockets.end());
 
                 Socket csocket;
                 SocketAddr caddr;
-                if (socket.accept(csocket, caddr))
+                bool isUnix = false;
                 {
-                    csocket.setNonBlocking();
+                    // Accept only on a listening socket that is still open: shutdown()
+                    // may close them concurrently (and a closed fd number can be reused).
+                    std::lock_guard<std::mutex> lock(m_listenMutex);
+                    if (std::find(m_listeningSockets.begin(), m_listeningSockets.end(), socket) ==
+                        m_listeningSockets.end())
                     {
-                        std::lock_guard<std::mutex> lock(m_connectionsMutex);
-                        Connection& conn = m_connections[csocket];
-                        conn.socket = csocket;
-                        conn.state = Connection::Idle;
-                        conn.request.client = caddr.toString();
-                        conn.lastActivity = std::chrono::steady_clock::now();
+                        return;
                     }
-                    m_reactor.addSocket(csocket, Reactor::Readable | Reactor::Closed);
-                    LOG_TRACE("HttpServer: [%s] accepted", caddr.toString().c_str());
+                    if (!socket.accept(csocket, caddr))
+                    {
+                        return;
+                    }
+                    isUnix = (m_unixListeners.count(socket) != 0);
                 }
+
+                csocket.setNonBlocking();
+                // Unix domain peers are unnamed: report a fixed marker instead of an address.
+                const std::string client = isUnix ? std::string("unix") : caddr.toString();
+                {
+                    std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                    Connection& conn = m_connections[csocket];
+                    conn.socket = csocket;
+                    conn.state = Connection::Idle;
+                    conn.request.client = client;
+                    conn.lastActivity = std::chrono::steady_clock::now();
+                }
+                m_reactor.addSocket(csocket, Reactor::Readable | Reactor::Closed);
+                LOG_TRACE("HttpServer: [%s] accepted", client.c_str());
             }
 
             /// @brief Reactor callback: read available bytes and advance the connection's

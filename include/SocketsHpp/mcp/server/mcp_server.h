@@ -701,6 +701,8 @@ namespace mcp
             /// running (the loopback guard is still checked first).
             /// SSRF guard: refuses a host other than "127.0.0.1", "localhost", "::1" or
             /// "[::1]" unless ServerConfig::allowNonLoopback is true.
+            /// With ServerConfig::unixSocketPath set, binds only that Unix domain socket
+            /// instead (host, port and the loopback guard do not apply; port() is -1).
             /// @throws std::runtime_error for the STDIO transport, a refused non-loopback
             ///         host, or a bind/listen failure; std::invalid_argument for a malformed host.
             void listen()
@@ -709,6 +711,20 @@ namespace mcp
                     m_config.transport != TransportType::HTTP_STREAMABLE)
                 {
                     throw std::runtime_error("listen() only available in HTTP transport modes");
+                }
+
+                if (!m_config.unixSocketPath.empty())
+                {
+                    // Local IPC only: filesystem permissions govern access, so the
+                    // loopback guard does not apply.
+                    if (m_running.load())
+                        return;
+                    m_httpServer.setServerName(m_config.serverName.empty() ? std::string("mcp-server") : m_config.serverName);
+                    m_httpServer.addListeningUnixSocket(m_config.unixSocketPath, m_config.unixSocketPermissions);
+                    m_running = true;
+                    m_httpServer.enableThreadPool(4);
+                    m_httpServer.start();
+                    return;
                 }
 
                 // SSRF loopback guard (backport from FMcpNativeTransport)
@@ -734,7 +750,8 @@ namespace mcp
             }
 
             /// @brief Port the server is listening on (useful with config.port = 0).
-            /// @return The port, or -1 before listen().
+            /// @return The port, or -1 before listen() or when listening on
+            ///         ServerConfig::unixSocketPath.
             int port() const { return m_httpServer.getListeningPort(); }
 
             /// @brief Stop serving: close all SSE queues (ending their streams), then stop the

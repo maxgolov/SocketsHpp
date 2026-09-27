@@ -135,6 +135,18 @@ if(NOT WIN32)
   gtest_discover_tests(http_client_test TEST_PREFIX functional. DISCOVERY_TIMEOUT ${SOCKETSHPP_TEST_DISCOVERY_TIMEOUT})
 endif()
 
+# MCPServer on a Unix domain socket (ServerConfig::unixSocketPath) — requires
+# nlohmann-json. Portable: skips where AF_UNIX is unavailable.
+if(TARGET nlohmann_json::nlohmann_json)
+  add_executable(mcp_unix_socket_test "functional/mcp_unix_socket_test.cc")
+  target_link_libraries(mcp_unix_socket_test
+    ${GTEST_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+    nlohmann_json::nlohmann_json)
+  target_include_directories(mcp_unix_socket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  gtest_discover_tests(mcp_unix_socket_test TEST_PREFIX functional. DISCOVERY_TIMEOUT ${SOCKETSHPP_TEST_DISCOVERY_TIMEOUT})
+endif()
+
 # Header self-containment check: every public header must compile on its own
 # (and twice, to verify include guards). One generated translation unit per
 # header is compiled into a static library; nothing is executed.
