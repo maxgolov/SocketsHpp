@@ -725,6 +725,28 @@ int main()
 }
 ```
 
+## Design
+
+The core is the classic **Reactor** pattern with an optional **Half-Sync/Half-Async**
+split (both from Schmidt's *Pattern-Oriented Software Architecture*, volume 2). One
+event thread per server handles sockets through epoll, kqueue or `WSAEventSelect` and
+dispatches callbacks. Blocking handlers can be moved to a worker pool that hands the
+result back to the reactor.
+
+- **Closest single analogy: Mongoose.** It's an embeddable, single-threaded event loop
+  with callback handlers and everything in one small code base.
+- **The routing API** (a prefix plus a lambda that returns a status code) feels like
+  cpp-httplib or a minimal Express.
+- **Runtime shape: Node.js without JavaScript.** One event loop does the I/O while a
+  worker pool runs blocking work, the way libuv's thread pool does.
+- **MCP layering follows the official SDKs:** JSON-RPC dispatch sits on top of
+  separate transports (Streamable HTTP and STDIO).
+
+This is not an obsolete design: nginx, Redis, Node.js (libuv), Netty and Tokio are all
+built on reactors. [docs/DESIGN.md](docs/DESIGN.md) explains the architecture, its
+trade-offs, and the more modern patterns that could be layered on later (C++20
+coroutines, multiple reactors, io_uring/IOCP, senders/receivers).
+
 ## Limits and platform notes
 
 | Platform | Reactor | Notes |
@@ -788,6 +810,7 @@ See [examples/README.md](examples/README.md). Build them with
 ## Documentation
 
 - [docs/FEATURES.md](docs/FEATURES.md) - what is and is not implemented
+- [docs/DESIGN.md](docs/DESIGN.md) - architecture, design patterns and future directions
 - [docs/INTEGRATION.md](docs/INTEGRATION.md) - adding SocketsHpp to a project
 - [docs/MCP_IMPLEMENTATION.md](docs/MCP_IMPLEMENTATION.md) - MCP server/client guide
 - [docs/ARM64.md](docs/ARM64.md) - ARM64 cross-compilation and QEMU testing
