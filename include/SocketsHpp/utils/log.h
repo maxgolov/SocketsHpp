@@ -31,7 +31,10 @@
 #include <string>
 #include <utility>
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__MINGW32__) && !defined(__clang__)
+// MinGW-w64 libstdc++ uses the C99-conforming mingw stdio (%zu, %lld), not msvcrt's.
+#  define SOCKETSHPP_PRINTF_FORMAT(fmtIndex, argIndex) __attribute__((format(gnu_printf, fmtIndex, argIndex)))
+#elif defined(__GNUC__) || defined(__clang__)
 /// @brief printf format checking for the log formatter (GCC / Clang).
 #  define SOCKETSHPP_PRINTF_FORMAT(fmtIndex, argIndex) __attribute__((format(printf, fmtIndex, argIndex)))
 #else

@@ -443,6 +443,8 @@ TEST(HttpServerOpsTest, LogLevelFiltersAndArgumentsAreLazy)
 
     SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Trace);
     LOG_TRACE("trace %s", "on");
+    LOG_ERROR("sizes %zu|%lld|%llx", static_cast<size_t>(5), static_cast<long long>(-7),
+        static_cast<unsigned long long>(255));
 
     SocketsHpp::setLogHandler(nullptr);
     SocketsHpp::setLogLevel(SocketsHpp::LogLevel::Info);
@@ -453,6 +455,7 @@ TEST(HttpServerOpsTest, LogLevelFiltersAndArgumentsAreLazy)
     EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Warn, "warned 1"));
     EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Error, "plain error"));
     EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Trace, "trace on"));
+    EXPECT_TRUE(captured->contains(SocketsHpp::LogLevel::Error, "sizes 5|-7|ff"));  // C99 formats (MinGW too)
     EXPECT_FALSE(captured->contains(SocketsHpp::LogLevel::Error, "removed"));
     EXPECT_STREQ(SocketsHpp::logLevelName(SocketsHpp::LogLevel::Warn), "WARN");
 }
@@ -1112,6 +1115,31 @@ TEST(HttpServerMetricsTest, MaxConnectionsRefusesAndTimeoutsAreCounted)
     EXPECT_EQ(again.request(get("/")).code, 200);
     server.stop();
 }
+
+#ifdef _WIN32
+TEST(HttpServerMetricsTest, WindowsReactorLimitRefusesInsteadOfStalling)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    server.route("/", [](const HttpRequest&, HttpResponse& res) {
+        res.set_content("ok");
+        return 200;
+    });
+    server.start();
+    std::vector<std::unique_ptr<RawConn>> conns;
+    for (size_t i = 0; i < Reactor::maxSockets() + 4; ++i)
+    {
+        conns.push_back(std::make_unique<RawConn>(port));
+    }
+    ASSERT_TRUE(waitFor([&]() { return server.metrics().connectionsRefused >= 5; }));
+    conns.resize(10);  // free reactor slots
+    ASSERT_TRUE(waitFor([&]() { return server.metrics().connectionsActive <= 10; }));
+    RawConn c(port);
+    ASSERT_TRUE(c.connected());
+    EXPECT_EQ(c.request(get("/")).code, 200);  // the server still works
+    server.stop();
+}
+#endif
 
 TEST(HttpServerMetricsTest, FormatPrometheusIsStatic)
 {
