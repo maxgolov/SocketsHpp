@@ -1612,6 +1612,13 @@ namespace http
                 isUnix = (addr.m_data.sa_family == AF_UNIX);
                 addr.isUnixDomain = isUnix;
 #endif
+                // Portable fallback for platforms where SO_ACCEPTCONN cannot be queried
+                // (the check above is then skipped, e.g. on macOS): a TCP socket without
+                // a bound port is certainly not listening.
+                if (!isUnix && addr.port() == 0)
+                {
+                    throw std::invalid_argument("adoptListeningSocket: socket is not bound");
+                }
                 sock.setNonBlocking();
                 sock.setCloseOnExec();
                 registerListeningSocket(sock, addr, isUnix);
