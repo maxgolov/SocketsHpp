@@ -1380,6 +1380,9 @@ namespace http
                             {
                                 Socket sock = conn.socket;
                                 conn.state = Connection::ProcessingAsync;  // prevent re-entry
+                                // Do not leave EPOLLOUT armed while the worker is blocked waiting for
+                                // SSE events; writable keep-alive sockets are always ready on Linux.
+                                m_reactor.addSocket(sock, Reactor::Readable | Reactor::Closed);
                                 auto streamCb  = conn.response.streamCallback;  // copy by value
                                 auto onEndCb   = conn.response.onStreamEnd;     // copy by value
                                 bool kaAllowed = allowKeepalive;
