@@ -1,8 +1,8 @@
 // Copyright Max Golovanov.
 // SPDX-License-Identifier: Apache-2.0
 
-// MCPServer listening on a Unix domain socket (ServerConfig::unixSocketPath),
-// driven with HttpClient::setUnixSocketPath().
+// MCPServer Unix-domain listening and configurable HTTP worker concurrency,
+// driven with HttpClient over TCP and Unix-domain sockets.
 
 #include <gtest/gtest.h>
 
@@ -139,7 +139,8 @@ TEST_P(McpWorkerPoolTest, ConfiguredConcurrency)
         if (workers == 0) workers = 4;
     }
     const size_t expected = std::min<size_t>(workers, 6);
-    const size_t requests = expected == 1 ? 2 : expected;
+    const bool checkLimit = workers <= 6;  // Bound automatic-mode fanout on large hosts.
+    const size_t requests = expected + (checkLimit ? 1 : 0);
     std::mutex mutex;
     std::condition_variable cv;
     size_t entered = 0;
@@ -194,15 +195,15 @@ TEST_P(McpWorkerPoolTest, ConfiguredConcurrency)
     {
         std::unique_lock<std::mutex> lock(mutex);
         reached = cv.wait_for(lock, std::chrono::seconds(5), [&] { return entered >= expected; });
-        if (expected == 1)
-            exceeded = cv.wait_for(lock, std::chrono::milliseconds(250), [&] { return entered > 1; });
+        if (checkLimit)
+            exceeded = cv.wait_for(lock, std::chrono::milliseconds(250), [&] { return entered > expected; });
         released = true;
     }
     cv.notify_all();
     for (auto& client : clients) client.join();
     server.stop();
     EXPECT_TRUE(reached) << "configured workers did not enter together";
-    EXPECT_FALSE(exceeded) << "a single-worker pool ran handlers concurrently";
+    EXPECT_FALSE(exceeded) << "pool exceeded the configured worker count";
     EXPECT_EQ(completed.load(), requests);
 }
 

@@ -96,8 +96,11 @@ Key points:
   uses hardware concurrency (4 if unknown); set `4` explicitly to retain the
   previous fixed size. This applies to both TCP and Unix-domain HTTP listeners;
   STDIO ignores the setting. Handlers on different connections must be thread-safe.
-  `port()` returns the bound port (useful with
-  `config.port = 0`), or -1 before `listen()`. `stop()` closes all notification streams
+  With one worker (explicit or automatic), HTTP cancellation and SSE notifications
+  wait behind a running handler. Leave worker capacity for control requests and
+  notification streams.
+  `port()` returns the bound port (useful with `config.port = 0`), or -1 before
+  `listen()`. `stop()` closes all notification streams
   and stops the HTTP server. `listen()` throws for `TransportType::STDIO`.
 - **Loopback guard:** `listen()` refuses to bind anything other than `127.0.0.1`,
   `localhost`, `::1` or `[::1]` unless `config.allowNonLoopback = true`. `0.0.0.0`

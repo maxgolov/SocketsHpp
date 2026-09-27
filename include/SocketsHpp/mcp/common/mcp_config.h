@@ -384,6 +384,9 @@ namespace mcp
         /// @note Applies to TCP and Unix domain listeners; ignored for STDIO.
         ///       Handlers on different connections must be thread-safe. Set 4
         ///       explicitly to retain the previous fixed pool size.
+        /// @warning With one worker (explicit or automatic), HTTP cancellation and
+        ///          SSE notifications wait behind a running handler. Leave worker
+        ///          capacity for control requests and notification streams.
         size_t workerThreads = 0;
 
         /// @brief Override settings from command-line arguments. Unknown arguments are ignored.

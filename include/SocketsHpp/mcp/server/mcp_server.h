@@ -698,8 +698,7 @@ namespace mcp
             ///
             /// Binds only to ServerConfig::host and ServerConfig::port (0 = ephemeral; see
             /// port()) and sizes the handler pool using ServerConfig::workerThreads.
-            /// No-op if already
-            /// running (the loopback guard is still checked first).
+            /// No-op if already running (the loopback guard is still checked first).
             /// SSRF guard: refuses a host other than "127.0.0.1", "localhost", "::1" or
             /// "[::1]" unless ServerConfig::allowNonLoopback is true.
             /// With ServerConfig::unixSocketPath set, binds only that Unix domain socket
