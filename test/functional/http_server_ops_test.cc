@@ -1009,3 +1009,116 @@ TEST(HttpServerDrainTest, ShutdownWithoutStartOrConnections)
     EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
     EXPECT_FALSE(RawConn(port2).connected());
 }
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+TEST(HttpServerMetricsTest, CountersAndPrometheusEndpoint)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    server.enableMetricsEndpoint();
+    server.route("/ok", [](const HttpRequest&, HttpResponse& res) {
+        res.set_content("fine");
+        return 200;
+    });
+    server.route("/boom", [](const HttpRequest&, HttpResponse&) -> int { throw std::runtime_error("x"); });
+    server.start();
+
+    {
+        RawConn c(port);
+        ASSERT_TRUE(c.connected());
+        EXPECT_EQ(c.request(get("/ok")).code, 200);
+        EXPECT_EQ(c.request(get("/ok")).code, 200);
+        EXPECT_EQ(c.request(get("/missing")).code, 404);
+        EXPECT_EQ(c.request(get("/boom")).code, 500);
+        EXPECT_EQ(c.request(get("/metrics/other")).code, 404);  // exact path only
+    }
+    {
+        RawConn bad(port);
+        ASSERT_TRUE(bad.connected());
+        EXPECT_EQ(bad.request("BROKEN\r\n\r\n").code, 400);
+    }
+
+    ASSERT_TRUE(waitFor([&]() { return server.metrics().connectionsActive == 0; }));
+    HttpServerMetrics m = server.metrics();
+    EXPECT_EQ(m.connectionsAccepted, 2u);
+    EXPECT_EQ(m.connectionsRefused, 0u);
+    EXPECT_EQ(m.requestsTotal, 6u);
+    EXPECT_EQ(m.responsesByClass[1], 2u);  // 2xx
+    EXPECT_EQ(m.responsesByClass[3], 3u);  // 4xx: 404, 404, 400
+    EXPECT_EQ(m.responsesByClass[4], 1u);  // 5xx
+    EXPECT_GT(m.bytesReceived, 0u);
+    EXPECT_GT(m.bytesSent, m.bytesReceived);
+
+    RawConn c(port);
+    RawResponse res = c.request(get("/metrics?x=1"));
+    ASSERT_TRUE(res.complete);
+    EXPECT_EQ(res.code, 200);
+    EXPECT_EQ(res.header("content-type"), "text/plain; version=0.0.4; charset=utf-8");
+    const std::string& text = res.body;
+    EXPECT_NE(text.find("# TYPE socketshpp_http_connections_accepted_total counter\n"
+                        "socketshpp_http_connections_accepted_total 3\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("socketshpp_http_connections_active 1\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("# TYPE socketshpp_http_connections_active gauge\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("socketshpp_http_responses_total{code=\"2xx\"} 2\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("socketshpp_http_responses_total{code=\"4xx\"} 3\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("socketshpp_http_responses_total{code=\"5xx\"} 1\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("socketshpp_http_requests_total 7\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("socketshpp_http_sent_bytes_total "), std::string::npos) << text;
+    EXPECT_EQ(text.back(), '\n');
+
+    RawResponse post = c.request("POST /metrics HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
+    EXPECT_EQ(post.code, 404);  // only GET is answered
+    server.stop();
+}
+
+TEST(HttpServerMetricsTest, MaxConnectionsRefusesAndTimeoutsAreCounted)
+{
+    HttpServer server;
+    int port = server.addListeningPort("127.0.0.1", 0);
+    server.setMaxConnections(2);
+    server.setIdleTimeout(std::chrono::milliseconds(300));
+    server.route("/", [](const HttpRequest&, HttpResponse& res) {
+        res.set_content("ok");
+        return 200;
+    });
+    server.start();
+
+    RawConn a(port);
+    RawConn b(port);
+    ASSERT_TRUE(a.connected());
+    ASSERT_TRUE(b.connected());
+    EXPECT_EQ(a.request(get("/")).code, 200);
+    EXPECT_EQ(b.request(get("/")).code, 200);
+
+    RawConn refused(port);  // TCP connect succeeds (backlog), then the server closes it
+    ASSERT_TRUE(refused.connected());
+    EXPECT_TRUE(refused.waitForClose(3000));
+    EXPECT_EQ(server.metrics().connectionsRefused, 1u);
+
+    // a and b go idle and are closed by the idle timeout.
+    EXPECT_TRUE(a.waitForClose(3000));
+    EXPECT_TRUE(b.waitForClose(3000));
+    ASSERT_TRUE(waitFor([&]() { return server.metrics().timeouts >= 2; }));
+    HttpServerMetrics m = server.metrics();
+    EXPECT_EQ(m.connectionsAccepted, 2u);
+    EXPECT_EQ(m.connectionsActive, 0u);
+
+    RawConn again(port);  // room again
+    ASSERT_TRUE(again.connected());
+    EXPECT_EQ(again.request(get("/")).code, 200);
+    server.stop();
+}
+
+TEST(HttpServerMetricsTest, FormatPrometheusIsStatic)
+{
+    HttpServerMetrics m;
+    m.connectionsAccepted = 7;
+    m.responsesByClass[2] = 3;
+    const std::string text = HttpServer::formatPrometheus(m);
+    EXPECT_NE(text.find("socketshpp_http_connections_accepted_total 7\n"), std::string::npos);
+    EXPECT_NE(text.find("socketshpp_http_responses_total{code=\"3xx\"} 3\n"), std::string::npos);
+    EXPECT_NE(text.find("# HELP socketshpp_http_timeouts_total "), std::string::npos);
+}

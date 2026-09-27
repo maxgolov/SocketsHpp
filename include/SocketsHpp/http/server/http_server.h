@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <cctype>
@@ -1002,6 +1003,27 @@ namespace http
             };
         };
 
+        /// @brief Snapshot of HttpServer counters, returned by HttpServer::metrics().
+        ///
+        /// Counters are cumulative since the server was constructed; connectionsActive is
+        /// the current number of open client connections.
+        struct HttpServerMetrics
+        {
+            uint64_t connectionsAccepted = 0;  ///< Client connections accepted.
+            /// @brief Connections closed right after accept because a limit was reached
+            ///        (HttpServer::setMaxConnections(), or the 64-socket reactor limit on Windows).
+            uint64_t connectionsRefused = 0;
+            uint64_t connectionsActive = 0;    ///< Open client connections now (gauge).
+            uint64_t requestsTotal = 0;        ///< Requests processed (including rejected ones and handler -1).
+            /// @brief Responses by status class: [0] = 1xx, [1] = 2xx, ... [4] = 5xx.
+            ///        Includes error responses the server generated (400, 408, 413, 431, ...).
+            uint64_t responsesByClass[5] = { 0, 0, 0, 0, 0 };
+            /// @brief Connections closed or answered 408 by the idle / request timeouts.
+            uint64_t timeouts = 0;
+            uint64_t bytesReceived = 0;        ///< Bytes read from client sockets.
+            uint64_t bytesSent = 0;            ///< Bytes written to client sockets.
+        };
+
         /// @brief Small embeddable HTTP/1.x server driven by a single reactor thread.
         ///
         /// Typical use:
@@ -1187,6 +1209,28 @@ namespace http
             std::atomic<bool> m_stopped{false};  ///< Set by stop(); cleared by start().
             /// @brief Set by shutdown(): no keep-alive, streams end, idle connections close.
             std::atomic<bool> m_draining{false};
+            /// @brief Maximum open client connections (setMaxConnections()); 0 = unlimited.
+            size_t m_maxConnections{ 0 };
+
+            /// @brief Live counters behind metrics() (relaxed atomics).
+            struct MetricCounters
+            {
+                std::atomic<uint64_t> connectionsAccepted{ 0 };  ///< See HttpServerMetrics.
+                std::atomic<uint64_t> connectionsRefused{ 0 };   ///< See HttpServerMetrics.
+                std::atomic<uint64_t> requestsTotal{ 0 };        ///< See HttpServerMetrics.
+                std::atomic<uint64_t> responsesByClass[5] = {};  ///< See HttpServerMetrics.
+                std::atomic<uint64_t> timeouts{ 0 };             ///< See HttpServerMetrics.
+                std::atomic<uint64_t> bytesReceived{ 0 };        ///< See HttpServerMetrics.
+                std::atomic<uint64_t> bytesSent{ 0 };            ///< See HttpServerMetrics.
+                /// @brief m_connections.size(), updated under m_connectionsMutex whenever it changes.
+                std::atomic<uint64_t> connectionsActive{ 0 };
+            } m_metrics;  ///< Counters (see metrics()).
+
+            /// @brief Add @p n to counter @p counter (relaxed).
+            static void bump(std::atomic<uint64_t>& counter, uint64_t n = 1)
+            {
+                counter.fetch_add(n, std::memory_order_relaxed);
+            }
 
             /// @brief Idle timeout (setIdleTimeout()); 0 = disabled.
             std::chrono::milliseconds m_idleTimeout{ config::HTTP_IDLE_TIMEOUT_MS };
@@ -2004,6 +2048,7 @@ namespace http
                         }
                     }
                     m_connections.clear();
+                    m_metrics.connectionsActive.store(0, std::memory_order_relaxed);
                 }
                 LOG_INFO("HttpServer: shut down (%s)", drained ? "drained" : "deadline reached");
                 return drained;
@@ -2011,6 +2056,92 @@ namespace http
 
             /// @brief Whether shutdown() has begun.
             bool isDraining() const { return m_draining.load(); }
+
+            /// @brief Limit the number of open client connections; a connection accepted
+            ///        beyond it is closed at once (counted in
+            ///        HttpServerMetrics::connectionsRefused).
+            /// @param maxConnections Limit; 0 (default) = unlimited. On Windows the
+            ///        reactor's 64-socket limit (listening sockets included) always applies.
+            /// @note Call before start().
+            void setMaxConnections(size_t maxConnections) { m_maxConnections = maxConnections; }
+
+            /// @brief Snapshot of the server's counters.
+            /// @note Thread-safe and lock-free; may be called from a handler.
+            HttpServerMetrics metrics() const
+            {
+                HttpServerMetrics m;
+                m.connectionsAccepted = m_metrics.connectionsAccepted.load(std::memory_order_relaxed);
+                m.connectionsRefused = m_metrics.connectionsRefused.load(std::memory_order_relaxed);
+                m.requestsTotal = m_metrics.requestsTotal.load(std::memory_order_relaxed);
+                for (size_t i = 0; i < 5; ++i)
+                {
+                    m.responsesByClass[i] = m_metrics.responsesByClass[i].load(std::memory_order_relaxed);
+                }
+                m.timeouts = m_metrics.timeouts.load(std::memory_order_relaxed);
+                m.bytesReceived = m_metrics.bytesReceived.load(std::memory_order_relaxed);
+                m.bytesSent = m_metrics.bytesSent.load(std::memory_order_relaxed);
+                m.connectionsActive = m_metrics.connectionsActive.load(std::memory_order_relaxed);
+                return m;
+            }
+
+            /// @brief Format @p m in the Prometheus text exposition format (version 0.0.4).
+            ///
+            /// Metric names: socketshpp_http_connections_accepted_total,
+            /// socketshpp_http_connections_refused_total, socketshpp_http_connections_active
+            /// (gauge), socketshpp_http_requests_total, socketshpp_http_responses_total{code="1xx".."5xx"},
+            /// socketshpp_http_timeouts_total, socketshpp_http_received_bytes_total and
+            /// socketshpp_http_sent_bytes_total.
+            /// @param m Snapshot from metrics().
+            /// @return The exposition text (ends with a newline).
+            static std::string formatPrometheus(const HttpServerMetrics& m)
+            {
+                std::ostringstream os;
+                auto metric = [&os](const char* name, const char* type, const char* help, uint64_t value) {
+                    os << "# HELP " << name << ' ' << help << "\n# TYPE " << name << ' ' << type << '\n'
+                       << name << ' ' << value << '\n';
+                };
+                metric("socketshpp_http_connections_accepted_total", "counter", "Client connections accepted.",
+                    m.connectionsAccepted);
+                metric("socketshpp_http_connections_refused_total", "counter",
+                    "Client connections closed at accept because a connection limit was reached.",
+                    m.connectionsRefused);
+                metric("socketshpp_http_connections_active", "gauge", "Open client connections.", m.connectionsActive);
+                metric("socketshpp_http_requests_total", "counter", "Requests processed.", m.requestsTotal);
+                os << "# HELP socketshpp_http_responses_total Responses by status class.\n"
+                      "# TYPE socketshpp_http_responses_total counter\n";
+                for (size_t i = 0; i < 5; ++i)
+                {
+                    os << "socketshpp_http_responses_total{code=\"" << (i + 1) << "xx\"} " << m.responsesByClass[i] << '\n';
+                }
+                metric("socketshpp_http_timeouts_total", "counter",
+                    "Connections closed or answered 408 by the idle or request timeout.", m.timeouts);
+                metric("socketshpp_http_received_bytes_total", "counter", "Bytes received from clients.",
+                    m.bytesReceived);
+                metric("socketshpp_http_sent_bytes_total", "counter", "Bytes sent to clients.", m.bytesSent);
+                return os.str();
+            }
+
+            /// @brief Serve metrics() at @p path in the Prometheus text format
+            ///        (Content-Type "text/plain; version=0.0.4; charset=utf-8").
+            ///
+            /// Only GET (and HEAD) requests for exactly @p path (a query string is
+            /// ignored) are answered; anything else falls through to other routes.
+            /// @param path URL path, default "/metrics".
+            /// @note Register before start(). The endpoint is public to anyone who can
+            ///       reach the server: guard it (e.g. only expose it on a loopback or Unix
+            ///       socket listener behind a proxy) if the numbers are sensitive.
+            void enableMetricsEndpoint(const std::string& path = "/metrics")
+            {
+                route(path, [this, path](const HttpRequest& req, HttpResponse& res) {
+                    const std::string target = req.uri.substr(0, req.uri.find('?'));
+                    if (target != path || req.method != "GET")
+                    {
+                        return 0;  // decline: let other routes / fallbacks handle it
+                    }
+                    res.set_content(formatPrometheus(metrics()), "text/plain; version=0.0.4; charset=utf-8");
+                    return 200;
+                });
+            }
 
         protected:
             /// @brief Reactor callback: accept a client on listening socket @p socket
@@ -2043,7 +2174,20 @@ namespace http
                 const std::string client = isUnix ? std::string("unix") : caddr.toString();
                 {
                     std::lock_guard<std::mutex> lock(m_connectionsMutex);
+                    // Windows: one more socket would make WSAWaitForMultipleEvents() fail
+                    // for every socket, stalling the whole server.
+                    const bool reactorFull = m_reactor.socketCount() >= Reactor::maxSockets();
+                    if (reactorFull || (m_maxConnections != 0 && m_connections.size() >= m_maxConnections))
+                    {
+                        LOG_WARN("HttpServer: [%s] connection limit reached (%zu open) - refusing",
+                            client.c_str(), m_connections.size());
+                        bump(m_metrics.connectionsRefused);
+                        csocket.close();
+                        return;
+                    }
+                    bump(m_metrics.connectionsAccepted);
                     Connection& conn = m_connections[csocket];
+                    m_metrics.connectionsActive.store(m_connections.size(), std::memory_order_relaxed);
                     conn.socket = csocket;
                     conn.state = Connection::Idle;
                     conn.request.client = client;
@@ -2083,6 +2227,7 @@ namespace http
                     return;
                 }
                 conn.receiveBuffer.append(buffer, buffer + received);
+                bump(m_metrics.bytesReceived, static_cast<uint64_t>(received));
                 conn.lastActivity = std::chrono::steady_clock::now();
 
                 handleConnection(conn);  // May close and erase conn - must be the last use
@@ -2213,6 +2358,7 @@ namespace http
             /// @warning May close and erase conn; callers must not use it afterwards.
             void onConnectionTimeout(Connection& conn)
             {
+                bump(m_metrics.timeouts);
                 if (conn.state == Connection::ReceivingHeaders || conn.state == Connection::ReceivingBody ||
                     conn.state == Connection::ReceivingChunkedBody)
                 {
@@ -2293,6 +2439,7 @@ namespace http
                     break;  // Socket buffer full - retry when writable
                 }
                 conn.sendBuffer.erase(0, offset);
+                bump(m_metrics.bytesSent, offset);
 
                 if (!conn.sendBuffer.empty())
                 {
@@ -2357,6 +2504,7 @@ namespace http
                 {
                     m_connections.erase(connIt);
                 }
+                m_metrics.connectionsActive.store(m_connections.size(), std::memory_order_relaxed);
             }
 
             /// @brief Drive the connection state machine.
@@ -3517,6 +3665,8 @@ namespace http
                 conn.response.streamCallback = nullptr;
                 conn.response.onStreamEnd = nullptr;
 
+                bump(m_metrics.requestsTotal);
+
                 // Store original method for HEAD handling
                 std::string originalMethod = conn.request.method;
                 bool isHeadRequest = (conn.request.method == "HEAD");
@@ -3648,6 +3798,10 @@ namespace http
                 if (conn.response.message.empty())
                 {
                     conn.response.message = getDefaultResponseMessage(conn.response.code);
+                }
+                if (conn.response.code >= 100 && conn.response.code < 600)
+                {
+                    bump(m_metrics.responsesByClass[conn.response.code / 100 - 1]);
                 }
 
                 // Decide on connection persistence before emitting the Connection header,
