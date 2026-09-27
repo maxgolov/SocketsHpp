@@ -25,7 +25,7 @@ Protects routes with the library's authentication helpers from
 From the repository root:
 
 ```bash
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target authenticated-api
 ```
 

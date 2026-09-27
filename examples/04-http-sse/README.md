@@ -7,7 +7,7 @@ Real-time event streaming with Server-Sent Events, plus a small browser client.
 From the repository root:
 
 ```bash
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target http-sse
 ```
 

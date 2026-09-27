@@ -41,7 +41,7 @@ cmake -S . -B build/linux-arm64 -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE=.arm64-env/arm64-toolchain.cmake \
     -DCMAKE_BUILD_TYPE=Debug \
     -DSOCKETSHPP_BUILD_TESTS=ON \
-    -DBUILD_EXAMPLES=ON \
+    -DSOCKETSHPP_BUILD_EXAMPLES=ON \
     -DCMAKE_CROSSCOMPILING_EMULATOR="/usr/bin/qemu-aarch64-static;-L;/usr/aarch64-linux-gnu"
 cmake --build build/linux-arm64 --parallel
 

@@ -24,7 +24,7 @@ ctest --test-dir build -C Debug --output-on-failure
 ```
 
 If GoogleTest is installed in a non-default prefix (Homebrew, a custom build), pass
-`-DCMAKE_PREFIX_PATH=<prefix>`. Useful extras: `-DENABLE_ASAN=ON -DENABLE_UBSAN=ON`,
+`-DCMAKE_PREFIX_PATH=<prefix>`. Useful extras: `-DSOCKETSHPP_ENABLE_ASAN=ON -DSOCKETSHPP_ENABLE_UBSAN=ON`,
 `-DSOCKETSHPP_WARNINGS_AS_ERRORS=ON`. For ARM64 under QEMU see
 [docs/ARM64.md](../docs/ARM64.md); for MinGW-w64 under Wine see the
 [README](../README.md#cross-compiling).

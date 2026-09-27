@@ -27,7 +27,7 @@ headers, so they are honoured only when the direct peer is a trusted proxy.
 From the repository root:
 
 ```bash
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target proxy-aware-server
 ```
 

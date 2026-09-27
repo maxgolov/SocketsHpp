@@ -9,7 +9,7 @@ Build the examples from the repository root together with the library:
 
 ```bash
 git submodule update --init --recursive      # nlohmann-json, needed by sockets.hpp
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --parallel               # or: --target http-server
 ```
 
@@ -56,7 +56,7 @@ For the MCP API in depth, see [docs/MCP_IMPLEMENTATION.md](../docs/MCP_IMPLEMENT
 ## Adding an example
 
 1. Create a numbered directory with `main.cpp`, `CMakeLists.txt` and `README.md`.
-2. Add it to the `BUILD_EXAMPLES` block of the top-level `CMakeLists.txt`.
+2. Add it to the `SOCKETSHPP_BUILD_EXAMPLES` block of the top-level `CMakeLists.txt`.
 3. Add a row to the table above.
 
 ## License

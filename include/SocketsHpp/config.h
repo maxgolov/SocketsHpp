@@ -68,7 +68,8 @@ namespace config
     constexpr int DEFAULT_SESSION_TIMEOUT_SECONDS = 3600;
 
     /// @brief Default SSE resumability history duration, in milliseconds (5 minutes).
-    /// @note Stored by the session manager but not currently enforced.
+    /// Events older than this are dropped from a session's history and can no longer
+    /// be replayed with Last-Event-ID.
     constexpr int DEFAULT_HISTORY_DURATION_MS = 300000;
 
     /// @brief Default maximum SSE events kept per session for resumability (oldest dropped).

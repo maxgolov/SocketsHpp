@@ -1,5 +1,5 @@
 # Shared setup for the examples. Each example can be built either from the
-# top-level project (-DBUILD_EXAMPLES=ON) or on its own:
+# top-level project (-DSOCKETSHPP_BUILD_EXAMPLES=ON) or on its own:
 #   cmake -S examples/03-http-server -B build-example && cmake --build build-example
 # In the standalone case the SocketsHpp project is pulled in with add_subdirectory
 # so the example gets the same SocketsHpp::SocketsHpp target (include paths,

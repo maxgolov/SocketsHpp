@@ -14,7 +14,7 @@ nlohmann-json (installed by vcpkg as a SocketsHpp dependency):
 | `/echo?msg=...` | `{"echo": "<msg>"}`; 400 with a JSON error for a malformed query string |
 | `/json` | A sample JSON document |
 
-This example is not part of the top-level `BUILD_EXAMPLES` build; build it on its own.
+This example is not part of the top-level `SOCKETSHPP_BUILD_EXAMPLES` build; build it on its own.
 CI builds and runs it through the port on every push (`scripts/test-vcpkg-port.sh`).
 
 ## Prerequisites

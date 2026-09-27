@@ -875,10 +875,8 @@ static void run_cancellation(const std::string& idLiteral)
     worker.join();
     auto elapsed = std::chrono::steady_clock::now() - t0;
 
-    auto d = json::parse(resp);
-    EXPECT_EQ(d["id"], json::parse(idLiteral));
-    ASSERT_TRUE(d.contains("error")) << resp;
-    EXPECT_NE(d["error"]["message"].get<std::string>().find("cancelled"), std::string::npos);
+    // MCP: the receiver of notifications/cancelled should not answer the request.
+    EXPECT_TRUE(resp.empty()) << "a cancelled request gets no response: " << resp;
     EXPECT_LT(elapsed, std::chrono::seconds(4)) << "handler must observe the cancel token";
 }
 
@@ -1437,16 +1435,17 @@ TEST(McpCancellationTest, CancelIsScopedToSession)
             json_headers({{"Mcp-Session-Id", canceller}}));
         EXPECT_EQ(cancel.status, 202);
         worker.join();
-        EXPECT_EQ(slowResp.status, 200);
-        return json::parse(slowResp.body);
+        return slowResp;
     };
 
     // Session B cannot cancel session A's request id 1...
     auto fromOther = runSlow(initB.session_id);
-    EXPECT_EQ(fromOther["result"]["cancelled"], false) << fromOther.dump();
-    // ...but session A can.
+    ASSERT_EQ(fromOther.status, 200);
+    EXPECT_EQ(json::parse(fromOther.body)["result"]["cancelled"], false) << fromOther.body;
+    // ...but session A can; a cancelled request gets no response (202, empty body).
     auto fromOwner = runSlow(initA.session_id);
-    EXPECT_EQ(fromOwner["result"]["cancelled"], true) << fromOwner.dump();
+    EXPECT_EQ(fromOwner.status, 202);
+    EXPECT_TRUE(fromOwner.body.empty()) << fromOwner.body;
 }
 
 // Legacy HTTP transport with ResponseMode::STREAM answers initialize as one SSE
@@ -1774,4 +1773,57 @@ TEST(McpOriginTest, ParseEnvAndArgs)
     fromArgs.parseArgs(3, const_cast<char**>(argv));
     ASSERT_EQ(fromArgs.allowedOrigins.size(), 1u);
     EXPECT_EQ(fromArgs.allowedOrigins[0], "https://c.example");
+}
+
+// A cancelled request over HTTP ends with 202 and no body; the handler may also
+// return normally after seeing the token.
+TEST_F(StreamableHttpTest, CancelledRequestGetsNoResponse)
+{
+    std::atomic<bool> started{false};
+    server_->registerCancellable("slow", [&](const json&, std::shared_ptr<std::atomic<bool>> cancel) -> json {
+        started = true;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!cancel->load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return {{"partial", true}};
+    });
+    std::string session = do_init();
+
+    TestHttpResponse slow;
+    std::thread worker([&]() {
+        slow = http_post(port_, R"({"jsonrpc":"2.0","id":41,"method":"slow"})", session);
+    });
+    for (int i = 0; i < 1000 && !started; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    ASSERT_TRUE(started.load());
+    auto cancel = http_post(port_,
+        R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":41}})", session);
+    EXPECT_EQ(cancel.status, 202);
+    worker.join();
+    EXPECT_EQ(slow.status, 202);
+    EXPECT_TRUE(slow.body.empty()) << slow.body;
+}
+
+// Responses POSTed by a client are accepted (202) and ignored, alone or in a batch.
+TEST_F(StreamableHttpTest, ClientResponsesAreAcceptedWith202)
+{
+    std::string session = do_init();
+    auto single = http_post(port_, R"({"jsonrpc":"2.0","id":"srv-1","result":{}})", session);
+    EXPECT_EQ(single.status, 202);
+    EXPECT_TRUE(single.body.empty());
+    auto error = http_post(port_,
+        R"({"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"no"}})", session);
+    EXPECT_EQ(error.status, 202);
+
+    auto batch = http_post(port_,
+        R"([{"jsonrpc":"2.0","id":7,"result":{}},{"jsonrpc":"2.0","id":8,"method":"ping"}])", session);
+    EXPECT_EQ(batch.status, 200);
+    auto arr = json::parse(batch.body);
+    ASSERT_TRUE(arr.is_array());
+    ASSERT_EQ(arr.size(), 1u) << batch.body;
+    EXPECT_EQ(arr[0]["id"], 8);
+
+    // A message with neither method nor result/error is still invalid.
+    auto bad = http_post(port_, R"({"jsonrpc":"2.0","id":9})", session);
+    EXPECT_EQ(bad.status, 400);
 }

@@ -150,8 +150,9 @@ The client's `capabilities` are stored per session and can be read with
   `-32600 Invalid Request`, as are messages whose `jsonrpc` member is present but not
   `"2.0"` (a missing `jsonrpc` is tolerated), whose `method` is missing, or whose
   `params` is not an object or array.
-- JSON-RPC *responses* sent by a client are rejected with `-32600` (HTTP 400): the
-  server never sends requests to clients, so it does not expect responses.
+- JSON-RPC *responses* sent by a client (an `id` with `result` or `error` and no
+  `method`) are accepted with `202 Accepted` and ignored: the server never sends
+  requests to clients, so there is nothing to match them with.
 - Notifications (no `id`) never get a response; errors in notification handlers are
   logged and dropped.
 
@@ -256,9 +257,10 @@ server.registerCancellable("tools/call",
 
 A `notifications/cancelled` with `params.requestId` equal to the in-flight request's
 JSON-RPC id (and sent in the same session) sets the token. Handlers run on the HTTP
-server's worker pool, so the notification is processed while the request runs. The
-exception thrown above is still sent back as an error response (`-32603`); the server
-does not suppress responses to cancelled requests.
+server's worker pool, so the notification is processed while the request runs. If the
+token is set when the handler finishes (whether it returns or throws), no response is
+sent for that request, as the spec asks: the POST gets `202 Accepted` with an empty
+body (or the entry is left out of a batch), and `processMessage()` returns `""`.
 
 ### Authentication
 

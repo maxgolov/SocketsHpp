@@ -44,14 +44,14 @@ target_link_libraries(myapp PRIVATE SocketsHpp::SocketsHpp)
 
 Notes:
 
-- Tests and examples are off by default (`SOCKETSHPP_BUILD_TESTS`, `BUILD_EXAMPLES`), so
-  GoogleTest is not required. `BUILD_EXAMPLES`, `ENABLE_ASAN` and `ENABLE_UBSAN` are
-  not prefixed, so a parent project that sets them affects SocketsHpp too.
-- If the `VCPKG_ROOT` environment variable is set and no toolchain file is given,
-  SocketsHpp's CMakeLists includes the vcpkg toolchain itself
-  (`cmake/detect-vcpkg.cmake`); unset it or pass `-DCMAKE_TOOLCHAIN_FILE` explicitly to
-  avoid that. Install rules are off in subproject builds
-  (`SOCKETSHPP_INSTALL` defaults to `ON` only for top-level builds).
+- Tests and examples are off by default (`SOCKETSHPP_BUILD_TESTS`,
+  `SOCKETSHPP_BUILD_EXAMPLES`), so GoogleTest is not required. All options are
+  prefixed with `SOCKETSHPP_`; the old unprefixed names (`BUILD_EXAMPLES`,
+  `ENABLE_ASAN`, `ENABLE_UBSAN`) are only honoured in top-level builds, so your
+  project's own options do not affect SocketsHpp.
+- Install rules are off in subproject builds (`SOCKETSHPP_INSTALL` defaults to `ON`
+  only for top-level builds), and the `VCPKG_ROOT` auto-detection only applies to
+  top-level builds.
 - `SocketsHpp::SocketsHpp` carries nlohmann/json (needed by `sockets.hpp` and the MCP
   headers): an existing `nlohmann_json::nlohmann_json` target or package is used if
   present when SocketsHpp is added, otherwise the bundled `external/nlohmann-json`

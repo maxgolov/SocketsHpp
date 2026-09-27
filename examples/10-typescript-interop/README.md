@@ -44,7 +44,7 @@ CI runs both directions on every push (`typescript-interop` job).
 
 ```bash
 # Build the C++ programs (from the repository root)
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target cpp_server cpp_client
 
 # Install the TypeScript dependencies

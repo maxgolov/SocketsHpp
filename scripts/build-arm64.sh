@@ -122,7 +122,7 @@ CMAKE_ARGS=(
 
 # Enable examples if requested
 if [ "$BUILD_EXAMPLES" = true ]; then
-    CMAKE_ARGS+=(-DBUILD_EXAMPLES=ON)
+    CMAKE_ARGS+=(-DSOCKETSHPP_BUILD_EXAMPLES=ON)
 fi
 
 cmake "${CMAKE_ARGS[@]}"

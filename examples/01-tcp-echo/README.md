@@ -10,7 +10,7 @@ needs no other tools and exits with status 0 on success, 1 on failure.
 From the repository root:
 
 ```bash
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target tcp-echo
 ```
 

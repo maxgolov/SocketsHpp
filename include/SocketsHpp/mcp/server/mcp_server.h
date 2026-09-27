@@ -254,6 +254,9 @@ namespace mcp
             /// params.requestId equals the JSON-RPC id of the in-flight request (tokens are
             /// keyed by (session, id)). For STDIO the session is "" and cancellation only
             /// works if the caller runs processMessage() concurrently.
+            /// If the token is set when the handler finishes (returns or throws), no
+            /// response is sent for the request, as the MCP spec asks (HTTP: 202 with an
+            /// empty body, or the entry is left out of a batch; processMessage(): "").
             /// @param method JSON-RPC method name.
             /// @param handler Handler; must be thread-safe on the HTTP transports.
             /// @note Thread-safe. A cancellable "initialize" handler is ignored.
@@ -1673,6 +1676,15 @@ namespace mcp
                     return invalid(replyId, "jsonrpc must be \"2.0\"");
 
                 auto methodIt = msg.find("method");
+                if (methodIt == msg.end() && jsonRpcIdPresent(id) &&
+                    (msg.contains("result") || msg.contains("error")))
+                {
+                    // A JSON-RPC response from the client. This server never sends
+                    // requests to clients, so there is nothing to match it with; accept
+                    // it without a reply (HTTP 202, as the spec requires for responses).
+                    LOG_DEBUG("%s", "MCPServer: ignoring a JSON-RPC response sent by the client");
+                    return out;
+                }
                 if (methodIt == msg.end() || !methodIt->is_string())
                     return invalid(replyId, "Missing or invalid method");
                 const std::string method = methodIt->get<std::string>();
@@ -1692,7 +1704,10 @@ namespace mcp
                     return out;  // notifications never get a response
                 }
 
-                out.response = handleRequest(method, id, params, init).toJson();
+                bool cancelled = false;
+                JsonRpcResponse response = handleRequest(method, id, params, init, cancelled);
+                if (!cancelled)
+                    out.response = response.toJson();  // no reply to a cancelled request
                 return out;
             }
 
@@ -1710,8 +1725,10 @@ namespace mcp
             }
 
             /// @brief Handle a JSON-RPC request (a message with an id)
+            /// @param cancelled Set to true when the request was cancelled while it ran
+            ///        (notifications/cancelled); the caller then sends no response.
             JsonRpcResponse handleRequest(const std::string& method, const JsonRpcId& id,
-                                          const json& params, InitOutcome* init)
+                                          const json& params, InitOutcome* init, bool& cancelled)
             {
                 if (method == "initialize")
                 {
@@ -1779,7 +1796,7 @@ namespace mcp
                 try
                 {
                     json result = entry->cancellable
-                        ? invokeCancellable(entry->cancellable, id, params)
+                        ? invokeCancellable(entry->cancellable, id, params, cancelled)
                         : entry->simple(params);
                     return JsonRpcResponse::success(id, result);
                 }
@@ -1796,8 +1813,10 @@ namespace mcp
             /// @brief Run a cancellable handler with its token registered under
             /// (current session, JSON-RPC id), so notifications/cancelled{requestId} from
             /// the same session can find it.
+            /// @param cancelled Receives whether the token was set when the handler
+            ///        finished (returned or threw).
             json invokeCancellable(const CancellableMethodHandler& handler, const JsonRpcId& id,
-                                   const json& params)
+                                   const json& params, bool& cancelled)
             {
                 auto token = std::make_shared<std::atomic<bool>>(false);
                 const json key = cancellationKey(id);
@@ -1811,14 +1830,16 @@ namespace mcp
                     MCPServer* self;
                     const json& key;
                     const std::shared_ptr<std::atomic<bool>>& token;
+                    bool& cancelled;
                     ~Unregister()
                     {
+                        cancelled = token->load();
                         std::lock_guard<std::mutex> lock(self->m_pendingMutex);
                         auto it = self->m_pendingCancellations.find(key);
                         if (it != self->m_pendingCancellations.end() && it->second == token)
                             self->m_pendingCancellations.erase(it);
                     }
-                } unregister{this, key, token};
+                } unregister{this, key, token, cancelled};
 
                 return handler(params, token);
             }

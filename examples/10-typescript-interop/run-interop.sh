@@ -18,7 +18,7 @@ if [ $# -ge 1 ]; then
     BIN_DIR="$(cd "$1" && pwd)"
 else
     echo "== Building the C++ programs"
-    cmake -S "$ROOT" -B "$ROOT/build-interop" -DBUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
+    cmake -S "$ROOT" -B "$ROOT/build-interop" -DSOCKETSHPP_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
     cmake --build "$ROOT/build-interop" --target cpp_server cpp_client --parallel
     BIN_DIR="$ROOT/build-interop/examples/10-typescript-interop"
 fi

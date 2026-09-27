@@ -1,6 +1,21 @@
 ﻿cmake_minimum_required (VERSION 3.14)
 
+# Top-level builds only: pick up vcpkg from the VCPKG_ROOT environment variable when
+# no toolchain file is given. This must happen before project(); when SocketsHpp is
+# added with add_subdirectory()/FetchContent the parent project's setup is used.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT DEFINED CMAKE_TOOLCHAIN_FILE
+   AND DEFINED ENV{VCPKG_ROOT} AND EXISTS "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING
+        "Toolchain file (vcpkg, from the VCPKG_ROOT environment variable)")
+endif()
+
 project ("SocketsHpp" VERSION 1.0.0)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(SOCKETSHPP_IS_TOP_LEVEL ON)
+else()
+    set(SOCKETSHPP_IS_TOP_LEVEL OFF)
+endif()
 
 # Set C++17 standard
 set(CMAKE_CXX_STANDARD 17)
@@ -27,18 +42,36 @@ if(SOCKETSHPP_WARNINGS_AS_ERRORS)
     endif()
 endif()
 
-# Optional: Enable sanitizers for debug builds
-option(ENABLE_ASAN "Enable Address Sanitizer" OFF)
-option(ENABLE_UBSAN "Enable Undefined Behavior Sanitizer" OFF)
-option(BUILD_EXAMPLES "Build example programs" OFF)
+# Optional sanitizers and examples. The unprefixed names used before 1.1
+# (BUILD_EXAMPLES, ENABLE_ASAN, ENABLE_UBSAN) are still honoured, but only in a
+# top-level build, so a parent project's own options never leak into SocketsHpp.
+set(_socketshpp_asan_default OFF)
+set(_socketshpp_ubsan_default OFF)
+set(_socketshpp_examples_default OFF)
+if(SOCKETSHPP_IS_TOP_LEVEL)
+    foreach(_legacy ASAN UBSAN)
+        if(DEFINED ENABLE_${_legacy})
+            string(TOLOWER ${_legacy} _lower)
+            set(_socketshpp_${_lower}_default ${ENABLE_${_legacy}})
+            message(DEPRECATION "ENABLE_${_legacy} is deprecated; use SOCKETSHPP_ENABLE_${_legacy}")
+        endif()
+    endforeach()
+    if(DEFINED BUILD_EXAMPLES)
+        set(_socketshpp_examples_default ${BUILD_EXAMPLES})
+        message(DEPRECATION "BUILD_EXAMPLES is deprecated; use SOCKETSHPP_BUILD_EXAMPLES")
+    endif()
+endif()
+option(SOCKETSHPP_ENABLE_ASAN "Enable Address Sanitizer (GCC/Clang)" ${_socketshpp_asan_default})
+option(SOCKETSHPP_ENABLE_UBSAN "Enable Undefined Behavior Sanitizer (GCC/Clang)" ${_socketshpp_ubsan_default})
+option(SOCKETSHPP_BUILD_EXAMPLES "Build example programs" ${_socketshpp_examples_default})
 
-if(ENABLE_ASAN AND NOT MSVC)
+if(SOCKETSHPP_ENABLE_ASAN AND NOT MSVC)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
     message(STATUS "Address Sanitizer enabled")
 endif()
 
-if(ENABLE_UBSAN AND NOT MSVC)
+if(SOCKETSHPP_ENABLE_UBSAN AND NOT MSVC)
     add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer)
     add_link_options(-fsanitize=undefined)
     message(STATUS "Undefined Behavior Sanitizer enabled")
@@ -46,9 +79,6 @@ endif()
 
 # Import to detect the platform target architecture
 include(cmake/target-arch.cmake)
-
-# Autodetect dependencies from vcpkg if available
-include(cmake/detect-vcpkg.cmake)
 
 # Tests are opt-in and require GTest. Embedded consumers (add_subdirectory) and
 # plain header-only builds are never forced to provide GTest; CI enables this
@@ -137,12 +167,7 @@ endif()
 
 # Install rules (headers + CMake package). Enabled by default for top-level builds.
 include(CMakePackageConfigHelpers)
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    set(_socketshpp_is_top_level ON)
-else()
-    set(_socketshpp_is_top_level OFF)
-endif()
-option(SOCKETSHPP_INSTALL "Generate install rules for SocketsHpp" ${_socketshpp_is_top_level})
+option(SOCKETSHPP_INSTALL "Generate install rules for SocketsHpp" ${SOCKETSHPP_IS_TOP_LEVEL})
 # The bundled BS_thread_pool.hpp is installed alongside the headers unless the
 # consumer provides it (e.g. the vcpkg port depends on bshoshany-thread-pool).
 option(SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL "Install the bundled BS_thread_pool.hpp" ON)
@@ -178,7 +203,7 @@ if(SOCKETSHPP_BUILD_TESTS)
 endif()
 
 # Build examples if requested
-if(BUILD_EXAMPLES)
+if(SOCKETSHPP_BUILD_EXAMPLES)
     message(STATUS "Building examples")
     
     # Set SOCKETSHPP_INCLUDE_DIR for examples that use find_path

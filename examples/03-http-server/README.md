@@ -8,7 +8,7 @@ parsing and a POST-only route that parses a JSON body.
 From the repository root:
 
 ```bash
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target http-server
 ```
 

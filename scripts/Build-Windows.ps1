@@ -62,7 +62,7 @@ $ConfigureArgs = @(
 )
 
 if ($BuildExamples) {
-    $ConfigureArgs += "-DBUILD_EXAMPLES=ON"
+    $ConfigureArgs += "-DSOCKETSHPP_BUILD_EXAMPLES=ON"
 }
 
 Write-Host "Running: cmake $($ConfigureArgs -join ' ')" -ForegroundColor Gray

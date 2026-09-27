@@ -13,7 +13,7 @@ page at `/`; a client that sends `Accept-Encoding: rle` gets it run-length encod
 From the repository root:
 
 ```bash
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target compression-server
 ```
 

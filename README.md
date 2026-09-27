@@ -160,7 +160,7 @@ Requires CMake 3.20+ for the commands below (3.14+ to consume the library).
 ```bash
 git clone --recursive https://github.com/maxgolov/SocketsHpp.git
 cd SocketsHpp
-cmake -S . -B build -DSOCKETSHPP_BUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_TESTS=ON -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
@@ -181,12 +181,17 @@ CI fails on any undocumented public API.
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `SOCKETSHPP_BUILD_TESTS` | `OFF` | Build the unit/functional tests and header checks (needs GoogleTest) |
-| `BUILD_EXAMPLES` | `OFF` | Build `examples/01`-`10` (example 11 is a separate vcpkg project) |
+| `SOCKETSHPP_BUILD_EXAMPLES` | `OFF` | Build `examples/01`-`10` (example 11 is a separate vcpkg project) |
 | `SOCKETSHPP_WARNINGS_AS_ERRORS` | `OFF` | `-Werror` / `/WX` |
 | `SOCKETSHPP_INSTALL` | `ON` for top-level builds | Generate install rules and the CMake package |
 | `SOCKETSHPP_INSTALL_BUNDLED_THREAD_POOL` | `ON` | Install `external/BS_thread_pool.hpp` with the headers |
-| `ENABLE_ASAN` | `OFF` | AddressSanitizer (GCC/Clang) |
-| `ENABLE_UBSAN` | `OFF` | UndefinedBehaviorSanitizer (GCC/Clang) |
+| `SOCKETSHPP_ENABLE_ASAN` | `OFF` | AddressSanitizer (GCC/Clang) |
+| `SOCKETSHPP_ENABLE_UBSAN` | `OFF` | UndefinedBehaviorSanitizer (GCC/Clang) |
+
+The unprefixed names used before 1.1 (`BUILD_EXAMPLES`, `ENABLE_ASAN`,
+`ENABLE_UBSAN`) still work in top-level builds, with a deprecation message. If the
+`VCPKG_ROOT` environment variable is set and no toolchain file is given, a top-level
+configure uses vcpkg's toolchain automatically.
 
 ### Cross-compiling
 
@@ -747,7 +752,7 @@ targets (built when `SOCKETSHPP_BUILD_TESTS=ON`):
 ## Examples
 
 See [examples/README.md](examples/README.md). Build them with
-`-DBUILD_EXAMPLES=ON`; binaries land in `build/examples/<name>/`.
+`-DSOCKETSHPP_BUILD_EXAMPLES=ON`; binaries land in `build/examples/<name>/`.
 
 | Example | Shows |
 |---------|-------|

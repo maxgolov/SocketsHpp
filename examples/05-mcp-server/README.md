@@ -18,7 +18,7 @@ talks to the official MCP TypeScript SDK.
 From the repository root:
 
 ```bash
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target mcp-server
 ```
 
@@ -93,10 +93,12 @@ An unknown tool or bad arguments give a JSON-RPC error, for example
 `{"error":{"code":-32602,"message":"Unknown tool: nope"},...}`.
 
 **5. Cancel a running call.** Start a 30-second `wait` in the background, then send
-`notifications/cancelled` with its request id; the call ends at once with an error:
+`notifications/cancelled` with its request id. The call ends at once and, as the MCP
+spec asks, the cancelled request gets no response: its POST ends with `202` and an
+empty body.
 
 ```bash
-curl -s http://127.0.0.1:8080/mcp \
+curl -s -o /dev/null -w "wait: %{http_code}\n" http://127.0.0.1:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Mcp-Session-Id: $SESSION" \
@@ -109,7 +111,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/mcp \
   -d '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}}'
 wait
 # 202
-# data: {"error":{"code":-32603,"message":"cancelled"},"id":4,"jsonrpc":"2.0"}
+# wait: 202
 ```
 
 **6. End the session:**
@@ -131,7 +133,8 @@ curl -s -o /dev/null -w "%{http_code}\n" -X DELETE http://127.0.0.1:8080/mcp -H 
   schemas
 - `registerCancellable("tools/call", ...)`: the handler polls its `cancelled` token,
   which a `notifications/cancelled` from the same session sets. Handlers run on
-  `MCPServer`'s worker threads, so the notification is processed while the call runs.
+  `MCPServer`'s worker threads, so the notification is processed while the call runs;
+  the cancelled request then gets no response.
 - `JsonRpcError::invalidParams()` for bad input; any other exception becomes a
   `-32603` internal error
 

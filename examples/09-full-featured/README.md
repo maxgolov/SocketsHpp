@@ -18,7 +18,7 @@ A small notes API that combines the server features shown one at a time in examp
 From the repository root:
 
 ```bash
-cmake -S . -B build -DBUILD_EXAMPLES=ON
+cmake -S . -B build -DSOCKETSHPP_BUILD_EXAMPLES=ON
 cmake --build build --target full-featured-server
 ```
 
