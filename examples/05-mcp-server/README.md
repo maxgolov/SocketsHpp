@@ -2,7 +2,10 @@
 
 A small but complete [Model Context Protocol](https://modelcontextprotocol.io) server
 built with `SocketsHpp::mcp::server::MCPServer`, using the Streamable HTTP transport
-(MCP 2025-03-26) at `http://127.0.0.1:8080/mcp`. It offers two tools:
+at `http://127.0.0.1:8080/mcp` (protocol versions 2025-11-25, 2025-06-18, 2025-03-26
+and 2024-11-05). The tools are registered with `registerTool()` /
+`registerCancellableTool()`, which provide `tools/list` and `tools/call`. It offers two
+tools:
 
 | Tool | Arguments | Result |
 |------|-----------|--------|
@@ -39,14 +42,16 @@ Every POST needs `Content-Type: application/json` and an `Accept` header listing
 `text/event-stream`, each response arrives as one SSE event (`data: {...}`); with
 `Accept: application/json` alone the server answers with plain JSON instead.
 
-**1. Initialize** and keep the session id from the `Mcp-Session-Id` response header:
+**1. Initialize** and keep the session id from the `Mcp-Session-Id` response header.
+The server answers with the client's protocol version when it supports it (otherwise
+with its newest, `2025-11-25`):
 
 ```bash
 curl -s -D headers.txt http://127.0.0.1:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
-# data: {"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2025-03-26","serverInfo":{"name":"example-mcp-server","version":"1.0.0"}}}
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+# data: {"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2025-11-25","serverInfo":{"name":"example-mcp-server","version":"1.0.0"}}}
 
 SESSION=$(grep -i '^mcp-session-id:' headers.txt | cut -d' ' -f2 | tr -d '\r')
 echo "$SESSION"
@@ -54,7 +59,10 @@ echo "$SESSION"
 ```
 
 Every later request must carry `Mcp-Session-Id: $SESSION` (without it: 400; with an
-unknown or deleted id: 404).
+unknown or deleted id: 404). From protocol version 2025-06-18 on, clients also send
+`MCP-Protocol-Version` with the negotiated version; the server answers 400 if it names
+an unsupported version or not the one negotiated, and assumes the negotiated version
+when it is absent.
 
 **2. Confirm initialization** (a notification, so the answer is `202 Accepted` with no body):
 
@@ -63,6 +71,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Mcp-Session-Id: $SESSION" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 # 202
 ```
@@ -74,6 +83,7 @@ curl -s http://127.0.0.1:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Mcp-Session-Id: $SESSION" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 # data: {"id":2,"jsonrpc":"2.0","result":{"tools":[{"description":"Return the given text",...,"name":"echo"},{...,"name":"wait"}]}}
 ```
@@ -85,12 +95,19 @@ curl -s http://127.0.0.1:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Mcp-Session-Id: $SESSION" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"Hello, MCP!"}}}'
 # data: {"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"Hello, MCP!","type":"text"}]}}
 ```
 
-An unknown tool or bad arguments give a JSON-RPC error, for example
-`{"error":{"code":-32602,"message":"Unknown tool: nope"},...}`.
+An unknown tool gives a JSON-RPC error
+(`{"error":{"code":-32602,"message":"Unknown tool: nope"},...}`). Bad arguments make
+the handler throw, which is reported as a tool execution error inside the result:
+`{"result":{"content":[{"text":"echo: 'text' must be a string","type":"text"}],"isError":true},...}`.
+
+JSON-RPC batches (a JSON array of messages) are accepted only on sessions that
+negotiated 2025-03-26 or 2024-11-05; from 2025-06-18 on they are rejected with HTTP 400
+and error `-32600`.
 
 **5. Cancel a running call.** Start a 30-second `wait` in the background, then send
 `notifications/cancelled` with its request id. The call ends at once and, as the MCP
@@ -102,12 +119,14 @@ curl -s -o /dev/null -w "wait: %{http_code}\n" http://127.0.0.1:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Mcp-Session-Id: $SESSION" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"wait","arguments":{"seconds":30}}}' &
 sleep 1
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Mcp-Session-Id: $SESSION" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
   -d '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}}'
 wait
 # 202
@@ -117,7 +136,8 @@ wait
 **6. End the session:**
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" -X DELETE http://127.0.0.1:8080/mcp -H "Mcp-Session-Id: $SESSION"
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE http://127.0.0.1:8080/mcp \
+  -H "Mcp-Session-Id: $SESSION" -H "MCP-Protocol-Version: 2025-11-25"
 # 204
 ```
 
@@ -127,16 +147,16 @@ curl -s -o /dev/null -w "%{http_code}\n" -X DELETE http://127.0.0.1:8080/mcp -H 
 
 - `ServerConfig` with `TransportType::HTTP_STREAMABLE`, host, port and endpoint;
   `MCPServer::listen()` (non-blocking), `port()` and `stop()`
-- `registerMethod("initialize", ...)` to advertise the `tools` capability (the
-  protocol version and the session are handled by `MCPServer`)
-- `registerMethod("tools/list", ...)` returning the tool descriptions with JSON
-  schemas
-- `registerCancellable("tools/call", ...)`: the handler polls its `cancelled` token,
-  which a `notifications/cancelled` from the same session sets. Handlers run on
-  `MCPServer`'s worker threads, so the notification is processed while the call runs;
-  the cancelled request then gets no response.
-- `JsonRpcError::invalidParams()` for bad input; any other exception becomes a
-  `-32603` internal error
+- `registerTool()` with a JSON schema: `MCPServer` serves `tools/list` and
+  `tools/call`, turns a returned string into text content, and advertises the `tools`
+  capability in its default `initialize` result (protocol version negotiation and
+  sessions are handled by `MCPServer`; `serverInfo` comes from `ServerConfig`)
+- `registerCancellableTool()`: the handler polls its `cancelled` token, which a
+  `notifications/cancelled` from the same session sets. Handlers run on `MCPServer`'s
+  worker threads, so the notification is processed while the call runs; the
+  cancelled request then gets no response.
+- Exceptions thrown by a tool become results with `"isError": true`; an unknown tool
+  is a `-32602` JSON-RPC error
 
 ## Expected output
 

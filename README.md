@@ -31,8 +31,9 @@ HTTP/1.1 server and client, Server-Sent Events (SSE), and a Model Context Protoc
 - **Server helpers**: authentication strategies (Bearer, API key, Basic),
   a pluggable compression registry (you bring the codec), and reverse-proxy
   helpers (`X-Forwarded-*`, RFC 7239 `Forwarded`) with trusted-proxy configuration.
-- **MCP**: JSON-RPC 2.0 layer, `MCPServer` (Streamable HTTP 2025-03-26, a POST-based
-  variant for 2024-11-05 clients, or JSON-RPC over your own STDIO loop) and `MCPClient`
+- **MCP**: JSON-RPC 2.0 layer, `MCPServer` (Streamable HTTP for protocol versions
+  2025-11-25, 2025-06-18 and 2025-03-26, a POST-based variant for 2024-11-05 clients,
+  or JSON-RPC over your own STDIO loop; `registerTool()` helpers) and `MCPClient`
   (HTTP transports), tested against the official MCP TypeScript SDK in both directions.
 - **Tested**: 500+ GoogleTest cases in CI on Ubuntu (GCC, Clang, ASan/UBSan),
   macOS (Clang), Windows (MSVC) and MinGW-w64 (under Wine), plus MCP interop with the
@@ -633,13 +634,12 @@ skipped.
 #include <thread>
 
 using namespace SocketsHpp::mcp;
-using SocketsHpp::http::common::JsonRpcError;
 using json = nlohmann::json;
 
 int main()
 {
     ServerConfig config;
-    config.transport = TransportType::HTTP_STREAMABLE;  // MCP 2025-03-26
+    config.transport = TransportType::HTTP_STREAMABLE;  // MCP 2025-11-25 ... 2024-11-05
     config.host = "127.0.0.1";                          // loopback unless allowNonLoopback
     config.port = 8080;                                 // 0 = ephemeral, see server.port()
     config.endpoint = "/mcp";
@@ -647,26 +647,11 @@ int main()
 
     server::MCPServer server(config);
 
-    server.registerMethod("initialize", [](const json&) -> json {
-        // protocolVersion is filled in by the server's version negotiation
-        return {{"capabilities", {{"tools", json::object()}}},
-                {"serverInfo", {{"name", "demo-server"}, {"version", "1.0.0"}}}};
-    });
-
-    server.registerMethod("tools/list", [](const json&) -> json {
-        json echo = {{"name", "echo"},
-                     {"description", "Echo the text back"},
-                     {"inputSchema", {{"type", "object"},
-                                      {"properties", {{"text", {{"type", "string"}}}}}}}};
-        return {{"tools", json::array({echo})}};
-    });
-
-    server.registerMethod("tools/call", [](const json& params) -> json {
-        if (params.value("name", "") != "echo")
-            throw JsonRpcError::invalidParams("unknown tool");
-        std::string text = params.value("arguments", json::object()).value("text", "");
-        return {{"content", json::array({{{"type", "text"}, {"text", text}}})}};
-    });
+    // Provides tools/list and tools/call and advertises the tools capability;
+    // initialize (version negotiation, serverInfo from config) is built in.
+    server.registerTool("echo", "Echo the text back",
+        {{"type", "object"}, {"properties", {{"text", {{"type", "string"}}}}}},
+        [](const json& args) -> json { return args.value("text", ""); });  // → text content
 
     server.listen();  // non-blocking
     std::this_thread::sleep_for(std::chrono::minutes(5));
@@ -675,7 +660,10 @@ int main()
 ```
 
 `ping`, `notifications/initialized`, `notifications/cancelled` and `logging/setLevel`
-are built in. `registerCancellable()` gives a handler a cancel token,
+are built in. `registerTool()` / `registerCancellableTool()`, `registerPrompt()` and
+`registerResource()` implement the tools, prompts and resources methods (a throwing
+tool becomes an `isError` result); `registerMethod()` handles any other method and
+overrides a helper. `registerCancellable()` gives a handler a cancel token,
 `push_event()` / `push_log()` / `push_progress()` send server-initiated messages on a
 session's SSE stream, `processMessage()` handles one JSON-RPC message (or batch) for
 a STDIO transport you drive yourself, and `GET /health` returns the server info. See

@@ -3,9 +3,9 @@
 //
 // MCP SERVER — SocketsHpp
 //
-// Implements MCP 2025-03-26 (Streamable HTTP) and a POST-based transport for
-// protocol version 2024-11-05 (not the legacy SSE `endpoint`-event handshake) over
-// the SocketsHpp HTTP server. The STDIO transport is
+// Implements MCP protocol versions 2025-11-25, 2025-06-18, 2025-03-26 (Streamable
+// HTTP) and a POST-based transport for protocol version 2024-11-05 (not the legacy
+// SSE `endpoint`-event handshake) over the SocketsHpp HTTP server. The STDIO transport is
 // supported only through MCPServer::processMessage(), driven by the caller: the
 // server never reads stdin itself and never binds a port in STDIO mode.
 // (MCPClient does not support STDIO.)
@@ -89,6 +89,7 @@
 #include <optional>
 #include <queue>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -128,6 +129,21 @@ namespace mcp
         ///     the session that sent it (default "warning")
         /// "initialize" is handled internally (version negotiation, session creation); a
         /// simple handler registered as "initialize" supplies the result object.
+        ///
+        /// Protocol versions (supportedProtocolVersions()): "2025-11-25", "2025-06-18",
+        /// "2025-03-26", "2024-11-05". initialize answers with the client's version if
+        /// supported, otherwise the latest; the result is stored per session
+        /// (get_protocol_version()). For sessions on 2025-06-18 or later, JSON-RPC batches
+        /// are rejected and the HTTP transports validate the MCP-Protocol-Version header.
+        ///
+        /// Typed helpers: registerTool() / registerCancellableTool(), registerPrompt() and
+        /// registerResource() provide tools/list + tools/call, prompts/list + prompts/get
+        /// and resources/list + resources/read. The matching capabilities ("tools",
+        /// "prompts", "resources") are advertised by the default initialize result and
+        /// merged into the "capabilities" of a registered initialize handler's result
+        /// (keys the handler sets itself are left untouched). A handler registered for one
+        /// of those method names with registerMethod() / registerCancellable() takes
+        /// precedence over the helper.
         ///
         /// @note Thread safety: on the HTTP transports listen() enables 4 worker threads
         ///       and handlers run on them concurrently, so registered handlers (and
@@ -268,6 +284,231 @@ namespace mcp
                 m_methods[method] = MethodEntry{nullptr, std::move(handler)};
             }
 
+            // ── Typed helpers: tools, prompts, resources ─────────────────────────────
+
+            /// @brief Tool handler: receives the tools/call `arguments` (an empty object if
+            ///        absent) and returns the tool result.
+            ///
+            /// The return value is turned into a CallToolResult:
+            ///   - an object containing "content" is sent as is (it may set "isError",
+            ///     "structuredContent", "_meta", ...);
+            ///   - a string becomes one text content item;
+            ///   - null becomes an empty content list;
+            ///   - any other object becomes "structuredContent" plus its serialized JSON
+            ///     as a text content item (as the spec recommends for structured output);
+            ///   - any other JSON value (array, number, bool) becomes its serialized JSON
+            ///     as a text content item.
+            /// Throwing a std::exception produces a result with "isError": true and the
+            /// exception message as text content (a tool execution error, visible to the
+            /// model). Throwing JsonRpcError sends that JSON-RPC error instead.
+            using ToolHandler = std::function<json(const json& args)>;
+
+            /// @brief Cancellable tool handler: like ToolHandler, and also receives the
+            ///        request's cancel token (see registerCancellable()).
+            using CancellableToolHandler =
+                std::function<json(const json& args,
+                                   std::shared_ptr<std::atomic<bool>> cancel_requested)>;
+
+            /// @brief Prompt handler: receives the prompts/get `arguments` (an object of
+            ///        strings, empty if absent) and returns the prompt.
+            ///
+            /// An object containing "messages" is sent as is (GetPromptResult); an array is
+            /// used as the "messages" list; a string becomes a single "user" message with
+            /// that text. The registered description is added when the result has none.
+            /// Throwing JsonRpcError sends that error; any other std::exception becomes an
+            /// internal error (-32603).
+            using PromptHandler = std::function<json(const json& args)>;
+
+            /// @brief Resource reader: receives the requested URI and returns its contents.
+            ///
+            /// An object containing "contents" is sent as is (ReadResourceResult); an
+            /// object with "text" or "blob" is one content item; an array is the list of
+            /// content items; a string is the text of the resource. "uri" and "mimeType"
+            /// are filled in on content items that lack them. Throwing JsonRpcError sends
+            /// that error; any other std::exception becomes an internal error (-32603).
+            using ResourceReader = std::function<json(const std::string& uri)>;
+
+            /// @brief Register (or replace) a tool served by the built-in tools/list and
+            ///        tools/call handlers.
+            ///
+            /// tools/list returns the tools in registration order (a replaced tool keeps
+            /// its position). tools/call with an unknown name, a missing name or
+            /// non-object arguments is answered with JSON-RPC error -32602. The input is not
+            /// validated against the schema; the handler checks its arguments.
+            /// Registering a tool adds "tools" to the capabilities of the initialize result.
+            /// @param name        Tool name (non-empty; the spec recommends 1-128 characters
+            ///                    from A-Z a-z 0-9 _ - .).
+            /// @param description Human-readable description (omitted from tools/list if empty).
+            /// @param inputSchema JSON Schema of the arguments; must be an object (null means
+            ///                    {"type": "object"}).
+            /// @param handler     Tool implementation; must be thread-safe on the HTTP transports.
+            /// @throws std::invalid_argument for an empty name, a non-object schema or an
+            ///         empty handler.
+            /// @note Thread-safe. A handler registered with registerMethod() or
+            ///       registerCancellable() for "tools/list" or "tools/call" takes precedence
+            ///       over the built-in one for that method.
+            void registerTool(const std::string& name, const std::string& description,
+                              const json& inputSchema, ToolHandler handler)
+            {
+                registerTool(makeToolDefinition(name, description, inputSchema), std::move(handler));
+            }
+
+            /// @brief Register (or replace) a tool from a full tool definition.
+            ///
+            /// Use this form to set optional fields such as "title", "outputSchema"
+            /// (MCP 2025-06-18: the handler should then return an object, which is sent as
+            /// "structuredContent") or "annotations". The definition is returned by
+            /// tools/list as given, with "inputSchema" defaulted to {"type": "object"}.
+            /// @param definition Tool object with at least a non-empty string "name".
+            /// @param handler    Tool implementation; must be thread-safe on the HTTP transports.
+            /// @throws std::invalid_argument for a definition without a name, a non-object
+            ///         "inputSchema" or an empty handler.
+            /// @note Thread-safe. See registerTool(const std::string&, const std::string&,
+            ///       const json&, ToolHandler) for the call semantics.
+            void registerTool(const json& definition, ToolHandler handler)
+            {
+                if (!handler)
+                    throw std::invalid_argument("registerTool: empty handler");
+                addTool(definition,
+                        [h = std::move(handler)](const json& args,
+                                                 std::shared_ptr<std::atomic<bool>>) {
+                            return h(args);
+                        });
+            }
+
+            /// @brief Register (or replace) a cancellable tool.
+            ///
+            /// The handler also receives the cancel token of the tools/call request; poll it
+            /// and stop early (e.g. throw) when it becomes true. As with
+            /// registerCancellable(), a request whose token is set when the handler
+            /// finishes gets no response.
+            /// @param name        Tool name (non-empty).
+            /// @param description Human-readable description (omitted from tools/list if empty).
+            /// @param inputSchema JSON Schema of the arguments; must be an object (null means
+            ///                    {"type": "object"}).
+            /// @param handler     Tool implementation; must be thread-safe on the HTTP transports.
+            /// @throws std::invalid_argument for an empty name, a non-object schema or an
+            ///         empty handler.
+            /// @note Thread-safe.
+            void registerCancellableTool(const std::string& name, const std::string& description,
+                                         const json& inputSchema, CancellableToolHandler handler)
+            {
+                registerCancellableTool(makeToolDefinition(name, description, inputSchema),
+                                        std::move(handler));
+            }
+
+            /// @brief Register (or replace) a cancellable tool from a full tool definition.
+            /// @param definition Tool object with at least a non-empty string "name".
+            /// @param handler    Tool implementation; must be thread-safe on the HTTP transports.
+            /// @throws std::invalid_argument for a definition without a name, a non-object
+            ///         "inputSchema" or an empty handler.
+            /// @note Thread-safe.
+            void registerCancellableTool(const json& definition, CancellableToolHandler handler)
+            {
+                if (!handler)
+                    throw std::invalid_argument("registerCancellableTool: empty handler");
+                addTool(definition, std::move(handler));
+            }
+
+            /// @brief Register (or replace) a prompt served by the built-in prompts/list and
+            ///        prompts/get handlers.
+            ///
+            /// prompts/get with an unknown name or without a required argument is answered
+            /// with JSON-RPC error -32602. Registering a prompt adds "prompts" to the
+            /// capabilities of the initialize result.
+            /// @param name        Prompt name (non-empty).
+            /// @param description Human-readable description (omitted if empty).
+            /// @param arguments   Array of PromptArgument objects ({"name", "description",
+            ///                    "required"}); null or an empty array for none.
+            /// @param handler     Prompt implementation; must be thread-safe on the HTTP
+            ///                    transports.
+            /// @throws std::invalid_argument for an empty name, a non-array arguments value
+            ///         or an empty handler.
+            /// @note Thread-safe. registerMethod("prompts/list" / "prompts/get", ...) takes
+            ///       precedence over the built-in handler.
+            void registerPrompt(const std::string& name, const std::string& description,
+                                const json& arguments, PromptHandler handler)
+            {
+                if (name.empty())
+                    throw std::invalid_argument("registerPrompt: empty name");
+                if (!arguments.is_null() && !arguments.is_array())
+                    throw std::invalid_argument("registerPrompt: arguments must be an array");
+                if (!handler)
+                    throw std::invalid_argument("registerPrompt: empty handler");
+                json definition = {{"name", name}};
+                if (!description.empty())
+                    definition["description"] = description;
+                if (arguments.is_array() && !arguments.empty())
+                    definition["arguments"] = arguments;
+
+                std::unique_lock<std::shared_mutex> lock(m_helpersMutex);
+                upsert(m_prompts, name, PromptEntry{std::move(definition), std::move(handler)});
+            }
+
+            /// @brief Register (or replace) a resource served by the built-in resources/list
+            ///        and resources/read handlers.
+            ///
+            /// resources/read with an unregistered URI is answered with JSON-RPC error
+            /// -32002 (resource not found). Registering a resource adds "resources" to the
+            /// capabilities of the initialize result.
+            /// @param uri         Resource URI (non-empty; matched exactly).
+            /// @param name        Resource name.
+            /// @param mimeType    MIME type (omitted if empty).
+            /// @param reader      Returns the resource contents; must be thread-safe on the
+            ///                    HTTP transports.
+            /// @param description Optional human-readable description (omitted if empty).
+            /// @throws std::invalid_argument for an empty URI or an empty reader.
+            /// @note Thread-safe. registerMethod("resources/list" / "resources/read", ...)
+            ///       takes precedence over the built-in handler.
+            void registerResource(const std::string& uri, const std::string& name,
+                                  const std::string& mimeType, ResourceReader reader,
+                                  const std::string& description = std::string())
+            {
+                if (uri.empty())
+                    throw std::invalid_argument("registerResource: empty uri");
+                if (!reader)
+                    throw std::invalid_argument("registerResource: empty reader");
+                json definition = {{"uri", uri}, {"name", name}};
+                if (!description.empty())
+                    definition["description"] = description;
+                if (!mimeType.empty())
+                    definition["mimeType"] = mimeType;
+
+                std::unique_lock<std::shared_mutex> lock(m_helpersMutex);
+                upsert(m_resources, uri, ResourceEntry{std::move(definition), std::move(reader)});
+            }
+
+            /// @brief Page size of the built-in tools/list, prompts/list and resources/list.
+            ///
+            /// 0 (the default) returns everything in one page. Otherwise each page holds at
+            /// most @p pageSize entries and "nextCursor" (an opaque string) is set while
+            /// more follow; a cursor the server did not issue gets JSON-RPC error -32602.
+            /// @param pageSize Maximum entries per page; 0 disables pagination.
+            /// @note Thread-safe.
+            void setListPageSize(size_t pageSize)
+            {
+                m_listPageSize.store(pageSize);
+            }
+
+            /// @brief Protocol versions this server supports, newest first.
+            /// @return {"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}.
+            static const std::vector<std::string>& supportedProtocolVersions()
+            {
+                return SUPPORTED_VERSIONS;
+            }
+
+            /// @brief Protocol version negotiated by a session's initialize.
+            /// For HTTP transports pass the session id; for the STDIO transport
+            /// (processMessage) pass an empty string.
+            /// @return The version, or "" if no initialize has completed for that session.
+            /// @note Thread-safe.
+            std::string get_protocol_version(const std::string& sessionId) const
+            {
+                std::lock_guard<std::mutex> lock(m_protocolVersionsMutex);
+                auto it = m_protocolVersions.find(sessionId);
+                return it != m_protocolVersions.end() ? it->second : std::string();
+            }
+
             /// @brief Push a notifications/progress message to a session's SSE stream
             ///        (via push_event()).
             /// Call from within a tool handler to report long-running operation progress.
@@ -344,7 +585,7 @@ namespace mcp
             /// @brief Server info as returned by GET /health.
             /// @return {"name", "version", "protocolVersion"}: ServerConfig::serverName /
             ///         serverVersion (defaults if empty) and the newest supported protocol
-            ///         version ("2025-03-26"), not a per-session negotiated one.
+            ///         version ("2025-11-25"), not a per-session negotiated one.
             json server_info() const
             {
                 return {
@@ -523,7 +764,8 @@ namespace mcp
             ///
             /// Handlers run synchronously on the calling thread. All messages share the
             /// session "" (see get_client_capabilities("")). initialize is rejected
-            /// inside a batch.
+            /// inside a batch, and a batch is rejected as a whole (-32600) once initialize
+            /// has negotiated protocol version 2025-06-18 or later.
             /// @param jsonRpcMessage JSON-RPC message (or batch array) string
             /// @return JSON-RPC response string; empty when no response is due
             ///         (notifications, or a batch made only of notifications). Parse errors
@@ -548,6 +790,9 @@ namespace mcp
                     {
                         if (body.empty())
                             return invalidRequestResponse(nullptr, "Empty batch").dump();
+                        const std::string version = effectiveVersion(std::string(), nullptr);
+                        if (!batchingAllowed(version))
+                            return batchRejectedResponse(version).dump();
                         json out = json::array();
                         for (const auto& item : body)
                         {
@@ -561,7 +806,10 @@ namespace mcp
                     InitOutcome init;
                     auto outcome = processOne(body, &init);
                     if (init.succeeded)
+                    {
                         storeClientCapabilities("", init.clientCaps);
+                        storeProtocolVersion("", init.protocolVersion);
+                    }
                     return outcome.response ? outcome.response->dump() : std::string();
                 }
                 catch (const std::exception& e)
@@ -573,8 +821,15 @@ namespace mcp
         private:
             // Supported protocol versions — highest first (negotiation preference order)
             static inline const std::vector<std::string> SUPPORTED_VERSIONS = {
-                "2025-03-26", "2024-11-05"
+                "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"
             };
+
+            // Version assumed for an HTTP request without MCP-Protocol-Version when none
+            // was negotiated (spec: "the server SHOULD assume protocol version 2025-03-26").
+            static constexpr const char* DEFAULT_NEGOTIATED_VERSION = "2025-03-26";
+
+            // First version without JSON-RPC batching and with the MCP-Protocol-Version header.
+            static constexpr const char* NO_BATCH_VERSION = "2025-06-18";
 
             // ----------------------------------------------------------------
             // Per-session SSE event queue (backport: real push SSE stream)
@@ -610,6 +865,7 @@ namespace mcp
             {
                 bool succeeded = false;
                 json clientCaps;
+                std::string protocolVersion;  // negotiated version
             };
 
             // Result of processing one JSON-RPC message
@@ -649,6 +905,33 @@ namespace mcp
             static constexpr int kDefaultLogLevel = 3;  // "warning"
             std::map<std::string, int> m_logLevels;
             mutable std::mutex m_logLevelsMutex;
+
+            // Negotiated protocol version per session (stored on initialize; "" = STDIO)
+            std::map<std::string, std::string> m_protocolVersions;
+            mutable std::mutex m_protocolVersionsMutex;
+
+            // Typed helper registries (registerTool / registerPrompt / registerResource),
+            // kept in registration order for the list methods.
+            struct ToolEntry
+            {
+                json definition;
+                CancellableToolHandler handler;
+            };
+            struct PromptEntry
+            {
+                json definition;
+                PromptHandler handler;
+            };
+            struct ResourceEntry
+            {
+                json definition;
+                ResourceReader reader;
+            };
+            std::vector<std::pair<std::string, ToolEntry>> m_tools;
+            std::vector<std::pair<std::string, PromptEntry>> m_prompts;
+            std::vector<std::pair<std::string, ResourceEntry>> m_resources;
+            mutable std::shared_mutex m_helpersMutex;
+            std::atomic<size_t> m_listPageSize{0};
 
             int minLogLevel(const std::string& sessionId) const
             {
@@ -806,6 +1089,89 @@ namespace mcp
                 m_clientCapabilities[sessionId] = caps;
             }
 
+            void storeProtocolVersion(const std::string& sessionId, const std::string& version)
+            {
+                std::lock_guard<std::mutex> lock(m_protocolVersionsMutex);
+                m_protocolVersions[sessionId] = version;
+            }
+
+            static bool isSupportedVersion(const std::string& version)
+            {
+                return std::find(SUPPORTED_VERSIONS.begin(), SUPPORTED_VERSIONS.end(), version) !=
+                       SUPPORTED_VERSIONS.end();
+            }
+
+            /// @brief Protocol version governing a request of @p sessionId: the version its
+            /// initialize negotiated, else the MCP-Protocol-Version header value (if any),
+            /// else 2025-03-26. @p req is null for STDIO (session ""); on HTTP an empty
+            /// session id means "no session".
+            std::string effectiveVersion(const std::string& sessionId, const HttpRequest* req) const
+            {
+                if (req == nullptr || !sessionId.empty())
+                {
+                    std::string negotiated = get_protocol_version(sessionId);
+                    if (!negotiated.empty())
+                        return negotiated;
+                }
+                if (req != nullptr)
+                {
+                    const std::string* header = findHeader(*req, "MCP-Protocol-Version");
+                    if (header != nullptr && !header->empty())
+                        return *header;
+                }
+                return DEFAULT_NEGOTIATED_VERSION;
+            }
+
+            /// @brief JSON-RPC batching was removed in MCP 2025-06-18. Versions are
+            /// ISO dates, so string order is chronological.
+            static bool batchingAllowed(const std::string& version)
+            {
+                return version < std::string(NO_BATCH_VERSION);
+            }
+
+            static json batchRejectedResponse(const std::string& version)
+            {
+                return invalidRequestResponse(nullptr,
+                    "JSON-RPC batching is not supported in protocol version " + version);
+            }
+
+            /// @brief Validate the MCP-Protocol-Version header of a request after initialize
+            /// (MCP 2025-06-18+). An absent header is accepted (the negotiated version, or
+            /// 2025-03-26, is assumed). A value that is not a supported version, or that
+            /// differs from the version the session negotiated, is answered with 400.
+            /// @return false if a response has been sent
+            bool checkProtocolVersion(const HttpRequest& req, HttpResponse& res)
+            {
+                const std::string* header = findHeader(req, "MCP-Protocol-Version");
+                if (header == nullptr)
+                    return true;
+                std::string message;
+                if (!isSupportedVersion(*header))
+                {
+                    std::string list;
+                    for (const auto& v : SUPPORTED_VERSIONS)
+                        list += (list.empty() ? "" : ", ") + v;
+                    message = "Bad Request: Unsupported protocol version: " + *header +
+                              " (supported versions: " + list + ")";
+                }
+                else
+                {
+                    const std::string sessionId = getSessionId(req);
+                    const std::string negotiated =
+                        sessionId.empty() ? std::string() : get_protocol_version(sessionId);
+                    if (!negotiated.empty() && negotiated != *header)
+                    {
+                        message = "Bad Request: MCP-Protocol-Version " + *header +
+                                  " does not match the negotiated version " + negotiated;
+                    }
+                }
+                if (message.empty())
+                    return true;
+                auto error = JsonRpcError::serverError(-32000, message);
+                sendJson(res, 400, JsonRpcResponse::failure(nullptr, error).toJson());
+                return false;
+            }
+
             /// @brief Drop all per-session state kept by the MCP layer (SSE queue, caps).
             void dropSessionState(const std::string& sessionId)
             {
@@ -826,6 +1192,10 @@ namespace mcp
                 {
                     std::lock_guard<std::mutex> lock(m_clientCapsMutex);
                     m_clientCapabilities.erase(sessionId);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_protocolVersionsMutex);
+                    m_protocolVersions.erase(sessionId);
                 }
             }
 
@@ -940,6 +1310,7 @@ namespace mcp
                     m_sseQueues[sessionId] = std::make_shared<SSESessionQueue>();
                 }
                 storeClientCapabilities(sessionId, init.clientCaps);
+                storeProtocolVersion(sessionId, init.protocolVersion);
                 res.set_header(m_config.session.headerName, sessionId);
                 return sessionId;
             }
@@ -1092,6 +1463,13 @@ namespace mcp
                             return;
                         }
                         if (!checkSession(req, res, true)) return;
+                        if (!checkProtocolVersion(req, res)) return;
+                        const std::string version = effectiveVersion(getSessionId(req), &req);
+                        if (!batchingAllowed(version))
+                        {
+                            sendJson(res, 400, batchRejectedResponse(version));
+                            return;
+                        }
 
                         std::vector<json> responses;
                         for (const auto& item : body)
@@ -1113,6 +1491,7 @@ namespace mcp
 
                     const bool isInit = isInitializeRequest(body);
                     if (!isInit && !checkSession(req, res, true)) return;
+                    if (!isInit && !checkProtocolVersion(req, res)) return;
 
                     InitOutcome init;
                     auto outcome = processOne(body, isInit ? &init : nullptr, getSessionId(req));
@@ -1216,6 +1595,13 @@ namespace mcp
                             return;
                         }
                         if (!checkSession(req, res, false)) return;
+                        if (!checkProtocolVersion(req, res)) return;
+                        const std::string version = effectiveVersion(getSessionId(req), &req);
+                        if (!batchingAllowed(version))
+                        {
+                            sendJson(res, 400, batchRejectedResponse(version));
+                            return;
+                        }
 
                         json responses = json::array();
                         for (const auto& item : body)
@@ -1243,6 +1629,7 @@ namespace mcp
 
                     const bool isInit = isInitializeRequest(body);
                     if (!isInit && !checkSession(req, res, false)) return;
+                    if (!isInit && !checkProtocolVersion(req, res)) return;
 
                     InitOutcome init;
                     auto outcome = processOne(body, isInit ? &init : nullptr, getSessionId(req));
@@ -1336,6 +1723,7 @@ namespace mcp
                     res.send("Invalid or expired session");
                     return;
                 }
+                if (!checkProtocolVersion(req, res)) return;
 
                 // Check for Last-Event-ID (resumability)
                 std::string lastEventId = headerValue(req, "Last-Event-ID");
@@ -1455,6 +1843,7 @@ namespace mcp
                     res.send("Missing session ID");
                     return;
                 }
+                if (!checkProtocolVersion(req, res)) return;
 
                 const bool existed = m_sessionManager.terminateSession(sessionId);
                 dropSessionState(sessionId);
@@ -1763,6 +2152,19 @@ namespace mcp
                                 result = json::object();
                             // Patch protocolVersion to the negotiated value
                             result["protocolVersion"] = negotiated;
+                            // Add the capabilities of the typed helpers the handler did
+                            // not declare itself (its own entries are kept as they are)
+                            json helperCaps = helperCapabilities();
+                            if (!helperCaps.empty())
+                            {
+                                if (!result.contains("capabilities") || !result["capabilities"].is_object())
+                                    result["capabilities"] = json::object();
+                                for (auto& cap : helperCaps.items())
+                                {
+                                    if (!result["capabilities"].contains(cap.key()))
+                                        result["capabilities"][cap.key()] = cap.value();
+                                }
+                            }
                             response = JsonRpcResponse::success(id, result);
                         }
                         catch (const JsonRpcError& err)
@@ -1779,17 +2181,20 @@ namespace mcp
                         // No user handler: return a minimal valid initialize response
                         response = JsonRpcResponse::success(id, {
                             {"protocolVersion", negotiated},
-                            {"capabilities",    json::object()},
+                            {"capabilities",    helperCapabilities()},
                             {"serverInfo",      {{"name", server_info()["name"]},
                                                  {"version", server_info()["version"]}}}
                         });
                     }
                     init->succeeded = true;
                     init->clientCaps = std::move(caps);
+                    init->protocolVersion = negotiated;
                     return response;
                 }
 
                 auto entry = findMethod(method);
+                if (!entry)
+                    entry = findHelperMethod(method);
                 if (!entry)
                 {
                     return JsonRpcResponse::failure(id, JsonRpcError::methodNotFound(method));
@@ -1874,6 +2279,315 @@ namespace mcp
                 {
                     LOG_ERROR("MCPServer: Error handling notification %s", method.c_str());
                 }
+            }
+
+            // ── Typed helper implementation ──────────────────────────────────────────
+
+            static json makeToolDefinition(const std::string& name, const std::string& description,
+                                           const json& inputSchema)
+            {
+                json definition = {{"name", name}};
+                if (!description.empty())
+                    definition["description"] = description;
+                definition["inputSchema"] = inputSchema;
+                return definition;
+            }
+
+            void addTool(json definition, CancellableToolHandler handler)
+            {
+                if (!definition.is_object() || !definition.contains("name") ||
+                    !definition["name"].is_string() || definition["name"].get<std::string>().empty())
+                {
+                    throw std::invalid_argument("registerTool: the tool needs a non-empty name");
+                }
+                if (!definition.contains("inputSchema") || definition["inputSchema"].is_null())
+                    definition["inputSchema"] = {{"type", "object"}};
+                else if (!definition["inputSchema"].is_object())
+                    throw std::invalid_argument("registerTool: inputSchema must be a JSON object");
+
+                const std::string name = definition["name"].get<std::string>();
+                std::unique_lock<std::shared_mutex> lock(m_helpersMutex);
+                upsert(m_tools, name, ToolEntry{std::move(definition), std::move(handler)});
+            }
+
+            /// Replace the entry with key @p key in place, or append it.
+            template <typename Entry>
+            static void upsert(std::vector<std::pair<std::string, Entry>>& entries,
+                               const std::string& key, Entry entry)
+            {
+                for (auto& e : entries)
+                {
+                    if (e.first == key)
+                    {
+                        e.second = std::move(entry);
+                        return;
+                    }
+                }
+                entries.emplace_back(key, std::move(entry));
+            }
+
+            /// Capabilities implied by the typed helpers in use ({} if none).
+            json helperCapabilities() const
+            {
+                json caps = json::object();
+                std::shared_lock<std::shared_mutex> lock(m_helpersMutex);
+                if (!m_tools.empty())
+                    caps["tools"] = json::object();
+                if (!m_prompts.empty())
+                    caps["prompts"] = json::object();
+                if (!m_resources.empty())
+                    caps["resources"] = json::object();
+                return caps;
+            }
+
+            /// Built-in handler for a helper-provided method, used only when no handler is
+            /// registered under that name and at least one entry of that kind exists.
+            std::optional<MethodEntry> findHelperMethod(const std::string& method)
+            {
+                bool tools = false, prompts = false, resources = false;
+                {
+                    std::shared_lock<std::shared_mutex> lock(m_helpersMutex);
+                    tools = !m_tools.empty();
+                    prompts = !m_prompts.empty();
+                    resources = !m_resources.empty();
+                }
+                MethodEntry entry;
+                if (tools && method == "tools/list")
+                    entry.simple = [this](const json& params) {
+                        return listPage(m_tools, "tools", params);
+                    };
+                else if (tools && method == "tools/call")
+                    entry.cancellable = [this](const json& params,
+                                               std::shared_ptr<std::atomic<bool>> token) {
+                        return callTool(params, std::move(token));
+                    };
+                else if (prompts && method == "prompts/list")
+                    entry.simple = [this](const json& params) {
+                        return listPage(m_prompts, "prompts", params);
+                    };
+                else if (prompts && method == "prompts/get")
+                    entry.simple = [this](const json& params) { return getPrompt(params); };
+                else if (resources && method == "resources/list")
+                    entry.simple = [this](const json& params) {
+                        return listPage(m_resources, "resources", params);
+                    };
+                else if (resources && method == "resources/read")
+                    entry.simple = [this](const json& params) { return readResource(params); };
+                else
+                    return std::nullopt;
+                return entry;
+            }
+
+            /// One page of a helper registry for a */list request: {key: [...],
+            /// "nextCursor"?}. The cursor is the decimal index of the next entry.
+            template <typename Entry>
+            json listPage(const std::vector<std::pair<std::string, Entry>>& entries,
+                          const char* key, const json& params) const
+            {
+                size_t start = 0;
+                if (params.is_object() && params.contains("cursor") && !params["cursor"].is_null())
+                {
+                    const json& cursor = params["cursor"];
+                    const std::string text = cursor.is_string() ? cursor.get<std::string>() : "";
+                    if (text.empty() || text.size() > 18 ||
+                        text.find_first_not_of("0123456789") != std::string::npos)
+                    {
+                        throw JsonRpcError::invalidParams("Invalid cursor");
+                    }
+                    start = static_cast<size_t>(std::stoull(text));
+                }
+                const size_t pageSize = m_listPageSize.load();
+
+                json items = json::array();
+                std::shared_lock<std::shared_mutex> lock(m_helpersMutex);
+                if (start > entries.size())
+                    throw JsonRpcError::invalidParams("Invalid cursor");
+                size_t end = entries.size();
+                if (pageSize > 0 && end - start > pageSize)
+                    end = start + pageSize;
+                for (size_t i = start; i < end; ++i)
+                    items.push_back(entries[i].second.definition);
+
+                json result = {{key, std::move(items)}};
+                if (end < entries.size())
+                    result["nextCursor"] = std::to_string(end);
+                return result;
+            }
+
+            /// Wrap a tool handler's return value into a CallToolResult.
+            static json toolResult(json value)
+            {
+                auto text = [](const std::string& s) {
+                    return json::array({{{"type", "text"}, {"text", s}}});
+                };
+                if (value.is_object() && value.contains("content"))
+                    return value;
+                if (value.is_null())
+                    return {{"content", json::array()}};
+                if (value.is_string())
+                    return {{"content", text(value.get<std::string>())}};
+                if (value.is_object())
+                {
+                    json result = {{"content", text(value.dump())}};
+                    result["structuredContent"] = std::move(value);
+                    return result;
+                }
+                return {{"content", text(value.dump())}};
+            }
+
+            json callTool(const json& params, std::shared_ptr<std::atomic<bool>> token)
+            {
+                if (!params.is_object() || !params.contains("name") || !params["name"].is_string())
+                    throw JsonRpcError::invalidParams("tools/call: missing tool name");
+                const std::string name = params["name"].get<std::string>();
+                json args = json::object();
+                if (params.contains("arguments") && !params["arguments"].is_null())
+                {
+                    if (!params["arguments"].is_object())
+                        throw JsonRpcError::invalidParams("tools/call: arguments must be an object");
+                    args = params["arguments"];
+                }
+
+                CancellableToolHandler handler;
+                {
+                    std::shared_lock<std::shared_mutex> lock(m_helpersMutex);
+                    for (const auto& t : m_tools)
+                    {
+                        if (t.first == name)
+                        {
+                            handler = t.second.handler;
+                            break;
+                        }
+                    }
+                }
+                if (!handler)
+                    throw JsonRpcError::invalidParams("Unknown tool: " + name);
+
+                // Tool execution errors are reported in the result (isError) so the model
+                // can see them; JsonRpcError still becomes a protocol error.
+                auto failure = [](const std::string& message) -> json {
+                    return {{"content", json::array({{{"type", "text"}, {"text", message}}})},
+                            {"isError", true}};
+                };
+                try
+                {
+                    return toolResult(handler(args, std::move(token)));
+                }
+                catch (const JsonRpcError&)
+                {
+                    throw;
+                }
+                catch (const std::exception& e)
+                {
+                    return failure(e.what());
+                }
+                catch (...)
+                {
+                    return failure("Unknown error in tool '" + name + "'");
+                }
+            }
+
+            json getPrompt(const json& params)
+            {
+                if (!params.is_object() || !params.contains("name") || !params["name"].is_string())
+                    throw JsonRpcError::invalidParams("prompts/get: missing prompt name");
+                const std::string name = params["name"].get<std::string>();
+                json args = json::object();
+                if (params.contains("arguments") && !params["arguments"].is_null())
+                {
+                    if (!params["arguments"].is_object())
+                        throw JsonRpcError::invalidParams("prompts/get: arguments must be an object");
+                    args = params["arguments"];
+                }
+
+                std::optional<PromptEntry> entry;
+                {
+                    std::shared_lock<std::shared_mutex> lock(m_helpersMutex);
+                    for (const auto& p : m_prompts)
+                    {
+                        if (p.first == name)
+                        {
+                            entry = p.second;
+                            break;
+                        }
+                    }
+                }
+                if (!entry)
+                    throw JsonRpcError::invalidParams("Unknown prompt: " + name);
+
+                for (const auto& arg : entry->definition.value("arguments", json::array()))
+                {
+                    if (arg.is_object() && arg.value("required", false) && arg.contains("name") &&
+                        arg["name"].is_string() && !args.contains(arg["name"].get<std::string>()))
+                    {
+                        throw JsonRpcError::invalidParams("Missing required argument: " +
+                                                          arg["name"].get<std::string>());
+                    }
+                }
+
+                json value = entry->handler(args);
+                json result;
+                if (value.is_object() && value.contains("messages"))
+                    result = std::move(value);
+                else if (value.is_array())
+                    result = {{"messages", std::move(value)}};
+                else if (value.is_string())
+                    result = {{"messages", json::array({
+                        {{"role", "user"}, {"content", {{"type", "text"}, {"text", value}}}}})}};
+                else
+                    throw JsonRpcError::internalError("Prompt '" + name + "' returned no messages");
+                if (!result.contains("description") && entry->definition.contains("description"))
+                    result["description"] = entry->definition["description"];
+                return result;
+            }
+
+            json readResource(const json& params)
+            {
+                if (!params.is_object() || !params.contains("uri") || !params["uri"].is_string())
+                    throw JsonRpcError::invalidParams("resources/read: missing uri");
+                const std::string uri = params["uri"].get<std::string>();
+
+                std::optional<ResourceEntry> entry;
+                {
+                    std::shared_lock<std::shared_mutex> lock(m_helpersMutex);
+                    for (const auto& r : m_resources)
+                    {
+                        if (r.first == uri)
+                        {
+                            entry = r.second;
+                            break;
+                        }
+                    }
+                }
+                if (!entry)
+                {
+                    JsonRpcError error = JsonRpcError::serverError(-32002, "Resource not found");
+                    error.data = json{{"uri", uri}};
+                    throw error;
+                }
+
+                json value = entry->reader(uri);
+                if (value.is_object() && value.contains("contents"))
+                    return value;
+                json contents;
+                if (value.is_array())
+                    contents = std::move(value);
+                else if (value.is_object())
+                    contents = json::array({std::move(value)});
+                else if (value.is_string())
+                    contents = json::array({{{"text", value}}});
+                else
+                    throw JsonRpcError::internalError("Resource '" + uri + "' returned no contents");
+                for (auto& item : contents)
+                {
+                    if (!item.is_object())
+                        continue;
+                    if (!item.contains("uri"))
+                        item["uri"] = uri;
+                    if (!item.contains("mimeType") && entry->definition.contains("mimeType"))
+                        item["mimeType"] = entry->definition["mimeType"];
+                }
+                return {{"contents", std::move(contents)}};
             }
         };
 

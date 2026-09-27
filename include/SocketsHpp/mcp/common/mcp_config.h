@@ -163,7 +163,7 @@ namespace mcp
         {
             std::string allowOrigin = "*";  ///< Access-Control-Allow-Origin (default "*").
             std::string allowMethods = "GET, POST, DELETE, OPTIONS";  ///< Access-Control-Allow-Methods.
-            std::string allowHeaders = "Content-Type, Accept, Authorization, x-api-key, Mcp-Session-Id, Last-Event-ID";  ///< Access-Control-Allow-Headers.
+            std::string allowHeaders = "Content-Type, Accept, Authorization, x-api-key, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID";  ///< Access-Control-Allow-Headers.
             std::string exposeHeaders = "Content-Type, Authorization, x-api-key, Mcp-Session-Id";  ///< Access-Control-Expose-Headers.
             std::string maxAge = "86400";  ///< Access-Control-Max-Age in seconds (default "86400" = 24 h).
         } cors;  ///< CORS settings.

@@ -64,6 +64,11 @@ Stop the background servers with `kill %1 %2` (or Ctrl+C in their terminals).
 
 ## Protocol version
 
-The TypeScript SDK offers its latest protocol version; SocketsHpp answers with
-`2025-03-26` (Streamable HTTP), which the SDK accepts. Both clients print the
-negotiated version.
+In direction 1 the TypeScript SDK offers its latest protocol version (`2025-11-25`
+for SDK 1.30), which `MCPServer` supports, so that version is negotiated; the SDK
+then sends `MCP-Protocol-Version: 2025-11-25` on every later request and
+`MCPServer` validates it. In direction 2 `MCPClient` offers `2025-03-26`, which the
+SDK server accepts. Both clients print the negotiated version.
+
+`cpp_server` registers its tools with `MCPServer::registerTool()`, which provides
+`tools/list` and `tools/call` and advertises the `tools` capability.

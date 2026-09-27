@@ -6,9 +6,10 @@
 ///
 /// This example demonstrates:
 /// - MCPServer on the Streamable HTTP transport at http://127.0.0.1:<port>/mcp
-/// - An initialize handler advertising the tools capability
-/// - tools/list and tools/call with two tools: "echo" and "wait"
-/// - A cancellable handler ("wait" stops early on notifications/cancelled)
+/// - registerTool() / registerCancellableTool(): built-in tools/list and tools/call
+///   with two tools, "echo" and "wait", and the tools capability advertised
+///   automatically in the initialize result
+/// - A cancellable tool ("wait" stops early on notifications/cancelled)
 /// - Sessions (Mcp-Session-Id) and graceful shutdown
 ///
 /// Usage: mcp-server [port]   (default 8080)
@@ -26,19 +27,12 @@
 
 using namespace SOCKETSHPP_NS::mcp;
 using namespace SOCKETSHPP_NS::mcp::server;
-using SOCKETSHPP_NS::http::common::JsonRpcError;
 using json = nlohmann::json;
 
 namespace
 {
     std::atomic<bool> g_running{true};
     void onSignal(int) { g_running = false; }
-
-    // A tools/call result with a single text item
-    json textResult(const std::string& text)
-    {
-        return {{"content", json::array({{{"type", "text"}, {"text", text}}})}};
-    }
 }  // namespace
 
 int main(int argc, char* argv[])
@@ -58,69 +52,47 @@ int main(int argc, char* argv[])
 
         MCPServer server(cfg);
 
-        // The protocol version and session are handled by MCPServer; this handler
-        // supplies the rest of the initialize result.
-        server.registerMethod("initialize", [](const json&) -> json {
-            return {
-                {"capabilities", {{"tools", json::object()}}},
-                {"serverInfo", {{"name", "example-mcp-server"}, {"version", "1.0.0"}}},
-            };
-        });
-
-        server.registerMethod("tools/list", [](const json&) -> json {
-            return {{"tools", json::array({
-                {{"name", "echo"},
-                 {"description", "Return the given text"},
-                 {"inputSchema", {{"type", "object"},
-                                  {"properties", {{"text", {{"type", "string"}}}}},
-                                  {"required", {"text"}}}}},
-                {{"name", "wait"},
-                 {"description", "Wait for the given number of seconds (1-60); cancellable"},
-                 {"inputSchema", {{"type", "object"},
-                                  {"properties", {{"seconds", {{"type", "integer"}}}}},
-                                  {"required", {"seconds"}}}}},
-            })}};
-        });
-
-        // Handlers run on MCPServer's worker threads, so a notifications/cancelled for
-        // this request (same session, params.requestId = this request's id) is
-        // processed while "wait" runs and sets `cancelled`.
-        server.registerCancellable(
-            "tools/call", [](const json& params, std::shared_ptr<std::atomic<bool>> cancelled) -> json {
-                const std::string name = params.value("name", "");
-                const json args = params.value("arguments", json::object());
-
-                if (name == "echo")
+        // registerTool() provides tools/list and tools/call, and the default initialize
+        // result (protocol version negotiation, serverInfo from cfg) advertises the tools
+        // capability. A handler returning a string produces one text content item; a
+        // handler that throws produces a result with "isError": true and the message.
+        server.registerTool(
+            "echo", "Return the given text",
+            {{"type", "object"}, {"properties", {{"text", {{"type", "string"}}}}}, {"required", {"text"}}},
+            [](const json& args) -> json {
+                if (!args.contains("text") || !args["text"].is_string())
                 {
-                    if (!args.contains("text") || !args["text"].is_string())
-                    {
-                        throw JsonRpcError::invalidParams("echo: 'text' must be a string");
-                    }
-                    return textResult(args["text"].get<std::string>());
+                    throw std::invalid_argument("echo: 'text' must be a string");
                 }
-                if (name == "wait")
+                return args["text"].get<std::string>();
+            });
+
+        // A cancellable tool: handlers run on MCPServer's worker threads, so a
+        // notifications/cancelled for this request (same session, params.requestId =
+        // this request's id) is processed while "wait" runs and sets `cancelled`.
+        server.registerCancellableTool(
+            "wait", "Wait for the given number of seconds (1-60); cancellable",
+            {{"type", "object"}, {"properties", {{"seconds", {{"type", "integer"}}}}}, {"required", {"seconds"}}},
+            [](const json& args, std::shared_ptr<std::atomic<bool>> cancelled) -> json {
+                if (!args.contains("seconds") || !args["seconds"].is_number_integer())
                 {
-                    if (!args.contains("seconds") || !args["seconds"].is_number_integer())
-                    {
-                        throw JsonRpcError::invalidParams("wait: 'seconds' must be an integer");
-                    }
-                    const int seconds = args["seconds"].get<int>();
-                    if (seconds < 1 || seconds > 60)
-                    {
-                        throw JsonRpcError::invalidParams("wait: 'seconds' must be between 1 and 60");
-                    }
-                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-                    while (std::chrono::steady_clock::now() < deadline)
-                    {
-                        if (cancelled->load())
-                        {
-                            throw std::runtime_error("cancelled");  // sent back as a -32603 error
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    }
-                    return textResult("Waited " + std::to_string(seconds) + " s");
+                    throw std::invalid_argument("wait: 'seconds' must be an integer");
                 }
-                throw JsonRpcError::invalidParams("Unknown tool: " + name);
+                const int seconds = args["seconds"].get<int>();
+                if (seconds < 1 || seconds > 60)
+                {
+                    throw std::invalid_argument("wait: 'seconds' must be between 1 and 60");
+                }
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    if (cancelled->load())
+                    {
+                        throw std::runtime_error("cancelled");  // no response is sent for it
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                return "Waited " + std::to_string(seconds) + " s";
             });
 
         server.listen();  // non-blocking

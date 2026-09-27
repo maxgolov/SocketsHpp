@@ -545,7 +545,7 @@ TEST_F(StreamableHttpTest, VersionNegotiationAnswersLatestForUnknownVersion)
     EXPECT_EQ(r.status, 200);
     auto d = json::parse(r.body);
     EXPECT_FALSE(d.contains("error"));
-    EXPECT_EQ(d["result"]["protocolVersion"], "2025-03-26");
+    EXPECT_EQ(d["result"]["protocolVersion"], "2025-11-25");
     EXPECT_FALSE(r.session_id.empty());
 }
 
@@ -1874,4 +1874,521 @@ TEST_F(StreamableHttpTest, ClientResponsesAreAcceptedWith202)
     // A message with neither method nor result/error is still invalid.
     auto bad = http_post(port_, R"({"jsonrpc":"2.0","id":9})", session);
     EXPECT_EQ(bad.status, 400);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Protocol versions 2025-06-18 / 2025-11-25: negotiation, MCP-Protocol-Version,
+// batching rules
+// ══════════════════════════════════════════════════════════════════════════════
+
+static std::string init_body(const std::string& version, int id = 1)
+{
+    return R"({"jsonrpc":"2.0","id":)" + std::to_string(id) +
+           R"(,"method":"initialize","params":{"protocolVersion":")" + version +
+           R"(","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})";
+}
+
+/// Initialize with @p version; returns {session, negotiated version}.
+static std::pair<std::string, std::string> init_session(int port, const std::string& version)
+{
+    auto r = http_request(port, "POST", init_body(version), json_headers());
+    if (r.status != 200)
+        return {};
+    auto d = json::parse(r.body);
+    return {r.session_id, d["result"]["protocolVersion"].get<std::string>()};
+}
+
+static TestHttpResponse post_with_version(int port, const std::string& body,
+                                          const std::string& session, const std::string& version)
+{
+    HeaderList extra = {{"Mcp-Session-Id", session}};
+    if (!version.empty())
+        extra.emplace_back("MCP-Protocol-Version", version);
+    return http_request(port, "POST", body, json_headers(extra));
+}
+
+TEST(McpProtocolVersionTest, EachSupportedVersionIsNegotiatedAndStored)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    CustomServer srv(cfg);
+    const std::vector<std::string> expected = {"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"};
+    EXPECT_EQ(MCPServer::supportedProtocolVersions(), expected);
+    for (const auto& v : expected)
+    {
+        auto init = init_session(srv.port, v);
+        ASSERT_FALSE(init.first.empty()) << v;
+        EXPECT_EQ(init.second, v);
+        EXPECT_EQ(srv.server->get_protocol_version(init.first), v);
+    }
+    // Unknown or missing → the latest supported version
+    EXPECT_EQ(init_session(srv.port, "2099-01-01").second, "2025-11-25");
+    auto r = http_request(srv.port, "POST",
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}})", json_headers());
+    EXPECT_EQ(json::parse(r.body)["result"]["protocolVersion"], "2025-11-25");
+    EXPECT_EQ(srv.server->get_protocol_version("no-such-session"), "");
+}
+
+TEST(McpProtocolVersionTest, StdioStoresNegotiatedVersion)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    MCPServer srv(cfg);
+    EXPECT_EQ(srv.get_protocol_version(""), "");
+    auto d = json::parse(srv.processMessage(init_body("2025-06-18")));
+    EXPECT_EQ(d["result"]["protocolVersion"], "2025-06-18");
+    EXPECT_EQ(srv.get_protocol_version(""), "2025-06-18");
+}
+
+TEST(McpProtocolVersionTest, HeaderValidation)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    CustomServer srv(cfg);
+    auto init = init_session(srv.port, "2025-11-25");
+    const std::string session = init.first;
+    ASSERT_EQ(init.second, "2025-11-25");
+    const std::string ping = R"({"jsonrpc":"2.0","id":2,"method":"ping"})";
+
+    // Matching header, or no header (the negotiated version is assumed): accepted
+    EXPECT_EQ(post_with_version(srv.port, ping, session, "2025-11-25").status, 200);
+    EXPECT_EQ(post_with_version(srv.port, ping, session, "").status, 200);
+
+    // Unsupported value: 400
+    auto bad = post_with_version(srv.port, ping, session, "1999-01-01");
+    EXPECT_EQ(bad.status, 400);
+    EXPECT_NE(bad.body.find("Unsupported protocol version"), std::string::npos) << bad.body;
+
+    // Supported, but not the version this session negotiated: 400
+    EXPECT_EQ(post_with_version(srv.port, ping, session, "2025-03-26").status, 400);
+
+    // The header is validated on GET and DELETE too
+    auto get = http_request(srv.port, "GET", "",
+        {{"Accept", "text/event-stream"}, {"Mcp-Session-Id", session}, {"MCP-Protocol-Version", "bogus"}});
+    EXPECT_EQ(get.status, 400);
+    auto del = http_request(srv.port, "DELETE", "",
+        {{"Mcp-Session-Id", session}, {"MCP-Protocol-Version", "bogus"}});
+    EXPECT_EQ(del.status, 400);
+    del = http_request(srv.port, "DELETE", "",
+        {{"Mcp-Session-Id", session}, {"MCP-Protocol-Version", "2025-11-25"}});
+    EXPECT_EQ(del.status, 204);
+    EXPECT_EQ(srv.server->get_protocol_version(session), "") << "state dropped with the session";
+
+    // initialize itself is not subject to the header check
+    auto reinit = http_request(srv.port, "POST", init_body("2025-06-18"),
+                               json_headers({{"MCP-Protocol-Version", "bogus"}}));
+    EXPECT_EQ(reinit.status, 200);
+}
+
+TEST(McpProtocolVersionTest, LegacyHttpTransportValidatesHeaderToo)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP;
+    CustomServer srv(cfg);
+    auto init = init_session(srv.port, "2025-06-18");
+    ASSERT_EQ(init.second, "2025-06-18");
+    const std::string ping = R"({"jsonrpc":"2.0","id":2,"method":"ping"})";
+    EXPECT_EQ(post_with_version(srv.port, ping, init.first, "2025-06-18").status, 200);
+    EXPECT_EQ(post_with_version(srv.port, ping, init.first, "bogus").status, 400);
+}
+
+TEST(McpProtocolVersionTest, BatchRejectedFrom2025_06_18)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    CustomServer srv(cfg);
+    const std::string batch =
+        R"([{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"ping"}])";
+    for (const std::string v : {"2025-06-18", "2025-11-25"})
+    {
+        auto init = init_session(srv.port, v);
+        ASSERT_EQ(init.second, v);
+        for (const std::string& header : {v, std::string()})
+        {
+            auto r = post_with_version(srv.port, batch, init.first, header);
+            EXPECT_EQ(r.status, 400) << v;
+            auto d = json::parse(r.body);
+            EXPECT_TRUE(d.is_object());
+            EXPECT_EQ(d["error"]["code"], -32600);
+            EXPECT_NE(d["error"]["message"].get<std::string>().find("batching"), std::string::npos);
+        }
+    }
+}
+
+TEST(McpProtocolVersionTest, BatchAcceptedFor2025_03_26And2024_11_05)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    CustomServer srv(cfg);
+    const std::string batch =
+        R"([{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"ping"}])";
+    for (const std::string v : {"2025-03-26", "2024-11-05"})
+    {
+        auto init = init_session(srv.port, v);
+        ASSERT_EQ(init.second, v);
+        auto r = post_with_version(srv.port, batch, init.first, "");
+        EXPECT_EQ(r.status, 200) << v;
+        auto arr = json::parse(r.body);
+        ASSERT_TRUE(arr.is_array());
+        EXPECT_EQ(arr.size(), 2u);
+    }
+}
+
+TEST(McpProtocolVersionTest, SessionlessBatchFollowsHeader)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    cfg.session.enabled = false;
+    CustomServer srv(cfg);
+    const std::string batch = R"([{"jsonrpc":"2.0","id":2,"method":"ping"}])";
+    auto noHeader = http_request(srv.port, "POST", batch, json_headers());
+    EXPECT_EQ(noHeader.status, 200) << "no header, no session: 2025-03-26 is assumed";
+    auto newer = http_request(srv.port, "POST", batch,
+                              json_headers({{"MCP-Protocol-Version", "2025-06-18"}}));
+    EXPECT_EQ(newer.status, 400);
+}
+
+TEST(McpProtocolVersionTest, StdioBatchRules)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    const std::string batch = R"([{"jsonrpc":"2.0","id":2,"method":"ping"}])";
+    {
+        MCPServer srv(cfg);
+        ASSERT_FALSE(srv.processMessage(init_body("2025-03-26")).empty());
+        auto out = json::parse(srv.processMessage(batch));
+        EXPECT_TRUE(out.is_array());
+    }
+    {
+        MCPServer srv(cfg);
+        ASSERT_FALSE(srv.processMessage(init_body("2025-11-25")).empty());
+        auto out = json::parse(srv.processMessage(batch));
+        ASSERT_TRUE(out.is_object());
+        EXPECT_EQ(out["error"]["code"], -32600);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Typed helpers: registerTool / registerPrompt / registerResource
+// ══════════════════════════════════════════════════════════════════════════════
+
+static json rpc(MCPServer& srv, const std::string& method, const json& params = json::object(),
+                int id = 1)
+{
+    json msg = {{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}};
+    std::string out = srv.processMessage(msg.dump());
+    return out.empty() ? json() : json::parse(out);
+}
+
+static MCPServer::ToolHandler addHandler()
+{
+    return [](const json& args) -> json {
+        return std::to_string(args.at("a").get<int>() + args.at("b").get<int>());
+    };
+}
+
+TEST(McpToolHelperTest, ListCallUnknownAndErrors)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    MCPServer srv(cfg);
+    const json schema = {{"type", "object"},
+                         {"properties", {{"a", {{"type", "integer"}}}, {"b", {{"type", "integer"}}}}},
+                         {"required", {"a", "b"}}};
+    srv.registerTool("add", "Add two integers", schema, addHandler());
+    srv.registerTool("fail", "Always throws", nullptr, [](const json&) -> json {
+        throw std::runtime_error("disk on fire");
+    });
+    srv.registerTool("stats", "", json::object(), [](const json&) -> json {
+        return {{"count", 3}};
+    });
+    srv.registerTool("full", "", nullptr, [](const json&) -> json {
+        return {{"content", json::array({{{"type", "text"}, {"text", "raw"}}})}, {"isError", false}};
+    });
+    srv.registerTool("proto", "", nullptr, [](const json&) -> json {
+        throw SocketsHpp::http::common::JsonRpcError::invalidParams("bad input");
+    });
+
+    auto list = rpc(srv, "tools/list");
+    auto tools = list["result"]["tools"];
+    ASSERT_EQ(tools.size(), 5u);
+    EXPECT_EQ(tools[0]["name"], "add");
+    EXPECT_EQ(tools[0]["description"], "Add two integers");
+    EXPECT_EQ(tools[0]["inputSchema"], schema);
+    EXPECT_EQ(tools[1]["inputSchema"], json({{"type", "object"}})) << "null schema → {type: object}";
+    EXPECT_FALSE(tools[2].contains("description")) << "empty description omitted";
+    EXPECT_FALSE(list["result"].contains("nextCursor"));
+
+    auto add = rpc(srv, "tools/call", {{"name", "add"}, {"arguments", {{"a", 2}, {"b", 5}}}});
+    EXPECT_EQ(add["result"]["content"][0]["type"], "text");
+    EXPECT_EQ(add["result"]["content"][0]["text"], "7");
+    EXPECT_FALSE(add["result"].contains("isError"));
+
+    auto unknown = rpc(srv, "tools/call", {{"name", "nope"}});
+    EXPECT_EQ(unknown["error"]["code"], -32602);
+    EXPECT_EQ(rpc(srv, "tools/call", json::object())["error"]["code"], -32602);
+    EXPECT_EQ(rpc(srv, "tools/call", {{"name", "add"}, {"arguments", 5}})["error"]["code"], -32602);
+
+    // A throwing handler is a tool execution error, not a protocol error
+    auto fail = rpc(srv, "tools/call", {{"name", "fail"}});
+    ASSERT_TRUE(fail.contains("result")) << fail.dump();
+    EXPECT_EQ(fail["result"]["isError"], true);
+    EXPECT_EQ(fail["result"]["content"][0]["text"], "disk on fire");
+    // Missing arguments → the handler's json exception → isError as well
+    EXPECT_EQ(rpc(srv, "tools/call", {{"name", "add"}})["result"]["isError"], true);
+
+    // Object result → structuredContent + serialized text
+    auto stats = rpc(srv, "tools/call", {{"name", "stats"}});
+    EXPECT_EQ(stats["result"]["structuredContent"], json({{"count", 3}}));
+    EXPECT_EQ(json::parse(stats["result"]["content"][0]["text"].get<std::string>()), json({{"count", 3}}));
+
+    // A full CallToolResult is passed through unchanged
+    auto full = rpc(srv, "tools/call", {{"name", "full"}});
+    EXPECT_EQ(full["result"]["content"][0]["text"], "raw");
+    EXPECT_EQ(full["result"]["isError"], false);
+
+    // JsonRpcError from a handler stays a JSON-RPC error
+    EXPECT_EQ(rpc(srv, "tools/call", {{"name", "proto"}})["error"]["code"], -32602);
+
+    // Re-registering replaces in place (order kept)
+    srv.registerTool("add", "Add (v2)", schema, addHandler());
+    tools = rpc(srv, "tools/list")["result"]["tools"];
+    ASSERT_EQ(tools.size(), 5u);
+    EXPECT_EQ(tools[0]["description"], "Add (v2)");
+
+    EXPECT_THROW(srv.registerTool("", "x", nullptr, addHandler()), std::invalid_argument);
+    EXPECT_THROW(srv.registerTool("x", "x", json::array(), addHandler()), std::invalid_argument);
+    EXPECT_THROW(srv.registerTool("x", "x", nullptr, MCPServer::ToolHandler()), std::invalid_argument);
+}
+
+TEST(McpToolHelperTest, FullDefinitionKeepsOptionalFields)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    MCPServer srv(cfg);
+    const json def = {{"name", "weather"},
+                      {"title", "Weather"},
+                      {"description", "Current weather"},
+                      {"outputSchema", {{"type", "object"},
+                                        {"properties", {{"temp", {{"type", "number"}}}}}}},
+                      {"annotations", {{"readOnlyHint", true}}}};
+    srv.registerTool(def, [](const json&) -> json { return {{"temp", 21.5}}; });
+    auto tool = rpc(srv, "tools/list")["result"]["tools"][0];
+    EXPECT_EQ(tool["title"], "Weather");
+    EXPECT_EQ(tool["outputSchema"], def["outputSchema"]);
+    EXPECT_EQ(tool["annotations"]["readOnlyHint"], true);
+    EXPECT_EQ(tool["inputSchema"], json({{"type", "object"}}));
+    auto call = rpc(srv, "tools/call", {{"name", "weather"}});
+    EXPECT_EQ(call["result"]["structuredContent"]["temp"], 21.5);
+    EXPECT_THROW(srv.registerTool(json({{"title", "no name"}}), addHandler()), std::invalid_argument);
+}
+
+TEST(McpToolHelperTest, Pagination)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    MCPServer srv(cfg);
+    for (int i = 0; i < 5; ++i)
+        srv.registerTool("t" + std::to_string(i), "", nullptr, addHandler());
+    srv.setListPageSize(2);
+
+    std::vector<std::string> names;
+    json params = json::object();
+    int pages = 0;
+    while (pages < 10)
+    {
+        auto r = rpc(srv, "tools/list", params)["result"];
+        ++pages;
+        EXPECT_LE(r["tools"].size(), 2u);
+        for (auto& t : r["tools"])
+            names.push_back(t["name"].get<std::string>());
+        if (!r.contains("nextCursor"))
+            break;
+        params = {{"cursor", r["nextCursor"]}};
+    }
+    EXPECT_EQ(pages, 3);
+    EXPECT_EQ(names, (std::vector<std::string>{"t0", "t1", "t2", "t3", "t4"}));
+    EXPECT_EQ(rpc(srv, "tools/list", {{"cursor", "garbage"}})["error"]["code"], -32602);
+    EXPECT_EQ(rpc(srv, "tools/list", {{"cursor", "99"}})["error"]["code"], -32602);
+}
+
+TEST(McpToolHelperTest, CancellableToolOverHttp)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    std::atomic<bool> started{false};
+    std::atomic<bool> sawCancel{false};
+    CustomServer srv(cfg, [&](MCPServer& s) {
+        s.registerCancellableTool("wait", "Wait until cancelled", nullptr,
+            [&](const json&, std::shared_ptr<std::atomic<bool>> cancel) -> json {
+                started = true;
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!cancel->load() && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                sawCancel = cancel->load();
+                if (sawCancel) throw std::runtime_error("cancelled");
+                return "finished";
+            });
+    });
+    const std::string session = init_session(srv.port, "2025-11-25").first;
+    ASSERT_FALSE(session.empty());
+
+    TestHttpResponse slow;
+    std::thread worker([&]() {
+        slow = post_with_version(srv.port,
+            R"({"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"wait"}})", session,
+            "2025-11-25");
+    });
+    for (int i = 0; i < 1000 && !started; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    ASSERT_TRUE(started.load());
+    auto cancel = post_with_version(srv.port,
+        R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":41}})", session,
+        "2025-11-25");
+    EXPECT_EQ(cancel.status, 202);
+    worker.join();
+    EXPECT_TRUE(sawCancel.load());
+    EXPECT_EQ(slow.status, 202) << "a cancelled request gets no response";
+    EXPECT_TRUE(slow.body.empty()) << slow.body;
+}
+
+TEST(McpPromptHelperTest, ListAndGet)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    MCPServer srv(cfg);
+    srv.registerPrompt("review", "Review code",
+        json::array({{{"name", "code"}, {"description", "The code"}, {"required", true}},
+                     {{"name", "style"}}}),
+        [](const json& args) -> json {
+            return "Please review: " + args.at("code").get<std::string>();
+        });
+    srv.registerPrompt("raw", "", nullptr, [](const json&) -> json {
+        return {{"description", "custom"},
+                {"messages", json::array({{{"role", "assistant"},
+                                           {"content", {{"type", "text"}, {"text", "hi"}}}}})}};
+    });
+
+    auto prompts = rpc(srv, "prompts/list")["result"]["prompts"];
+    ASSERT_EQ(prompts.size(), 2u);
+    EXPECT_EQ(prompts[0]["name"], "review");
+    EXPECT_EQ(prompts[0]["arguments"].size(), 2u);
+    EXPECT_FALSE(prompts[1].contains("arguments"));
+
+    auto got = rpc(srv, "prompts/get", {{"name", "review"}, {"arguments", {{"code", "x++"}}}});
+    EXPECT_EQ(got["result"]["description"], "Review code");
+    EXPECT_EQ(got["result"]["messages"][0]["role"], "user");
+    EXPECT_EQ(got["result"]["messages"][0]["content"]["text"], "Please review: x++");
+
+    EXPECT_EQ(rpc(srv, "prompts/get", {{"name", "raw"}})["result"]["description"], "custom");
+    EXPECT_EQ(rpc(srv, "prompts/get", {{"name", "nope"}})["error"]["code"], -32602);
+    EXPECT_EQ(rpc(srv, "prompts/get", {{"name", "review"}})["error"]["code"], -32602)
+        << "missing required argument";
+}
+
+TEST(McpResourceHelperTest, ListAndRead)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    MCPServer srv(cfg);
+    srv.registerResource("file:///readme.txt", "readme", "text/plain",
+                         [](const std::string&) -> json { return "Hello"; }, "The readme");
+    srv.registerResource("mem://logo", "logo", "image/png",
+                         [](const std::string&) -> json { return {{"blob", "iVBORw=="}}; });
+
+    auto list = rpc(srv, "resources/list")["result"]["resources"];
+    ASSERT_EQ(list.size(), 2u);
+    EXPECT_EQ(list[0], json({{"uri", "file:///readme.txt"}, {"name", "readme"},
+                             {"mimeType", "text/plain"}, {"description", "The readme"}}));
+
+    auto text = rpc(srv, "resources/read", {{"uri", "file:///readme.txt"}})["result"]["contents"];
+    ASSERT_EQ(text.size(), 1u);
+    EXPECT_EQ(text[0], json({{"uri", "file:///readme.txt"}, {"mimeType", "text/plain"}, {"text", "Hello"}}));
+
+    auto blob = rpc(srv, "resources/read", {{"uri", "mem://logo"}})["result"]["contents"][0];
+    EXPECT_EQ(blob["blob"], "iVBORw==");
+    EXPECT_EQ(blob["mimeType"], "image/png");
+    EXPECT_EQ(blob["uri"], "mem://logo");
+
+    auto missing = rpc(srv, "resources/read", {{"uri", "file:///nope"}});
+    EXPECT_EQ(missing["error"]["code"], -32002);
+    EXPECT_EQ(missing["error"]["data"]["uri"], "file:///nope");
+}
+
+TEST(McpHelperCapabilitiesTest, DefaultInitializeAdvertisesHelpers)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    {
+        MCPServer srv(cfg);
+        auto caps = rpc(srv, "initialize", {{"protocolVersion", "2025-06-18"}})["result"]["capabilities"];
+        EXPECT_EQ(caps, json::object()) << "no helpers → no capabilities";
+        EXPECT_EQ(rpc(srv, "tools/list")["error"]["code"], -32601) << "no built-in without tools";
+    }
+    MCPServer srv(cfg);
+    srv.registerTool("add", "", nullptr, addHandler());
+    srv.registerResource("a://b", "b", "", [](const std::string&) -> json { return "x"; });
+    auto caps = rpc(srv, "initialize", {{"protocolVersion", "2025-06-18"}})["result"]["capabilities"];
+    EXPECT_TRUE(caps.contains("tools"));
+    EXPECT_TRUE(caps.contains("resources"));
+    EXPECT_FALSE(caps.contains("prompts"));
+    EXPECT_EQ(rpc(srv, "prompts/list")["error"]["code"], -32601);
+}
+
+TEST(McpHelperCapabilitiesTest, MergedIntoUserInitializeResult)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    MCPServer srv(cfg);
+    srv.registerMethod("initialize", [](const json&) -> json {
+        return {{"capabilities", {{"tools", {{"listChanged", true}}}, {"logging", json::object()}}},
+                {"serverInfo", {{"name", "custom"}, {"version", "2"}}}};
+    });
+    srv.registerTool("add", "", nullptr, addHandler());
+    srv.registerPrompt("p", "", nullptr, [](const json&) -> json { return "hi"; });
+    auto result = rpc(srv, "initialize", {{"protocolVersion", "2025-11-25"}})["result"];
+    EXPECT_EQ(result["serverInfo"]["name"], "custom");
+    EXPECT_EQ(result["capabilities"]["tools"], json({{"listChanged", true}})) << "handler's entry wins";
+    EXPECT_TRUE(result["capabilities"].contains("logging"));
+    EXPECT_EQ(result["capabilities"]["prompts"], json::object());
+    EXPECT_FALSE(result["capabilities"].contains("resources"));
+}
+
+TEST(McpHelperOverrideTest, ExplicitRegisterMethodWins)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::STDIO;
+    MCPServer srv(cfg);
+    srv.registerTool("add", "", nullptr, addHandler());
+    srv.registerMethod("tools/list", [](const json&) -> json {
+        return {{"tools", json::array({{{"name", "explicit"}, {"inputSchema", {{"type", "object"}}}}})}};
+    });
+    EXPECT_EQ(rpc(srv, "tools/list")["result"]["tools"][0]["name"], "explicit");
+    // tools/call is still the built-in one
+    EXPECT_EQ(rpc(srv, "tools/call", {{"name", "add"}, {"arguments", {{"a", 1}, {"b", 1}}}})
+                  ["result"]["content"][0]["text"], "2");
+    srv.registerCancellable("tools/call", [](const json&, std::shared_ptr<std::atomic<bool>>) -> json {
+        return {{"content", json::array({{{"type", "text"}, {"text", "explicit call"}}})}};
+    });
+    EXPECT_EQ(rpc(srv, "tools/call", {{"name", "add"}})["result"]["content"][0]["text"], "explicit call");
+}
+
+TEST(McpToolHelperTest, EndToEndOverHttpWithNewestVersion)
+{
+    ServerConfig cfg;
+    cfg.transport = TransportType::HTTP_STREAMABLE;
+    CustomServer srv(cfg, [](MCPServer& s) {
+        s.registerTool("add", "Add", nullptr, addHandler());
+    });
+    auto init = http_request(srv.port, "POST", init_body("2025-11-25"), json_headers());
+    ASSERT_EQ(init.status, 200);
+    auto d = json::parse(init.body);
+    EXPECT_EQ(d["result"]["protocolVersion"], "2025-11-25");
+    EXPECT_TRUE(d["result"]["capabilities"].contains("tools"));
+
+    auto call = post_with_version(srv.port,
+        R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"a":20,"b":22}}})",
+        init.session_id, "2025-11-25");
+    ASSERT_EQ(call.status, 200);
+    EXPECT_EQ(json::parse(call.body)["result"]["content"][0]["text"], "42");
 }

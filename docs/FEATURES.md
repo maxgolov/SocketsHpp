@@ -109,13 +109,20 @@ Server helpers (opt-in headers, applied from your handlers):
 
 - JSON-RPC 2.0 requests, notifications, responses, batches and standard error codes;
   ids as string, 64-bit integer or null.
-- `mcp::server::MCPServer`: MCP 2025-03-26 (Streamable HTTP) and a POST-based
-  transport for 2024-11-05 (not the legacy SSE `endpoint` handshake), plus
-  `processMessage()` for STDIO; version negotiation, sessions,
+- `mcp::server::MCPServer`: MCP protocol versions 2025-11-25, 2025-06-18 and
+  2025-03-26 (Streamable HTTP) and a POST-based transport for 2024-11-05 (not the
+  legacy SSE `endpoint` handshake), plus `processMessage()` for STDIO; version
+  negotiation stored per session, `MCP-Protocol-Version` header validation, JSON-RPC
+  batches only for 2025-03-26 and older, sessions,
   server push (`push_event`, `push_log`, `push_progress`), resumability with
   `Last-Event-ID`, cancellation, `logging/setLevel`, Bearer / API key / capability-token
   auth (JWT with jwt-cpp), per-client rate limiting, CORS, `Origin` validation,
   `/health`, and a loopback-only bind guard.
+- Typed server helpers: `registerTool()` / `registerCancellableTool()` (built-in
+  `tools/list` with optional pagination and `tools/call`; handler exceptions become
+  `isError` results, object results `structuredContent`), `registerPrompt()`
+  (`prompts/list`, `prompts/get`) and `registerResource()` (`resources/list`,
+  `resources/read`), with the matching capabilities advertised in `initialize`.
 - `mcp::client::MCPClient`: HTTP and Streamable HTTP transports, tools / prompts /
   resources helpers, notification handlers over SSE. No STDIO client.
 

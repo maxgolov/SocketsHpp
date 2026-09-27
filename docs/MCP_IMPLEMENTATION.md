@@ -27,7 +27,7 @@ header-only and built on the library's own HTTP server and client.
 | `TransportType` | Protocol revision | Server | Client |
 |-----------------|-------------------|--------|--------|
 | `HTTP` | 2024-11-05 protocol version, POST-based | POST for requests and responses; GET notification stream opened after `initialize` | yes |
-| `HTTP_STREAMABLE` | 2025-03-26 (Streamable HTTP) | POST returns JSON or SSE; optional GET stream | yes |
+| `HTTP_STREAMABLE` | Streamable HTTP (2025-03-26, 2025-06-18, 2025-11-25) | POST returns JSON or SSE; optional GET stream | yes (offers 2025-03-26) |
 | `STDIO` | any | no listener: feed messages to `processMessage()` from your own stdin/stdout loop | **not supported** (`connect()` returns false) |
 
 The `HTTP` transport speaks protocol version 2024-11-05 but is **not** the legacy
@@ -51,7 +51,6 @@ reachable from other machines.
 #include <thread>
 
 using namespace SocketsHpp::mcp;
-using SocketsHpp::http::common::JsonRpcError;
 using json = nlohmann::json;
 
 int main(int argc, char** argv)
@@ -65,26 +64,14 @@ int main(int argc, char** argv)
 
     server::MCPServer server(config);
 
-    server.registerMethod("initialize", [](const json&) -> json {
-        return {{"capabilities", {{"tools", json::object()}}},
-                {"serverInfo", {{"name", "weather"}, {"version", "1.0.0"}}}};
-    });
-
-    server.registerMethod("tools/list", [](const json&) -> json {
-        json tool = {{"name", "get_weather"},
-                     {"description", "Current weather for a city"},
-                     {"inputSchema", {{"type", "object"},
-                                      {"properties", {{"city", {{"type", "string"}}}}},
-                                      {"required", json::array({"city"})}}}};
-        return {{"tools", json::array({tool})}};
-    });
-
-    server.registerMethod("tools/call", [](const json& params) -> json {
-        if (params.value("name", "") != "get_weather")
-            throw JsonRpcError::invalidParams("unknown tool");
-        std::string city = params.value("arguments", json::object()).value("city", "?");
-        return {{"content", json::array({{{"type", "text"}, {"text", "Sunny in " + city}}})}};
-    });
+    // Provides tools/list and tools/call and advertises the "tools" capability.
+    server.registerTool("get_weather", "Current weather for a city",
+        {{"type", "object"},
+         {"properties", {{"city", {{"type", "string"}}}}},
+         {"required", json::array({"city"})}},
+        [](const json& args) -> json {
+            return "Sunny in " + args.at("city").get<std::string>();  // → text content
+        });
 
     server.listen();  // non-blocking; throws std::runtime_error if it cannot bind
     std::this_thread::sleep_for(std::chrono::hours(1));
@@ -94,12 +81,13 @@ int main(int argc, char** argv)
 
 Key points:
 
-- `MCPServer` does not implement any MCP feature methods (`tools/*`, `resources/*`,
-  `prompts/*`, ...) itself: you register every method your server offers with
-  `registerMethod(name, handler)`. Handlers return the JSON-RPC `result`; throwing
-  `JsonRpcError` (for example `JsonRpcError::invalidParams(...)`) produces that error,
-  and any other `std::exception` becomes `-32603 Internal error`. Unknown methods get
-  `-32601 Method not found`.
+- Tools, prompts and resources can be registered with the typed helpers
+  (`registerTool()`, `registerPrompt()`, `registerResource()`, see
+  [Tools, prompts and resources](#tools-prompts-and-resources)). Any other method is
+  registered with `registerMethod(name, handler)`: handlers return the JSON-RPC
+  `result`; throwing `JsonRpcError` (for example `JsonRpcError::invalidParams(...)`)
+  produces that error, and any other `std::exception` becomes `-32603 Internal error`.
+  Unknown methods get `-32601 Method not found`.
 - Methods may be registered at any time, including after `listen()`.
 - `listen()` binds `config.host:config.port`, starts a 4-thread worker pool and the
   reactor, and returns immediately. `port()` returns the bound port (useful with
@@ -120,17 +108,118 @@ Key points:
 | `logging/setLevel` | Sets the minimum level for `push_log()` for the calling session (default `warning`); invalid levels get `-32602`. |
 
 Registering one of these names replaces the built-in (for `initialize`, see below).
+The typed helpers add `tools/list`, `tools/call`, `prompts/list`, `prompts/get`,
+`resources/list` and `resources/read` (see below).
+
+### Tools, prompts and resources
+
+The typed helpers implement the list/call methods so you only write the tool, prompt
+or resource itself:
+
+```cpp
+server.registerTool("add", "Add two integers",
+    {{"type", "object"},
+     {"properties", {{"a", {{"type", "integer"}}}, {"b", {{"type", "integer"}}}}},
+     {"required", {"a", "b"}}},
+    [](const json& args) -> json {
+        return std::to_string(args.at("a").get<int>() + args.at("b").get<int>());
+    });
+
+server.registerCancellableTool("sleep", "Sleep for a while", nullptr,
+    [](const json& args, std::shared_ptr<std::atomic<bool>> cancelled) -> json {
+        for (int i = 0; i < args.value("steps", 10); ++i)
+        {
+            if (cancelled->load())
+                throw std::runtime_error("cancelled");  // no response is sent
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return "done";
+    });
+
+server.registerPrompt("review", "Review code",
+    json::array({{{"name", "code"}, {"required", true}}}),
+    [](const json& args) -> json { return "Please review:\n" + args.at("code").get<std::string>(); });
+
+server.registerResource("file:///readme.txt", "readme", "text/plain",
+    [](const std::string& uri) -> json { return "Hello from " + uri; });
+```
+
+**Tools** (`registerTool(name, description, inputSchema, handler)`,
+`registerCancellableTool(...)`, or the overloads taking a full tool definition object,
+for optional fields such as `title`, `outputSchema` and `annotations`):
+
+- `tools/list` returns the tools in registration order; registering a name again
+  replaces the tool in place. A `null` schema means `{"type": "object"}`.
+- `tools/call` with an unknown tool, a missing `name` or non-object `arguments` gets
+  JSON-RPC error `-32602`. Arguments are not validated against the schema.
+- The handler's return value becomes the `CallToolResult`: an object containing
+  `content` is sent as is; a string becomes one text item; `null` an empty content
+  list; any other object becomes `structuredContent` plus its serialized JSON as a
+  text item (the spec's recommendation for structured output, MCP 2025-06-18); other
+  JSON values become their serialized JSON as text.
+- A `std::exception` thrown by the handler becomes a **tool execution error**: a
+  result with `"isError": true` and the exception message as text, which the model
+  can see (the spec asks for input validation and business errors to be reported this
+  way). Throw `JsonRpcError` to send a JSON-RPC error instead.
+- `registerCancellableTool()` handlers get the request's cancel token (see
+  [Cancellation](#cancellation)); non-cancellable tool calls are cancelled the same
+  way, the handler just cannot observe it.
+
+**Prompts** (`registerPrompt(name, description, arguments, handler)`): `prompts/list`
+returns the prompts with their argument descriptions; `prompts/get` checks that
+required arguments are present (`-32602` otherwise, and for unknown prompts) and calls
+the handler with the `arguments` object. A string result becomes one `user` text
+message, an array is the `messages` list, and an object with `messages` is sent as is.
+
+**Resources** (`registerResource(uri, name, mimeType, reader[, description])`):
+`resources/list` returns the resources; `resources/read` calls the reader for an exact
+URI match (unknown URI: error `-32002`, "Resource not found", with the URI in `data`).
+A string result is the text content; an object with `text` or `blob` is one content
+item; an array is the content list; an object with `contents` is sent as is. `uri` and
+`mimeType` are filled in when missing.
+
+**Pagination:** `setListPageSize(n)` limits `tools/list`, `prompts/list` and
+`resources/list` to `n` entries per page with an opaque `nextCursor` (default 0: no
+pagination). Unknown cursors get `-32602`.
+
+**Capabilities:** once a tool, prompt or resource is registered, the default
+`initialize` result advertises `tools`, `prompts` or `resources` (as `{}`). With an
+`initialize` handler registered, those entries are added to the `capabilities` of its
+result unless the handler already set them (so a handler can advertise, for example,
+`{"tools": {"listChanged": true}}` itself).
+
+**Precedence:** a handler registered with `registerMethod()` or
+`registerCancellable()` for one of these method names wins over the built-in one, per
+method (for example a custom `tools/list` with the built-in `tools/call`). The helpers
+are thread-safe and may be called at any time, like `registerMethod()`.
 
 ### Initialize and version negotiation
 
-The server supports protocol versions `2025-03-26` and `2024-11-05`. For an
-`initialize` request it answers with the client's `protocolVersion` if supported,
-otherwise with `2025-03-26` (the client then decides whether to continue).
+The server supports protocol versions `2025-11-25`, `2025-06-18`, `2025-03-26` and
+`2024-11-05` (`MCPServer::supportedProtocolVersions()`). For an `initialize` request it
+answers with the client's `protocolVersion` if supported, otherwise with the latest,
+`2025-11-25` (the client then decides whether to continue). The negotiated version is
+stored per session and returned by `get_protocol_version(sessionId)` (`""` for STDIO).
 
 If you registered an `initialize` handler, its result object is returned with
-`protocolVersion` overwritten by the negotiated version. Otherwise the server returns
-`{"protocolVersion": <negotiated>, "capabilities": {}, "serverInfo": {"name": serverName, "version": serverVersion}}`.
-Register a handler to advertise capabilities such as `tools`.
+`protocolVersion` overwritten by the negotiated version and the typed helpers'
+capabilities merged in. Otherwise the server returns
+`{"protocolVersion": <negotiated>, "capabilities": {...}, "serverInfo": {"name": serverName, "version": serverVersion}}`,
+where `capabilities` lists the helpers in use (`{}` if none). Register a handler to
+advertise other capabilities or a richer `serverInfo`.
+
+What the newer versions change for the server:
+
+| Version | Change | SocketsHpp |
+|---------|--------|------------|
+| 2025-06-18 | JSON-RPC batching removed | Batches are rejected (HTTP 400, `-32600`) for sessions that negotiated 2025-06-18 or later; accepted for 2025-03-26 and 2024-11-05 |
+| 2025-06-18 | `MCP-Protocol-Version` header required on HTTP requests after `initialize` | Validated on POST, GET and DELETE of both HTTP transports: an unsupported value, or one that differs from the session's negotiated version, gets 400; an absent header means the negotiated version (2025-03-26 without a session) |
+| 2025-06-18 | Structured tool output (`outputSchema`, `structuredContent`), `title` fields, resource links in tool results | Plain JSON produced by your handlers; `registerTool()` accepts a full definition and turns an object result into `structuredContent` |
+| 2025-06-18 | Elicitation, OAuth resource-server rules | Not implemented (no server-to-client requests; put OAuth in a proxy) |
+| 2025-11-25 | Input validation errors are tool execution errors (`isError`) | What `registerTool()` does for exceptions from the handler |
+| 2025-11-25 | Optional SSE priming events / server-initiated stream disconnects (polling) | Not used: POST streams end after their responses, GET streams stay open |
+| 2025-11-25 | Tasks, icons, URL elicitation, sampling with tools, JSON Schema 2020-12 default | Not implemented / plain JSON; schemas are passed through untouched |
+| 2025-11-25 | 403 for an invalid `Origin` | Already the behaviour (see [Origin validation](#origin-validation)) |
 
 The client's `capabilities` are stored per session and can be read with
 `get_client_capabilities(sessionId)` (pass `""` for the STDIO transport).
@@ -141,9 +230,12 @@ The client's `capabilities` are stored per session and can be read with
 
 ### JSON-RPC details
 
-- Batches (JSON arrays) are supported on every transport; notifications inside a batch
-  produce no entry, and a batch of only notifications gets `202 Accepted` (HTTP) or an
-  empty string (`processMessage()`).
+- Batches (JSON arrays) are supported on every transport for protocol versions
+  2025-03-26 and 2024-11-05 (and before `initialize` on STDIO); notifications inside a
+  batch produce no entry, and a batch of only notifications gets `202 Accepted` (HTTP)
+  or an empty string (`processMessage()`). For 2025-06-18 and later the whole batch is
+  rejected with `-32600` (HTTP 400). Which version applies: the session's negotiated
+  version, else the `MCP-Protocol-Version` header, else 2025-03-26.
 - Request ids may be strings, integers (the full `int64` range, kept without narrowing)
   or `null` (accepted for JSON-RPC compatibility, although MCP forbids null ids).
   Other ids, and unsigned values above `INT64_MAX`, are rejected with
@@ -158,7 +250,7 @@ The client's `capabilities` are stored per session and can be read with
 
 ### HTTP endpoints
 
-| Request | `HTTP` (2024-11-05) | `HTTP_STREAMABLE` (2025-03-26) |
+| Request | `HTTP` (2024-11-05) | `HTTP_STREAMABLE` (2025-03-26+) |
 |---------|---------------------|--------------------------------|
 | `POST <endpoint>` | `Content-Type` must be `application/json` (else 400). Response is `application/json` (array for batches). | Response is `text/event-stream` when `Accept` contains `text/event-stream` (one `data:` event per response, then the stream ends), otherwise `application/json`. |
 | `GET <endpoint>` | Opens the session's notification stream (SSE). | Same. |
@@ -167,6 +259,7 @@ The client's `capabilities` are stored per session and can be read with
 | `GET /health` | `server_info()` as JSON. | Same. |
 | Notification-only POST | `202 Accepted`, empty body. | Same. |
 | Invalid JSON or JSON-RPC | 400 with a JSON-RPC error body (`-32700` / `-32600`). | Same. |
+| Unsupported or mismatched `MCP-Protocol-Version` | 400, JSON-RPC error `-32000`. | Same. |
 | Any other method | 405 with `Allow: GET, POST, DELETE, OPTIONS`. | Same. |
 
 The default endpoint is `/mcp` (`config.endpoint`). Request bodies above
@@ -301,7 +394,8 @@ client could otherwise spoof.
 ### CORS
 
 Every endpoint response (and `/health`) carries the headers from `config.cors`:
-`allowOrigin` (default `*`), `allowMethods`, `allowHeaders`, `exposeHeaders` (includes
+`allowOrigin` (default `*`), `allowMethods`, `allowHeaders` (includes
+`Mcp-Session-Id` and `MCP-Protocol-Version`), `exposeHeaders` (includes
 `Mcp-Session-Id`) and `maxAge`. `OPTIONS` answers 204. Narrow `allowOrigin` for
 browser-facing deployments.
 
@@ -542,7 +636,7 @@ With `-DSOCKETSHPP_BUILD_TESTS=ON` (and nlohmann/json available):
 |--------|--------|
 | `build/test/json_rpc_test`, `json_rpc_minimal_test` | JSON-RPC types and ids |
 | `build/test/mcp_config_test` | `ServerConfig` / `ClientConfig` parsing |
-| `build/test/mcp_streamable_test` (POSIX only) | Server over both HTTP transports, sessions, batching, auth, rate limiting, cancellation, resumability, client |
+| `build/test/mcp_streamable_test` (POSIX only) | Server over both HTTP transports, protocol versions and `MCP-Protocol-Version`, sessions, batching, typed helpers, auth, rate limiting, cancellation, resumability, client |
 
 ```bash
 ctest --test-dir build -R "JsonRpc|MCPConfig|Mcp|StreamableHttp" --output-on-failure
