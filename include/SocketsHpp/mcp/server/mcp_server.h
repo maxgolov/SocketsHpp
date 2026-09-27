@@ -1137,8 +1137,9 @@ namespace mcp
 
             /// @brief Validate the MCP-Protocol-Version header of a request after initialize
             /// (MCP 2025-06-18+). An absent header is accepted (the negotiated version, or
-            /// 2025-03-26, is assumed). A value that is not a supported version, or that
-            /// differs from the version the session negotiated, is answered with 400.
+            /// 2025-03-26, is assumed). A value that is not a supported version is answered
+            /// with 400; like the official TypeScript SDK, a supported version that differs
+            /// from the one the session negotiated is accepted.
             /// @return false if a response has been sent
             bool checkProtocolVersion(const HttpRequest& req, HttpResponse& res)
             {
@@ -1153,17 +1154,6 @@ namespace mcp
                         list += (list.empty() ? "" : ", ") + v;
                     message = "Bad Request: Unsupported protocol version: " + *header +
                               " (supported versions: " + list + ")";
-                }
-                else
-                {
-                    const std::string sessionId = getSessionId(req);
-                    const std::string negotiated =
-                        sessionId.empty() ? std::string() : get_protocol_version(sessionId);
-                    if (!negotiated.empty() && negotiated != *header)
-                    {
-                        message = "Bad Request: MCP-Protocol-Version " + *header +
-                                  " does not match the negotiated version " + negotiated;
-                    }
                 }
                 if (message.empty())
                     return true;

@@ -213,7 +213,7 @@ What the newer versions change for the server:
 | Version | Change | SocketsHpp |
 |---------|--------|------------|
 | 2025-06-18 | JSON-RPC batching removed | Batches are rejected (HTTP 400, `-32600`) for sessions that negotiated 2025-06-18 or later; accepted for 2025-03-26 and 2024-11-05 |
-| 2025-06-18 | `MCP-Protocol-Version` header required on HTTP requests after `initialize` | Validated on POST, GET and DELETE of both HTTP transports: an unsupported value, or one that differs from the session's negotiated version, gets 400; an absent header means the negotiated version (2025-03-26 without a session) |
+| 2025-06-18 | `MCP-Protocol-Version` header required on HTTP requests after `initialize` | Validated on POST, GET and DELETE of both HTTP transports: an unsupported value gets 400 (a supported version other than the negotiated one is accepted, as in the TypeScript SDK); an absent header means the negotiated version (2025-03-26 without a session) |
 | 2025-06-18 | Structured tool output (`outputSchema`, `structuredContent`), `title` fields, resource links in tool results | Plain JSON produced by your handlers; `registerTool()` accepts a full definition and turns an object result into `structuredContent` |
 | 2025-06-18 | Elicitation, OAuth resource-server rules | Not implemented (no server-to-client requests; put OAuth in a proxy) |
 | 2025-11-25 | Input validation errors are tool execution errors (`isError`) | What `registerTool()` does for exceptions from the handler |
@@ -259,7 +259,7 @@ The client's `capabilities` are stored per session and can be read with
 | `GET /health` | `server_info()` as JSON. | Same. |
 | Notification-only POST | `202 Accepted`, empty body. | Same. |
 | Invalid JSON or JSON-RPC | 400 with a JSON-RPC error body (`-32700` / `-32600`). | Same. |
-| Unsupported or mismatched `MCP-Protocol-Version` | 400, JSON-RPC error `-32000`. | Same. |
+| Unsupported `MCP-Protocol-Version` | 400, JSON-RPC error `-32000` (a supported version other than the negotiated one is accepted, as in the TypeScript SDK). | Same. |
 | Any other method | 405 with `Allow: GET, POST, DELETE, OPTIONS`. | Same. |
 
 The default endpoint is `/mcp` (`config.endpoint`). Request bodies above

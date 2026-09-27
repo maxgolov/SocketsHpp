@@ -1959,8 +1959,9 @@ TEST(McpProtocolVersionTest, HeaderValidation)
     EXPECT_EQ(bad.status, 400);
     EXPECT_NE(bad.body.find("Unsupported protocol version"), std::string::npos) << bad.body;
 
-    // Supported, but not the version this session negotiated: 400
-    EXPECT_EQ(post_with_version(srv.port, ping, session, "2025-03-26").status, 400);
+    // Supported, but not the version this session negotiated: accepted, as in the
+    // official TypeScript SDK (only unsupported values are rejected)
+    EXPECT_EQ(post_with_version(srv.port, ping, session, "2025-03-26").status, 200);
 
     // The header is validated on GET and DELETE too
     auto get = http_request(srv.port, "GET", "",
